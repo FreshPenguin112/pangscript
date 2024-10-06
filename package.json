@@ -1,12 +1,17 @@
 {
   "scripts": {
-    "build": "npm i -g bun && bun i && antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener JavaScriptLexer.g4 && antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener JavaScriptParser.g4 && babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs"
+    "build": "npm i -g bun && bun i && antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs"
   },
   "dependencies": {
     "@babel/cli": "^7.23.9",
     "@babel/plugin-transform-modules-commonjs": "^7.23.3",
     "@babel/preset-typescript": "^7.24.1",
+    "acorn": "^8.12.1",
+    "acorn-loose": "^8.4.0",
+    "acorn-walk": "^8.3.4",
     "antlr4": "^4.13.1-patch-1",
-    "antlr4ng": "^3.0.4"
+    "antlr4ng": "^3.0.4",
+    "jszip": "2.7.0",
+    "luaparse": "^0.3.1"
   }
 }
