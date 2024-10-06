@@ -144,10 +144,10 @@ rule names:
 start_
 chunk
 block
-statment
+statement
 attnamelist
 attrib
-retstatment
+retstatement
 label
 funcname
 varlist

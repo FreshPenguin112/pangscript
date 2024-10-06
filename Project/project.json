@@ -3,9 +3,16 @@
     {
       "isStage": true,
       "name": "Stage",
-      "variables": { "`jEk@4|i[#Fk?(8x)AV.-my variable": ["my variable", 0] },
+      "variables": {
+        "`jEk@4|i[#Fk?(8x)AV.-my variable": [
+          "my variable",
+          0
+        ]
+      },
       "lists": {},
-      "broadcasts": {},
+      "broadcasts": {
+        "|sj.f5L4u^QFbZI~~/.7": "message1"
+      },
       "customVars": [],
       "blocks": {},
       "comments": {},
@@ -37,37 +44,222 @@
       "broadcasts": {},
       "customVars": [],
       "blocks": {
-        "b": {
+        "c": {
           "opcode": "event_whenflagclicked",
-          "next": "a",
+          "next": "d",
           "parent": null,
           "inputs": {},
           "fields": {},
           "shadow": false,
           "topLevel": true,
-          "x": 181,
-          "y": 184
+          "x": 293,
+          "y": 132,
+          "comment": "g"
+        },
+        "d": {
+          "opcode": "looks_say",
+          "next": "e",
+          "parent": "c",
+          "inputs": {
+            "MESSAGE": [
+              1,
+              [
+                10,
+                "i am a block"
+              ]
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "e": {
+          "opcode": "data_setvariableto",
+          "next": "a",
+          "parent": "d",
+          "inputs": {
+            "VALUE": [
+              1,
+              [
+                10,
+                "skibdi"
+              ]
+            ]
+          },
+          "fields": {
+            "VARIABLE": [
+              "my variable",
+              "`jEk@4|i[#Fk?(8x)AV.-my variable",
+              ""
+            ]
+          },
+          "shadow": false,
+          "topLevel": false
         },
         "a": {
           "opcode": "looks_say",
-          "next": null,
-          "parent": "b",
-          "inputs": { "MESSAGE": [3, "c", [10, "Hello!"]] },
+          "next": "b",
+          "parent": "e",
+          "inputs": {
+            "MESSAGE": [
+              3,
+              "h",
+              [
+                10,
+                "i am a block"
+              ]
+            ]
+          },
           "fields": {},
           "shadow": false,
           "topLevel": false
         },
-        "c": {
-          "opcode": "operator_randomBoolean",
+        "h": {
+          "opcode": "operator_random",
           "next": null,
           "parent": "a",
-          "inputs": {},
+          "inputs": {
+            "FROM": [
+              1,
+              [
+                4,
+                "1"
+              ]
+            ],
+            "TO": [
+              1,
+              [
+                4,
+                "10"
+              ]
+            ]
+          },
           "fields": {},
           "shadow": false,
           "topLevel": false
+        },
+        "b": {
+          "opcode": "control_if_else",
+          "next": null,
+          "parent": "a",
+          "inputs": {
+            "CONDITION": [
+              2,
+              "i"
+            ],
+            "SUBSTACK": [
+              2,
+              "j"
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "i": {
+          "opcode": "operator_equals",
+          "next": null,
+          "parent": "b",
+          "inputs": {
+            "OPERAND1": [
+              3,
+              [
+                12,
+                "my variable",
+                "`jEk@4|i[#Fk?(8x)AV.-my variable"
+              ],
+              [
+                10,
+                ""
+              ]
+            ],
+            "OPERAND2": [
+              1,
+              [
+                10,
+                "2"
+              ]
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "j": {
+          "opcode": "event_broadcast",
+          "next": null,
+          "parent": "b",
+          "inputs": {
+            "BROADCAST_INPUT": [
+              1,
+              [
+                11,
+                "message1",
+                "|sj.f5L4u^QFbZI~~/.7"
+              ]
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "k": {
+          "opcode": "event_whenbroadcastreceived",
+          "next": "f",
+          "parent": null,
+          "inputs": {},
+          "fields": {
+            "BROADCAST_OPTION": [
+              "message1",
+              "|sj.f5L4u^QFbZI~~/.7",
+              "broadcast_msg"
+            ]
+          },
+          "shadow": false,
+          "topLevel": true,
+          "x": 698,
+          "y": 227
+        },
+        "f": {
+          "opcode": "control_create_clone_of",
+          "next": null,
+          "parent": "k",
+          "inputs": {
+            "CLONE_OPTION": [
+              1,
+              "l"
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "l": {
+          "opcode": "control_create_clone_of_menu",
+          "next": null,
+          "parent": "f",
+          "inputs": {},
+          "fields": {
+            "CLONE_OPTION": [
+              "_myself_",
+              "qcc*wJN6p6Rp)@lm@h+y"
+            ]
+          },
+          "shadow": true,
+          "topLevel": false
         }
       },
-      "comments": {},
+      "comments": {
+        "g": {
+          "blockId": "c",
+          "x": 692.3414351851852,
+          "y": -32.14814814814869,
+          "width": 200,
+          "height": 200,
+          "minimized": false,
+          "text": "hat"
+        }
+      },
       "currentCostume": 0,
       "costumes": [
         {
@@ -104,7 +296,7 @@
   ],
   "monitors": [],
   "extensionData": {},
-  "extensions": ["pmOperatorsExpansion"],
+  "extensions": [],
   "meta": {
     "semver": "3.0.0",
     "vm": "0.2.0",
@@ -114,5 +306,7 @@
       "url": "https://penguinmod.com/",
       "version": "stable"
     }
-  }
+  },
+  "sideloadExtensionURLs": {},
+  "sideloadExtensionEnvs": {}
 }

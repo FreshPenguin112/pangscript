@@ -5,14 +5,7 @@
   "dependencies": {
     "@babel/cli": "^7.23.9",
     "@babel/plugin-transform-modules-commonjs": "^7.23.3",
-    "@babel/preset-typescript": "^7.24.1",
-    "@types/luaparse": "^0.2.12",
-    "acorn": "^8.12.1",
-    "acorn-loose": "^8.4.0",
-    "acorn-walk": "^8.3.4",
-    "antlr4": "^4.13.1-patch-1",
     "antlr4ng": "^3.0.4",
-    "jszip": "2.7.0",
-    "luaparse": "^0.3.1"
+    "jszip": "2.7.0"
   }
 }

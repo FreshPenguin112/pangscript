@@ -26,10 +26,10 @@ chunk
     ;
 
 block
-    : statment* retstatment?
+    : statement* retstatement?
     ;
 
-statment
+statement
     : ';'
     | varlist '=' explist
     | functioncall
@@ -55,7 +55,7 @@ attrib
     : ('<' NAME '>')?
     ;
 
-retstatment
+retstatement
     : ('return' explist? | 'break' | 'continue') ';'?
     ;
 
