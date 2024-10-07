@@ -66,6 +66,9 @@ class visitor extends LuaParserVisitor {
         let x = this.visitChildren(ctx);
         return x instanceof Array ? x[0] : x;
     }
+    visitConcatenation(ctx) {
+
+    }
     visitFunctioncall(ctx) {
         //console.log(ctx.parser.getVocabulary())
         //console.log(ctx.NAME(0).getText())
@@ -76,39 +79,67 @@ class visitor extends LuaParserVisitor {
                 //this.idCounter++;
                 //let parent = generator.letterCount(generator.blockIdCounter-1);
                 //let next = generator.letterCount(generator.blockIdCounter+1);
-                let blocks = this.blocks;
-                if (ctx.args(0).explist(0).exp().length === 1) {this.blocks = this.generator
-                    .addBlock({
-                        opcode: "looks_say",
-                        //id,
-                        //next,
-                        //parent,
-                        inputs: {
-                            MESSAGE: [
-                                1,
-                                [
-                                    10,
-                                    String(
-                                        this.visitExp(
-                                            ctx.args(0).explist(0).exp(0)
-                                        )
-                                    ),
-                                ],
+                //let blocks = this.blocks;
+                if (ctx.args(0).explist(0).exp().length === 1) {
+                    let x = this.visitExp(
+                        ctx.args(0).explist(0).exp(0)
+                    )
+                    if (typeof x === "object") {
+                        x = [3, String(this.generator.letterCount(this.generator.blockIdCounter - 1)), [10, "Hello!"]]
+                    } else {
+                        x = [
+                            1,
+                            [
+                                10,
+                                String(
+                                    this.visitExp(
+                                        ctx.args(0).explist(0).exp(0)
+                                    )
+                                ),
                             ],
-                        },
-                    })} else {
-                        this.blocks = this.generator
-                    .addBlock({
-                        opcode: "looks_sayforsecs",
-                        //id,
-                        //next,
-                        //parent,
-                        inputs: {
-                            MESSAGE: [1, [10, String(this.visitExp(ctx.args(0).explist(0).exp(0)))]], "SECS": [1, [4, String(this.visitExp(ctx.args(0).explist(0).exp(1)))]],
-                        },
-                    });
-                    };
-                    return;
+                        ]
+                    }
+                    this.blocks = this.generator
+                        .addBlock({
+                            opcode: "looks_say",
+                            //id,
+                            //next,
+                            //parent,
+                            inputs: {
+                                MESSAGE: x,
+                            },
+                        })
+                } else {
+                    let x = this.visitExp(
+                        ctx.args(0).explist(0).exp(0)
+                    )
+                    if (typeof x === "object") {
+                        x = [3, String(this.generator.letterCount(this.generator.blockIdCounter - 1)), [10, "Hello!"]]
+                    } else {
+                        x = [
+                            1,
+                            [
+                                10,
+                                String(
+                                    this.visitExp(
+                                        ctx.args(0).explist(0).exp(0)
+                                    )
+                                ),
+                            ],
+                        ]
+                    }
+                    this.blocks = this.generator
+                        .addBlock({
+                            opcode: "looks_sayforsecs",
+                            //id,
+                            //next,
+                            //parent,
+                            inputs: {
+                                MESSAGE: [1, [10, String(this.visitExp(ctx.args(0).explist(0).exp(0)))]], "SECS": [1, [4, String(this.visitExp(ctx.args(0).explist(0).exp(1)))]],
+                            },
+                        });
+                };
+                return;
             }
             default: {
                 return this.sendText(ctx);
@@ -116,7 +147,30 @@ class visitor extends LuaParserVisitor {
         }
     }
     visitExp(ctx) {
-        return this.getText(ctx, true);
+        let elements = []
+        let x = (() => {
+            for (let i = 0; i < ctx.children.length; i++) {
+                let e = ctx.children[i];
+                elements.push(this.getText(e))
+                switch (this.getText(e)) {
+                    case (".."): {
+                        this.blocks = {...this.blocks,...this.generator.addBlock({
+                            opcode: "operator_join",
+                            inputs: {
+                                STRING1: [1, [10, String(elements[i - 1])]],
+                                STRING2: [1, [10, String(elements[i + 1])]],
+                            },
+                        })}
+                    }
+                    default: {
+                        return this.getText(ctx, true);
+                    }
+                }
+            }
+        })();
+        console.log(elements)
+        return x || this.generator.getBlocks();
+        //return this.getText(ctx, true);
     }
 }
 module.exports = visitor;
