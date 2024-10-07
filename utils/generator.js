@@ -119,7 +119,7 @@ class generator {
     }
 
     addBlock(options) {
-        console.log(this.blockIdCounter)
+        //console.log(this.blockIdCounter)
         const [id, opcode, next, parent, inputs, fields, shadow, topLevel] = [
             options.id || this.letterCount(this.blockIdCounter),
             options.opcode,

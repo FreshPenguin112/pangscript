@@ -5,6 +5,7 @@
   "dependencies": {
     "@babel/cli": "^7.23.9",
     "@babel/plugin-transform-modules-commonjs": "^7.23.3",
+    "antlr4": "^4.13.2",
     "antlr4ng": "^3.0.4",
     "jszip": "2.7.0"
   }

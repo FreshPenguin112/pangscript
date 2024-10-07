@@ -1,4 +1,4 @@
-const { InputStream, CommonTokenStream, Token } = require("../lib/antlr4");
+const { InputStream, CommonTokenStream, Token } = require("antlr4");
 const SimpleLangLexer = require("../lib/LuaLexer").default;
 const SimpleLangParser = require("../lib/LuaParser").default;
 const _visitor = require("./visitor");
@@ -9,11 +9,12 @@ const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
 
 generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true }); //add a whenflagclicked block for the start of the script
-console.log(generator.blockIdCounter);
+//console.log(generator.blockIdCounter);
 const input = new InputStream(
     readFileSync(path.join(__dirname, "test.lua"), "utf8").toString()
 );
 const debug = process.argv.includes("--debug") || process.argv.includes("-d");
+const outfile = process.argv.includes("-o") || process.argv.includes("--outfile") ? process.argv[(process.argv.indexOf("-o") == -1 ? process.argv.indexOf("-outfile") : process.argv.indexOf("-o")) + 1] : "../indexTest.pmp"
 const lexer = new SimpleLangLexer(input);
 /*if (debug) {
     let token = lexer.nextToken();
@@ -40,10 +41,13 @@ visitor.visitBlock(tree);
 let result = visitor.getAndClearBlocks();
 const mergedBlocks = { ...a, ...result.blocks };
 visitor.generator.importBlocks(mergedBlocks);
-debug && console.log("result:\n");
+debug && console.log("blocks:\n");
 debug && console.log(JSON.stringify(visitor.generator.getBlocks()));
 debug && console.log();
+debug && console.log("result:\n");
+debug && console.log(`saved to file: ${outfile}`);
+debug && console.log();
 debug && writeFileSync(
-    path.join(__dirname, "../indexTest.pmp"),
+    path.join(__dirname, outfile),
     visitor.generator.getProject()
 );
