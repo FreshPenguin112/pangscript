@@ -1,12 +1,12 @@
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
-const generator = new _generator();
 //console.log(Object.getOwnPropertyNames(v))
 class visitor extends LuaParserVisitor {
     constructor() {
         super();
         this.idCounter = 0;
         this.blocks = {};
+        this.generator = new _generator()
     }
     // isType and getText methods are just ripped straight from fplus
     /*
@@ -77,7 +77,7 @@ class visitor extends LuaParserVisitor {
                 //let parent = generator.letterCount(generator.blockIdCounter-1);
                 //let next = generator.letterCount(generator.blockIdCounter+1);
                 let blocks = this.blocks;
-                this.blocks = {blocks,...generator
+                this.blocks = this.generator
                     .addBlock({
                         opcode: "looks_say",
                         //id,
@@ -96,7 +96,7 @@ class visitor extends LuaParserVisitor {
                                 ],
                             ],
                         },
-                    })};
+                    });
                     return;
             }
             default: {

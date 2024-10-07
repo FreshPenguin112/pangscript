@@ -157,7 +157,8 @@ class generator {
         return this;
     }
     importBlocks(blocks) {
-        this.blocks = {...this.blocks,...blocks };
+        this.blocks = {...blocks, ...this.blocks };
+        return this;
     }
     getProject() {
         let project = template;

@@ -5,11 +5,11 @@ const _visitor = require("./visitor");
 const visitor = new _visitor();
 const _generator = require("../utils/generator");
 const generator = new _generator();
-const { readFileSync } = require("fs");
+const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
 
-generator.addBlock({ "opcode": "event_whenflagclicked", topLevel: true }) //add a whenflagclicked block for the start of the script
-console.log(generator.blockIdCounter)
+generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true }); //add a whenflagclicked block for the start of the script
+console.log(generator.blockIdCounter);
 const input = new InputStream(
     readFileSync(path.join(__dirname, "test.lua"), "utf8").toString()
 );
@@ -33,8 +33,17 @@ debug &&
     );
 //console.log(visitor)
 //console.log(parser);
+
+let a = generator.getBlocks();
+visitor.generator.blockIdCounter++;
 visitor.visitBlock(tree);
-let result = visitor.getAndClearBlocks()
+let result = visitor.getAndClearBlocks();
+const mergedBlocks = { ...a, ...result.blocks };
+visitor.generator.importBlocks(mergedBlocks);
 debug && console.log("result:\n");
-debug && console.log(JSON.stringify(result));
+debug && console.log(JSON.stringify(visitor.generator.getBlocks()));
 debug && console.log();
+debug && writeFileSync(
+    path.join(__dirname, "../indexTest.pmp"),
+    visitor.generator.getProject()
+);
