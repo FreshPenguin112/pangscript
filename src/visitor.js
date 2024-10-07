@@ -77,7 +77,7 @@ class visitor extends LuaParserVisitor {
                 //let parent = generator.letterCount(generator.blockIdCounter-1);
                 //let next = generator.letterCount(generator.blockIdCounter+1);
                 let blocks = this.blocks;
-                this.blocks = this.generator
+                if (ctx.args(0).explist(0).exp().length === 1) {this.blocks = this.generator
                     .addBlock({
                         opcode: "looks_say",
                         //id,
@@ -96,7 +96,18 @@ class visitor extends LuaParserVisitor {
                                 ],
                             ],
                         },
+                    })} else {
+                        this.blocks = this.generator
+                    .addBlock({
+                        opcode: "looks_sayforsecs",
+                        //id,
+                        //next,
+                        //parent,
+                        inputs: {
+                            MESSAGE: [1, [10, String(this.visitExp(ctx.args(0).explist(0).exp(0)))]], "SECS": [1, [4, String(this.visitExp(ctx.args(0).explist(0).exp(1)))]],
+                        },
                     });
+                    };
                     return;
             }
             default: {

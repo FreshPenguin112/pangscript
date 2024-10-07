@@ -44,10 +44,10 @@ visitor.generator.importBlocks(mergedBlocks);
 debug && console.log("blocks:\n");
 debug && console.log(JSON.stringify(visitor.generator.getBlocks()));
 debug && console.log();
-debug && console.log("result:\n");
-debug && console.log(`saved to file: ${outfile}`);
-debug && console.log();
-debug && writeFileSync(
+console.log("result:\n");
+console.log(`saved to file: ${outfile}`);
+console.log();
+writeFileSync(
     path.join(__dirname, outfile),
     visitor.generator.getProject()
 );
