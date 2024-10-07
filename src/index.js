@@ -3,15 +3,13 @@ const SimpleLangLexer = require("../lib/LuaLexer").default;
 const SimpleLangParser = require("../lib/LuaParser").default;
 const _visitor = require("./visitor");
 const visitor = new _visitor();
-const { compiler } = require("./compile");
-const { compile } = new compiler();
+const _generator = require("../utils/generator");
+const generator = new _generator();
 const { readFileSync } = require("fs");
 const path = require("path");
 
-// Read input file
-//const code = readFileSync(args[0], "utf8");
-
-// Create compiler instance
+generator.addBlock({ "opcode": "event_whenflagclicked", topLevel: true }) //add a whenflagclicked block for the start of the script
+console.log(generator.blockIdCounter)
 const input = new InputStream(
     readFileSync(path.join(__dirname, "test.lua"), "utf8").toString()
 );
@@ -33,16 +31,10 @@ debug &&
     console.log(
         `tree:\n\n${tree.toStringTree(null, parser) || "blank tree"}\n`
     );
-// comment out until compiler is ready to be tested
-debug && console.log("compiled:\n");
-debug && console.log(compile(tree) || "blank compiled output");
-debug && console.log();
-
 //console.log(visitor)
 //console.log(parser);
-let result = visitor.visitBlock(tree);
+visitor.visitBlock(tree);
+let result = visitor.getAndClearBlocks()
 debug && console.log("result:\n");
-if (result instanceof Array)
-    result.forEach((x) => console.log(x || "blank output"));
-else console.log(result || "blank output");
+debug && console.log(JSON.stringify(result));
 debug && console.log();

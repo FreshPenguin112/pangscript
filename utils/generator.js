@@ -94,7 +94,7 @@ class generator {
         this.blocks = {};
         this.blockIdCounter = 1;
     }
-    generatorBlocksArray(array) { }
+    //generatorBlocksArray(array) { }
     letterCount(num) {
         let letters = "abcdefghijklmnopqrstuvwxyz";
         let result = "";
@@ -119,11 +119,12 @@ class generator {
     }
 
     addBlock(options) {
+        console.log(this.blockIdCounter)
         const [id, opcode, next, parent, inputs, fields, shadow, topLevel] = [
-            options.id || this.letterCount(this.blockIdCounter++),
+            options.id || this.letterCount(this.blockIdCounter),
             options.opcode,
-            options.next || null,
-            options.parent || null,
+            options.next || this.letterCount(this.blockIdCounter + 1),
+            options.parent || this.letterCount(this.blockIdCounter - 1),
             options.inputs || {},
             options.fields || {},
             options.shadow || false,
@@ -133,7 +134,7 @@ class generator {
             this.blocks[id] = {
                 opcode,
                 next,
-                parent,
+                parent: null,
                 inputs,
                 fields,
                 shadow,
@@ -152,12 +153,16 @@ class generator {
                 topLevel,
             };
         }
+        this.blockIdCounter++;
         return this;
+    }
+    importBlocks(blocks) {
+        this.blocks = {...this.blocks,...blocks };
     }
     getProject() {
         let project = template;
         project.targets.find((x) => x.name === "Sprite1").blocks =
-            this.getAndClearBlocks();
+            this.getBlocks();
         let zip = new jszip();
         zip.file("project.json", JSON.stringify(project));
         zip.file(

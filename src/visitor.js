@@ -3,6 +3,11 @@ const _generator = require("../utils/generator");
 const generator = new _generator();
 //console.log(Object.getOwnPropertyNames(v))
 class visitor extends LuaParserVisitor {
+    constructor() {
+        super();
+        this.idCounter = 0;
+        this.blocks = {};
+    }
     // isType and getText methods are just ripped straight from fplus
     /*
     might not even need isType because the you can just define
@@ -18,10 +23,10 @@ class visitor extends LuaParserVisitor {
             }
         })();
     }
-    getText(ctx) {
+    getText(ctx, parse = false) {
         return (() => {
             try {
-                return ctx.getText();
+                return parse ? JSON.parse(ctx.getText()) : ctx.getText();
             } catch (e) {
                 return "";
             }
@@ -51,22 +56,56 @@ class visitor extends LuaParserVisitor {
     sendText(ctx, name = false) {
         return `${name || this.getName(ctx)}: ${this.getText(ctx)}`;
     }
+    getAndClearBlocks() {
+        let blocksCopy = { ...this.blocks };
+        this.blocks = {};
+        return blocksCopy;
+    }
     visitStatement(ctx) {
-        return this.visitChildren(ctx) instanceof Array
-            ? this.visitChildren(ctx)[0]
-            : this.visitChildren(ctx);
+        //console.log(this.visitChildren(ctx))
+        let x = this.visitChildren(ctx);
+        return x instanceof Array ? x[0] : x;
     }
     visitFunctioncall(ctx) {
         //console.log(ctx.parser.getVocabulary())
         //console.log(ctx.NAME(0).getText())
         switch (this.getText(ctx.NAME(0))) {
             case "print": {
-                return this.sendText(ctx, "print");
+                //console.log(this.visitExp(ctx.args(0).explist(0).exp(0)));
+                //let id = generator.letterCount(generator.blockIdCounter+1);
+                //this.idCounter++;
+                //let parent = generator.letterCount(generator.blockIdCounter-1);
+                //let next = generator.letterCount(generator.blockIdCounter+1);
+                let blocks = this.blocks;
+                this.blocks = {blocks,...generator
+                    .addBlock({
+                        opcode: "looks_say",
+                        //id,
+                        //next,
+                        //parent,
+                        inputs: {
+                            MESSAGE: [
+                                1,
+                                [
+                                    10,
+                                    String(
+                                        this.visitExp(
+                                            ctx.args(0).explist(0).exp(0)
+                                        )
+                                    ),
+                                ],
+                            ],
+                        },
+                    })};
+                    return;
             }
             default: {
                 return this.sendText(ctx);
             }
         }
+    }
+    visitExp(ctx) {
+        return this.getText(ctx, true);
     }
 }
 module.exports = visitor;
