@@ -85,7 +85,7 @@ class visitor extends LuaParserVisitor {
                         ctx.args(0).explist(0).exp(0)
                     )
                     if (typeof x === "object") {
-                        x = [3, String(this.generator.letterCount(this.generator.blockIdCounter - 1)), [10, "Hello!"]]
+                        x = [3, String(this.generator.letterCount(this.generator.blockIdCounter + 1)), [10, "Hello!"]]
                     } else {
                         x = [
                             1,
@@ -114,7 +114,7 @@ class visitor extends LuaParserVisitor {
                         ctx.args(0).explist(0).exp(0)
                     )
                     if (typeof x === "object") {
-                        x = [3, String(this.generator.letterCount(this.generator.blockIdCounter - 1)), [10, "Hello!"]]
+                        x = [3, String(this.generator.letterCount(this.generator.blockIdCounter + 1)), [10, "Hello!"]]
                     } else {
                         x = [
                             1,
