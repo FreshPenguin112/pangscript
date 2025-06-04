@@ -47,6 +47,7 @@
                     "fields": {},
                     "shadow": false,
                     "topLevel": true,
+                    "mutation": null,
                     "x": 0,
                     "y": 0
                 },
@@ -57,16 +58,19 @@
                     "inputs": {},
                     "fields": {},
                     "shadow": true,
-                    "topLevel": false
-                },
-                "y96p65xicy": {
-                    "opcode": "argument_reporter_string_number",
-                    "next": null,
-                    "parent": "c",
-                    "inputs": {},
-                    "fields": { "VALUE": ["x", ""] },
-                    "shadow": true,
-                    "topLevel": false
+                    "topLevel": false,
+                    "mutation": {
+                        "proccode": "test",
+                        "argumentids": "[]",
+                        "argumentnames": "[]",
+                        "argumentdefaults": "[]",
+                        "warp": "false",
+                        "children": [],
+                        "returns": "null",
+                        "edited": "true",
+                        "optype": "null",
+                        "color": "[\"#FF6680\",\"#FF4D6A\",\"#FF3355\"]"
+                    }
                 },
                 "b": {
                     "opcode": "procedures_definition",
@@ -76,6 +80,7 @@
                     "fields": {},
                     "shadow": false,
                     "topLevel": true,
+                    "mutation": null,
                     "x": 0,
                     "y": 0
                 }

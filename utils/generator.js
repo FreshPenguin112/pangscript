@@ -157,7 +157,7 @@ class generator {
             };
         }
         this.blockIdCounter++;
-        return this;
+        return id; // <-- Fix: return the block's ID
     }
     importBlocks(blocks) {
         this.blocks = {...blocks, ...this.blocks };

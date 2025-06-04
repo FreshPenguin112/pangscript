@@ -1,3 +1,1 @@
-function test()
-    print("test")
-end
+print("test")

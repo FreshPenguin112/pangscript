@@ -1,14 +1,14 @@
 const { InputStream, CommonTokenStream, Token } = require("antlr4");
 const SimpleLangLexer = require("../lib/LuaLexer").default;
 const SimpleLangParser = require("../lib/LuaParser").default;
-const _visitor = require("./visitor");
-const visitor = new _visitor();
 const _generator = require("../utils/generator");
 const generator = new _generator();
+const _visitor = require("./visitor");
+const visitor = new _visitor(generator);
 const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
 
-generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true }); //add a whenflagclicked block for the start of the script
+generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, parent: null, next: null}); //add a whenflagclicked block for the start of the script
 //console.log(generator.blockIdCounter);
 const input = new InputStream(
     readFileSync(path.join(__dirname, "test.lua"), "utf8").toString()
@@ -36,11 +36,11 @@ debug &&
 //console.log(parser);
 
 let a = generator.getBlocks();
-visitor.generator.blockIdCounter++;
-visitor.visitBlock(tree);
-let result = visitor.getAndClearBlocks();
+//visitor.generator.blockIdCounter++;
+visitor.visit(tree);
+let result = visitor.generator.getBlocks();
 const mergedBlocks = { ...a, ...result.blocks };
-visitor.generator.importBlocks(mergedBlocks);
+generator.importBlocks(mergedBlocks);
 debug && console.log("blocks:\n");
 debug && console.log(JSON.stringify(visitor.generator.getBlocks()));
 debug && console.log();
