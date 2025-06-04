@@ -123,8 +123,8 @@ class generator {
         const [id, opcode, next, parent, inputs, fields, shadow, topLevel] = [
             options.id || this.letterCount(this.blockIdCounter),
             options.opcode,
-            options.next || this.letterCount(this.blockIdCounter + 1),
-            options.parent || this.letterCount(this.blockIdCounter - 1),
+            options.hasOwnProperty('next') ? options.next : this.letterCount(this.blockIdCounter + 1),
+            options.hasOwnProperty('parent') ? options.parent : this.letterCount(this.blockIdCounter - 1),
             options.inputs || {},
             options.fields || {},
             options.shadow || false,

@@ -1,1 +1,1 @@
-print("h" .. "i")
+print("hi" .. " there" .. " world " .. 500, 4 + 1)
