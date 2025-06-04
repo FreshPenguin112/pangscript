@@ -66,6 +66,9 @@ COMMENT=65
 WS=66
 NL=67
 SHEBANG=68
+STRINGTYPE=69
+NUMBERTYPE=70
+BOOLEANTYPE=71
 ';'=1
 '='=2
 'break'=3
@@ -122,3 +125,6 @@ SHEBANG=68
 '/'=54
 '...'=55
 '~='=56
+'string'=69
+'number'=70
+'boolean'=71

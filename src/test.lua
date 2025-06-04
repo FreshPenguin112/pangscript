@@ -1,1 +1,3 @@
-print("hi" .. " there" .. " world " .. 500, 4 + 1)
+function test()
+    print("test")
+end

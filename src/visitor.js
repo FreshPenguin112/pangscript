@@ -1,12 +1,12 @@
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
-//console.log(Object.getOwnPropertyNames(v))
+
 class visitor extends LuaParserVisitor {
     constructor() {
         super();
-        this.idCounter = 0;
         this.blocks = {};
         this.generator = new _generator();
+        this.procRegistry = {}; // name -> {proccode, argIds, argNames, returns, optype}
     }
     // isType and getText methods are just ripped straight from fplus
     /*
@@ -62,59 +62,231 @@ class visitor extends LuaParserVisitor {
         return blocksCopy;
     }
     visitStatement(ctx) {
-        //console.log(this.visitChildren(ctx))
-        let x = this.visitChildren(ctx);
-        return x instanceof Array ? x[0] : x;
+        // Handle function definitions at statement level
+        if (ctx.funcname && ctx.funcbody) {
+            return this.visitFunctiondef(ctx);
+        }
+        return this.visitChildren(ctx);
     }
-    visitConcatenation(ctx) {}
-    visitFunctioncall(ctx) {
-        switch (this.getText(ctx.NAME(0))) {
-            case "print": {
-                // The flag block is always the previous block (blockIdCounter is already at the next free letter)
-                const flagId = this.generator.letterCount(this.generator.blockIdCounter - 1);
+    visitFunctiondef(ctx) {
+        // Get function name (for local functions, use NAME, for global use funcname)
+        let funcName = "myblock";
+        if (ctx.funcname) {
+            funcName = this.getText(ctx.funcname());
+        } else if (ctx.NAME) {
+            funcName = this.getText(ctx.NAME());
+        }
 
-                // Say block
-                const sayId = this.generator.letterCount(this.generator.blockIdCounter);
-                this.generator.blockIdCounter++; // Reserve for say block
-
-                // Check if there are two expressions (for say for secs)
-                const explist = ctx.args(0).explist(0);
-                const exps = explist.exp ? explist.exp() : [];
-                if (exps.length === 2) {
-                    // say for secs
-                    let msg = this.visitExp(exps[0], sayId);
-                    let secs = this.visitExp(exps[1], sayId);
-
-                    this.blocks = this.generator.addBlock({
-                        opcode: "looks_sayforsecs",
-                        id: sayId,
-                        parent: flagId,
-                        next: null,
-                        inputs: {
-                            MESSAGE: msg,
-                            SECS: typeof secs === "object" ? secs : [1, [4, String(secs)]],
-                        },
-                    });
-                } else {
-                    // say
-                    let x = this.visitExp(explist, sayId);
-
-                    this.blocks = this.generator.addBlock({
-                        opcode: "looks_say",
-                        id: sayId,
-                        parent: flagId,
-                        next: null, // End of chain
-                        inputs: {
-                            MESSAGE: x,
-                        },
-                    });
-                }
-                return;
-            }
-            default: {
-                return this.sendText(ctx);
+        // Get parameter names robustly
+        let funcbody = ctx.funcbody && ctx.funcbody();
+        if (!funcbody || !funcbody.children) {
+            // Defensive: skip or return if funcbody is missing or malformed
+            return;
+        }
+        let argNames = [];
+        let parlist = funcbody.children.find(child =>
+            child.constructor && child.constructor.name === "ParlistContext"
+        );
+        if (parlist && parlist.children && parlist.children.length > 0) {
+            let namelist = parlist.children.find(child =>
+                child.constructor && child.constructor.name === "NamelistContext"
+            );
+            if (namelist) {
+                argNames = namelist.children
+                    .filter(child => child.symbol && child.symbol.type && child.symbol.text)
+                    .map(child => child.symbol.text);
             }
         }
+
+        // Add this line to generate unique IDs for each argument
+        let argIds = argNames.map(() => this._genUid());
+
+        // --- NEW: Get return type annotation if present ---
+        let returnType = "string"; // default
+        let hasReturnAnnotation = false;
+        if (funcbody.returntype) {
+            const typeNode = funcbody.returntype();
+            if (typeNode) {
+                hasReturnAnnotation = true;
+                returnType = this.getText(typeNode.children[1]); // skip the colon
+            }
+        }
+
+        // Detect return: look for retstatement in block
+        let block = funcbody.block();
+        let hasReturn = false;
+        if (block && block.retstatement) {
+            let ret = block.retstatement();
+            if (ret) {
+                hasReturn = true;
+            }
+        }
+
+        // --- ENFORCE nil return type means no return allowed ---
+        if (hasReturnAnnotation && returnType === "nil" && hasReturn) {
+            throw new Error(`Function "${funcName}" is annotated as returning nil but has a return statement.`);
+        }
+
+        // If no annotation but has return, default to string
+        if (!hasReturnAnnotation && hasReturn) {
+            returnType = "string";
+        }
+
+        // If annotated as nil, treat as not returning
+        if (hasReturnAnnotation && returnType === "nil") {
+            hasReturn = false;
+            returnType = null;
+        }
+
+        // Build proccode (e.g. "join %s and %s")
+        let proccode = funcName + (argNames.length ? " " + argNames.map(() => "%s").join(", ") : "");
+
+        // Store in registry for calls
+        this.procRegistry[funcName] = {
+            proccode,
+            argIds,
+            argNames,
+            returns: hasReturn,
+            optype: hasReturn ? `"${returnType}"` : "null"
+        };
+
+        // IDs for blocks
+        const defId = this.generator.letterCount(this.generator.blockIdCounter++);
+        const protoId = this.generator.letterCount(this.generator.blockIdCounter++);
+
+        // Create prototype block
+        this.generator.addBlock({
+            opcode: "procedures_prototype",
+            id: protoId,
+            parent: defId,
+            next: null,
+            shadow: true,
+            mutation: {
+                proccode,
+                argumentids: JSON.stringify(argIds || []),
+                argumentnames: JSON.stringify(argNames || []),
+                argumentdefaults: JSON.stringify((argNames || []).map(() => "")),
+                warp: "true",
+                returns: hasReturn ? "true" : "null",
+                edited: "true",
+                optype: hasReturn ? `"${returnType}"` : "null",
+                color: JSON.stringify(["#FF6680", "#FF4D6A", "#FF3355"])
+            }
+        });
+
+        // Argument reporter blocks
+        argIds.forEach((id, i) => {
+            this.blocks[id] = this.generator.addBlock({
+                opcode: "argument_reporter_string_number",
+                id,
+                parent: protoId,
+                next: null,
+                shadow: true,
+                fields: { VALUE: [argNames[i], ""] },
+                mutation: {
+                    color: JSON.stringify(["#FF6680", "#FF4D6A", "#FF3355"])
+                }
+            });
+        });
+
+        // Visit function body (statements)
+        let bodyFirstId = null;
+        let lastBodyId = null;
+        if (block && block.statement) {
+            const stmts = Array.isArray(block.statement()) ? block.statement() : [block.statement()];
+            for (let stmt of stmts) {
+                const stmtId = this.visit(stmt);
+                if (stmtId) {
+                    // If the block isn't already saved, save it
+                    if (!this.blocks[stmtId]) {
+                        // You may need to return the block object from visitFunctioncall etc.
+                        // For now, assume the block is created in the visit method and saved there
+                        // If not, you can add logic here to create/save it
+                    }
+                    if (!bodyFirstId) bodyFirstId = stmtId;
+                    if (lastBodyId && this.blocks[lastBodyId]) {
+                        this.blocks[lastBodyId].next = stmtId;
+                    }
+                    lastBodyId = stmtId;
+                    // Set parent to defId for top-level body blocks
+                    if (this.blocks[stmtId]) this.blocks[stmtId].parent = defId;
+                }
+            }
+        }
+
+        // Definition block, chain prototype and body
+        this.blocks[defId] = this.generator.addBlock({
+            opcode: hasReturn ? "procedures_definition_return" : "procedures_definition",
+            id: defId,
+            parent: null,
+            next: null,
+            topLevel: true,
+            inputs: { custom_block: [1, protoId] }
+        });
+
+        // Chain prototype to first body block
+        if (bodyFirstId && this.blocks[protoId]) {
+            this.blocks[protoId].next = bodyFirstId;
+        }
+
+        // If hasReturn, generate a procedures_return block (already handled above)
+        // ...existing return block logic...
+
+        return defId;
+    }
+    visitFunctioncall(ctx) {
+        const funcName = this.getText(ctx.NAME ? ctx.NAME(0) : ctx);
+        if (funcName === "print") {
+            const flagId = this.generator.letterCount(this.generator.blockIdCounter - 1);
+            const sayId = this.generator.letterCount(this.generator.blockIdCounter);
+            this.generator.blockIdCounter++;
+            const explist = ctx.args(0).explist(0);
+            let x = this.visitExp(explist, sayId);
+            this.blocks[sayId] = this.generator.addBlock({
+                opcode: "looks_say",
+                id: sayId,
+                parent: null, // will be set by functiondef
+                next: null,
+                inputs: { MESSAGE: x }
+            });
+            return sayId;
+        }
+        // User-defined function call
+        const proc = this.procRegistry[funcName];
+        if (!proc) {
+            throw new Error(`Function "${funcName}" is not defined or not registered in procRegistry.`);
+        }
+
+        const callId = this.generator.letterCount(this.generator.blockIdCounter++);
+        // Gather argument expressions
+        let callArgs = [];
+        if (ctx.args && typeof ctx.args === "function") {
+            const argsCtx = ctx.args();
+            if (argsCtx && argsCtx.explist && typeof argsCtx.explist === "function") {
+                const explist = argsCtx.explist(0);
+                if (explist && explist.exp) callArgs = explist.exp();
+            }
+        }
+        let callInputs = {};
+        for (let i = 0; i < proc.argIds.length; i++) {
+            callInputs[proc.argIds[i]] = callArgs[i] ? this.visitExp(callArgs[i], callId) : [1, [10, ""]];
+        }
+        this.generator.addBlock({
+            opcode: "procedures_call",
+            id: callId,
+            parent: null,
+            next: null,
+            inputs: callInputs,
+            mutation: {
+                proccode: proc.proccode,
+                argumentids: JSON.stringify(proc.argIds),
+                warp: "false",
+                returns: proc.returns ? "true" : "null",
+                optype: proc.optype,
+                color: JSON.stringify(["#FF6680", "#FF4D6A", "#FF3355"])
+            }
+        });
+        return [3, callId, [4, ""]];
     }
     visitExp(ctx, parentId = null) {
         // Concatenation: exp .. exp
@@ -206,5 +378,10 @@ class visitor extends LuaParserVisitor {
         }
         return this.getText(ctx, true);
     }
+    _genUid() {
+        // Simple unique ID for argument IDs (replace with a better one if needed)
+        return Math.random().toString(36).substr(2, 16);
+    }
 }
+
 module.exports = visitor;

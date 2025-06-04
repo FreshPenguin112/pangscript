@@ -133,8 +133,12 @@ functiondef
     : 'function' funcbody
     ;
 
+returntype
+    : COL (NIL | STRINGTYPE | NUMBERTYPE | BOOLEANTYPE)
+    ;
+
 funcbody
-    : '(' parlist ')' block 'end'
+    : '(' parlist ')' returntype? block 'end'
     ;
 
 /* lparser.c says "is 'parlist' not empty?"

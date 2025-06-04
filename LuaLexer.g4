@@ -121,3 +121,7 @@ WS: [ \t\u000C\r]+ -> channel(HIDDEN);
 NL: [\n] -> channel(2);
 
 SHEBANG: '#' { this.IsLine1Col0() }? '!'? SingleLineInputCharacter* -> channel(HIDDEN);
+
+STRINGTYPE : 'string';
+NUMBERTYPE : 'number';
+BOOLEANTYPE: 'boolean';
