@@ -114,7 +114,9 @@ fragment HexDigit: [0-9a-fA-F];
 
 fragment SingleLineInputCharacter: ~[\r\n\u0085\u2028\u2029];
 
-COMMENT: '--' { this.HandleComment(); } -> channel(HIDDEN);
+COMMENT: '--' { this.HandleComment(); } ~[\r\n]* -> channel(HIDDEN);
+
+LONGCOMMENT: '--' '[[' .+? ']]' '--' -> channel(HIDDEN);
 
 WS: [ \t\u000C\r]+ -> channel(HIDDEN);
 

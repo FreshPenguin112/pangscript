@@ -57,7 +57,7 @@ if (visitor.mainBodyBlockIds && visitor.mainBodyBlockIds.length > 0) {
 debug && console.log("blocks:\n");
 debug && console.log(JSON.stringify(visitor.generator.getBlocks()));
 debug && console.log();
-console.log("result:\n");
+//console.log("result:\n");
 console.log(`saved to file: ${outfile}`);
 console.log();
 writeFileSync(
