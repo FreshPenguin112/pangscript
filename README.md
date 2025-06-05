@@ -6,7 +6,7 @@ This project is aimed towards use in developing advanced projects that would be 
 
 # Build/Usage steps
 
-- Make sure you have a modern or latest java version install and in your PATH, i'm using java 21.
+- Make sure you have a modern or latest java version install and in your PATH and as the default, i'm using java 21.
 - In the root directory, install everything with your favorite node package manager, for example `npm i` or `bun i`, then run the the install script with the same thing, for example, `npm run install2` or `bun run install2`
 - Run the build script, with the same tool you used to install, for example `npm run build` or `bun run build`.
 - After this you can enter the "src" directory and run `node index.js` to build "test.lua".
