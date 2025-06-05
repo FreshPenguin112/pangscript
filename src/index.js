@@ -8,7 +8,7 @@ const generator = new _generator();
 const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
 
-generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true }); //add a whenflagclicked block for the start of the script
+generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, next: null, id: "a" }); // Ensure id is "a" for reference
 //console.log(generator.blockIdCounter);
 const input = new InputStream(
     readFileSync(path.join(__dirname, "test.lua"), "utf8").toString()
@@ -41,6 +41,19 @@ visitor.visitBlock(tree);
 let result = visitor.getAndClearBlocks();
 const mergedBlocks = { ...a, ...result.blocks };
 visitor.generator.importBlocks(mergedBlocks);
+
+// --- Chain main function body under whenflagclicked ---
+if (visitor.mainBodyBlockIds && visitor.mainBodyBlockIds.length > 0) {
+    // Set parent and next for main body blocks
+    for (let i = 0; i < visitor.mainBodyBlockIds.length; i++) {
+        const id = visitor.mainBodyBlockIds[i];
+        visitor.generator.blocks[id].parent = "a";
+        visitor.generator.blocks[id].next = visitor.mainBodyBlockIds[i + 1] || null;
+    }
+    // Set whenflagclicked's next to first main body block
+    visitor.generator.blocks["a"].next = visitor.mainBodyBlockIds[0];
+}
+
 debug && console.log("blocks:\n");
 debug && console.log(JSON.stringify(visitor.generator.getBlocks()));
 debug && console.log();

@@ -120,7 +120,7 @@ class generator {
 
     addBlock(options) {
         //console.log(this.blockIdCounter)
-        const [id, opcode, next, parent, inputs, fields, shadow, topLevel] = [
+        const [id, opcode, next, parent, inputs, fields, shadow, topLevel, mutation] = [
             options.id || this.letterCount(this.blockIdCounter),
             options.opcode,
             options.hasOwnProperty('next') ? options.next : this.letterCount(this.blockIdCounter + 1),
@@ -129,6 +129,7 @@ class generator {
             options.fields || {},
             options.shadow || false,
             options.topLevel || false,
+                options.mutation || null
         ];
         if (topLevel) {
             this.blocks[id] = {
@@ -139,6 +140,7 @@ class generator {
                 fields,
                 shadow,
                 topLevel,
+                mutation,
                 x: 0,
                 y: 0,
             };
@@ -151,10 +153,11 @@ class generator {
                 fields,
                 shadow,
                 topLevel,
+                mutation,
             };
         }
         this.blockIdCounter++;
-        return this;
+        return id;
     }
     importBlocks(blocks) {
         this.blocks = {...blocks, ...this.blocks };
