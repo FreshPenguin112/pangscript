@@ -6,7 +6,7 @@ This project is aimed towards use in developing advanced projects that would be 
 
 # Build/Usage steps
 
-- In the root directory, install everything with your favorite node package manager, for example `npm i` or `bun i`.
+- In the root directory, install everything with your favorite node package manager, for example `npm i` or `bun i`, then run the the install script with the same thing, for example, `npm run install` or `bun run install`
 - Run the build script, with the same tool you used to install, for example `npm run build` or `bun run build`.
 - After this you can enter the "src" directory and run `node index.js` to build "test.lua".
 
