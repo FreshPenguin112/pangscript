@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "build": "npm i -g bun && bun i && node_modules/.bin/antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && node_modules/.bin/babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs"
+    "build": "npm i -g && antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs"
   },
   "dependencies": {
     "@babel/cli": "^7.23.9",
