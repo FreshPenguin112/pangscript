@@ -1,7 +1,7 @@
 {
 "scripts": {
     "build": "antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs",
-    "install": "npm i && npm install -g @babel/cli@^7.23.9 @babel/plugin-transform-modules-commonjs@^7.23.3 antlr4@^4.13.2 antlr4ng@^3.0.4"
+    "install2": "npm install -g @babel/cli @babel/plugin-transform-modules-commonjs antlr4ng"
   },
   "dependencies": {
     "jszip": "2.7.0",
