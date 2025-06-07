@@ -1,7 +1,7 @@
 # What is this?
 
 This is a small project i'm working on called PangScript.
-It's a minimal implementation of Lua that is adapted for and compiles to PenguinMod code.
+It's a minimal implementation of Lua that is adapted for and transpiles to PenguinMod code.
 This project is aimed towards use in developing advanced projects that would be too time consuming to create by hand in the PenguinMod editor.
 
 # Build/Usage steps
