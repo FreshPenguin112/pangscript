@@ -10,11 +10,12 @@ const path = require("path");
 
 generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, next: null, id: "a" }); // Ensure id is "a" for reference
 //console.log(generator.blockIdCounter);
-const input = new InputStream(
-    readFileSync(path.join(__dirname, "test.lua"), "utf8").toString()
-);
 const debug = process.argv.includes("--debug") || process.argv.includes("-d");
+const infile = process.argv.includes("-i") || process.argv.includes("--infile") ? process.argv[(process.argv.indexOf("-i") == -1 ? process.argv.indexOf("--infile") : process.argv.indexOf("-i")) + 1] : "test.lua";
 const outfile = process.argv.includes("-o") || process.argv.includes("--outfile") ? process.argv[(process.argv.indexOf("-o") == -1 ? process.argv.indexOf("-outfile") : process.argv.indexOf("-o")) + 1] : "../indexTest.pmp"
+const input = new InputStream(
+    readFileSync(path.join(__dirname, infile), "utf8").toString()
+);
 const lexer = new SimpleLangLexer(input);
 /*if (debug) {
     let token = lexer.nextToken();

@@ -2,3 +2,4 @@ node_modules
 *lock*
 lib/*
 !lib/LuaLexerBase.js
+blocks_vertical

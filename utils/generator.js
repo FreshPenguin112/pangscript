@@ -172,19 +172,19 @@ class generator {
         zip.file(
             "c434b674f2da18ba13cdfe51dbc05ecc.svg",
             readFileSync(
-                path.join(__dirname, "../indexTest/c434b674f2da18ba13cdfe51dbc05ecc.svg")
+                path.join(__dirname, "../startingAssets/c434b674f2da18ba13cdfe51dbc05ecc.svg")
             ).toString()
         );
         zip.file(
             "cd21514d0531fdffb22204e0ec5ed84a.svg",
             readFileSync(
-                path.join(__dirname, "../indexTest/cd21514d0531fdffb22204e0ec5ed84a.svg")
+                path.join(__dirname, "../startingAssets/cd21514d0531fdffb22204e0ec5ed84a.svg")
             ).toString()
         );
         zip.file(
             "e140d7ff07de8fa35c3d1595bba835ac.wav",
             readFileSync(
-                path.join(__dirname, "../indexTest/e140d7ff07de8fa35c3d1595bba835ac.wav")
+                path.join(__dirname, "../startingAssets/e140d7ff07de8fa35c3d1595bba835ac.wav")
             )
         );
         return zip.generate({ type: "nodebuffer" });

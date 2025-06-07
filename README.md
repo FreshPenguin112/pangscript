@@ -14,6 +14,7 @@ This project is aimed towards use in developing advanced projects that would be 
 # Command line arguments for index.js
 
 - `--debug` or `-d`, prints additional debug info for the build, the ast and the generated blocks object that goes in project.json.
+- `--infile` or `-i`, you can specify a different path to the input lua file, such as `../test2.lua`, the default path is `test.lua` in the src directory if you don't use this argument.
 - `--outfile` or `-o`, you can set a different path to save the project file to, such as `../PangScriptTest.pmp`, the default path is `indexTest.pmp` in the root directory if you don't use this argument.
 
 # Current available syntax

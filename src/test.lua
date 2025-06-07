@@ -4,6 +4,28 @@
     You can use single-line comments with `-- whatever` or multi-line comments as shown in this comment block.
 ]]--
 
+--[[
+    I'm too lazy to properly demonstrate all the conditions and available operators you can use, so here's the internal list lmao.
+        {
+            "+": { opcode: "operator_add"},
+            "-": { opcode: "operator_subtract"},
+            "*": { opcode: "operator_multiply"},
+            "/": { opcode: "operator_divide"},
+            "%": { opcode: "operator_mod"},
+            "^": { opcode: "operator_power"},
+            "<": { opcode: "operator_lt"},
+            ">": { opcode: "operator_gt"},
+            "<=": { opcode: "operator_ltorequal"},
+            ">=": { opcode: "operator_gtorequal"},
+            "==": { opcode: "operator_equals"},
+            "~=": { opcode: "operator_notequal"},
+            "and": { opcode: "operator_and"},
+            "or": { opcode: "operator_or"},
+            }
+            You can also the unary "-" operator before a number to make it negative.
+            You can also use the `not` operator to negate a boolean value.
+]]--
+
 function test()
     --[[
         The below code demonstrates how to use the print function.
@@ -36,6 +58,23 @@ function test2()
     print(4 + 3 * 2 - 8 / 4)
 end
 
+function test3()
+    --[[
+        The below code demonstrates how to use if-else statements.
+        You can use if statements, elseif statements, and else statements to control the flow of your program.
+        The conditions are evaluated in order, and the first true condition's block is executed.
+    ]]--
+    if 5 < 3 then
+        print("5 is less than 3")
+    elseif 5 == 3 then
+        print("5 is equal to 3")
+    elseif 5 + 3 == 8 then
+        print("5 plus 3 is equal to 8")
+    else
+        print("idek man")
+    end
+end
+
 function main()
     --[[
         The main function is a special reserved function that never gets compiled into a my blocks function,
@@ -48,4 +87,6 @@ function main()
     test()
     test1()
     test2()
+    test3()
 end
+
