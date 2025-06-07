@@ -1,0 +1,3 @@
+[submodule "src/PenguinMod-Blocks"]
+	path = src/PenguinMod-Blocks
+	url = https://github.com/PenguinMod/PenguinMod-Blocks.git

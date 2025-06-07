@@ -1,5 +1,7 @@
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
+const {processedBlocks} = require("./blocks.js");
+
 //console.log(Object.getOwnPropertyNames(v))
 class visitor extends LuaParserVisitor {
     constructor() {
@@ -545,6 +547,83 @@ class visitor extends LuaParserVisitor {
             }
 
             // Set parent of join blocks to the say/sayforsecs block
+            for (const joinId of joinBlockIds) {
+                this.generator.blocks[joinId].parent = blockId;
+            }
+
+            return blockId;
+        }
+        // this is why we use ts kids
+        if (!this.customBlocks[funcName]) {
+            const explist = ctx.args(0).explist(0);
+            const exps = explist.exp ? explist.exp() : [];
+            let messageInput;
+            let joinBlockIds = [];
+
+            // Build the message input (join chain if needed)
+            if (exps.length > 0) {
+                let left = this.visitExp(exps[0], null, true);
+                for (
+                    let i = 1;
+                    i < exps.length - (exps.length > 1 ? 1 : 0);
+                    i++
+                ) {
+                    const right = this.visitExp(exps[i]);
+                    const joinId = this.generator.addBlock({
+                        opcode: "operator_join",
+                        inputs: {
+                            STRING1:
+                                typeof left === "string"
+                                    ? [1, [10, left]]
+                                    : left,
+                            STRING2:
+                                typeof right === "string"
+                                    ? [1, [10, right]]
+                                    : right,
+                        },
+                        parent: null,
+                        next: null,
+                        shadow: false,
+                        topLevel: false,
+                    });
+                    joinBlockIds.push(joinId);
+                    left = [3, joinId, [10, ""]];
+                }
+                messageInput = left;
+            } else {
+                messageInput = [1, [10, ""]];
+            }
+            if (typeof messageInput !== "string") {
+                // If messageInput is a block reference, set its parent to the say block's id (which we know will be assigned below)
+                if (
+                    Array.isArray(messageInput) &&
+                    messageInput[0] === 3 &&
+                    typeof messageInput[1] === "string"
+                ) {
+                    const sayBlockId = this.generator.letterCount(
+                        this.generator.blockIdCounter
+                    );
+                    this.generator.blocks[messageInput[1]].parent = sayBlockId;
+                }
+            }
+            // k
+            const inputs = processedBlocks[funcName][0];
+            console.log(inputs)
+            let blockId = this.generator.addBlock({
+                    opcode: funcName,
+                    inputs: {
+                        //TODO: allow multiple inputs
+                        ...Object.fromEntries([[inputs[0].name, typeof messageInput === "string"
+                                ? [1, [10, messageInput]]
+                                : [1, [4, messageInput]]]])
+                    },
+                    parent: null,
+                    next: null,
+                    shadow: false,
+                    topLevel: false,
+                });
+
+            // Set parent of join blocks to the block
             for (const joinId of joinBlockIds) {
                 this.generator.blocks[joinId].parent = blockId;
             }
