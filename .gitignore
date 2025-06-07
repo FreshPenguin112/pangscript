@@ -1,6 +1,6 @@
 node_modules
 # *lock*
-pm-blocks
+pm-block
 lib/*
 !lib/LuaLexerBase.js
 blocks_vertical

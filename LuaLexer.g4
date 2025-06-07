@@ -1,7 +1,8 @@
 // $antlr-format alignTrailingComments true, columnLimit 150, maxEmptyLinesToKeep 1, reflowComments false, useTab false
 // $antlr-format allowShortRulesOnASingleLine true, allowShortBlocksOnASingleLine true, minEmptyLines 0, alignSemicolons ownLine
 // $antlr-format alignColons trailing, singleLineOverrulesHangingColon true, alignLexerCommands true, alignLabels true, alignTrailers true
-
+// nah
+// ic
 lexer grammar LuaLexer;
 
 options {
@@ -107,7 +108,7 @@ fragment DecimalEscape: '\\' Digit | '\\' Digit Digit | '\\' [0-2] Digit Digit;
 fragment HexEscape: '\\' 'x' HexDigit HexDigit;
 
 fragment UtfEscape: '\\' 'u{' HexDigit+ '}';
-
+// i was wondering what this was
 fragment Digit: [0-9];
 
 fragment HexDigit: [0-9a-fA-F];
