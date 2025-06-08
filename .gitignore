@@ -1,7 +1,8 @@
 node_modules
 # *lock*
-pm-block
 lib/*
 !lib/LuaLexerBase.js
 blocks_vertical
 pnpm-lock.yaml
+package-lock.json
+bun.lock*
