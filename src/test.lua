@@ -88,5 +88,8 @@ function main()
     test1()
     test2()
     test3()
+    motion_movesteps(10)
+    sensing_askandwait("What is your name?")
+    print("Hello, " .. sensing_answer() .. "!")
 end
 

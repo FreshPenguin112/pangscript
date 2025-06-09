@@ -89,6 +89,7 @@ const template = {
 const jszip = require("jszip");
 const { readFileSync } = require("fs");
 const path = require("path");
+const { processedBlocks } = require("../src/blocks.js");
 class generator {
     constructor() {
         this.blocks = {};
@@ -119,7 +120,6 @@ class generator {
     }
 
     addBlock(options) {
-        //console.log(this.blockIdCounter)
         const [id, opcode, next, parent, inputs, fields, shadow, topLevel, mutation] = [
             options.id || this.letterCount(this.blockIdCounter),
             options.opcode,
@@ -129,14 +129,35 @@ class generator {
             options.fields || {},
             options.shadow || false,
             options.topLevel || false,
-                options.mutation || null
+            options.mutation || null
         ];
+
+        // --- NEW: handle array-style inputs ---
+        let processedInputs = inputs;
+        if (Array.isArray(inputs) && processedBlocks[opcode]) {
+            const inputMeta = processedBlocks[opcode][0];
+            let mappedInputs = {};
+            for (let i = 0; i < inputMeta.length; i++) {
+                const inputName = inputMeta[i].name;
+                let val = inputs[i];
+                // If input is a one-item array, treat as block id reference
+                if (Array.isArray(val) && val.length === 1) {
+                    mappedInputs[inputName] = [3, val[0], [10, ""]];
+                } else if (typeof val === "number") {
+                    mappedInputs[inputName] = [1, [4, String(val)]];
+                } else {
+                    mappedInputs[inputName] = [1, [10, String(val ?? "")]];
+                }
+            }
+            processedInputs = mappedInputs;
+        }
+
         if (topLevel) {
             this.blocks[id] = {
                 opcode,
                 next,
                 parent: null,
-                inputs,
+                inputs: processedInputs,
                 fields,
                 shadow,
                 topLevel,
@@ -149,7 +170,7 @@ class generator {
                 opcode,
                 next,
                 parent,
-                inputs,
+                inputs: processedInputs,
                 fields,
                 shadow,
                 topLevel,

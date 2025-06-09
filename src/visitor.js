@@ -1,6 +1,6 @@
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
-const {processedBlocks} = require("./blocks.js");
+const { processedBlocks } = require("./blocks.js");
 
 //console.log(Object.getOwnPropertyNames(v))
 class visitor extends LuaParserVisitor {
@@ -455,8 +455,16 @@ class visitor extends LuaParserVisitor {
         return x instanceof Array ? x[0] : x;
     }
     visitConcatenation(ctx) {}
-    visitFunctioncall(ctx) {
+    // Helper to wrap block references for input arrays
+    wrapInput(val) {
+        if (Array.isArray(val) && val[0] === 3) return [val[1]];
+        if (typeof val === "string" && this.generator.blocks[val]) return [val];
+        return val;
+    }
+    visitFunctioncall(ctx, asReporter = false) {
         const funcName = this.getText(ctx.NAME ? ctx.NAME(0) : ctx);
+
+        // Handle built-in print
         if (funcName === "print") {
             const explist = ctx.args(0).explist(0);
             const exps = explist.exp ? explist.exp() : [];
@@ -471,60 +479,48 @@ class visitor extends LuaParserVisitor {
                     i < exps.length - (exps.length > 1 ? 1 : 0);
                     i++
                 ) {
-                    const right = this.visitExp(exps[i]);
-                    const joinId = this.generator.addBlock({
+                    const rightVal = this.visitExp(exps[i], null, true);
+                    const joinId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    this.generator.addBlock({
                         opcode: "operator_join",
-                        inputs: {
-                            STRING1:
-                                typeof left === "string"
-                                    ? [1, [10, left]]
-                                    : left,
-                            STRING2:
-                                typeof right === "string"
-                                    ? [1, [10, right]]
-                                    : right,
-                        },
+                        id: joinId,
                         parent: null,
                         next: null,
-                        shadow: false,
-                        topLevel: false,
+                        inputs: [
+                            this.wrapInput(left),
+                            this.wrapInput(rightVal)
+                        ],
                     });
                     joinBlockIds.push(joinId);
                     left = [3, joinId, [10, ""]];
                 }
                 messageInput = left;
             } else {
-                messageInput = [1, [10, ""]];
+                messageInput = "";
             }
-            if (typeof messageInput !== "string") {
-                // If messageInput is a block reference, set its parent to the say block's id (which we know will be assigned below)
-                if (
-                    Array.isArray(messageInput) &&
-                    messageInput[0] === 3 &&
-                    typeof messageInput[1] === "string"
-                ) {
-                    const sayBlockId = this.generator.letterCount(
-                        this.generator.blockIdCounter
-                    );
-                    this.generator.blocks[messageInput[1]].parent = sayBlockId;
-                }
+
+            // If messageInput is a block reference, set its parent to the say block's id
+            if (
+                Array.isArray(messageInput) &&
+                messageInput[0] === 3 &&
+                typeof messageInput[1] === "string"
+            ) {
+                const sayBlockId = this.generator.letterCount(
+                    this.generator.blockIdCounter
+                );
+                this.generator.blocks[messageInput[1]].parent = sayBlockId;
             }
+
             // If there is a second argument, use sayforsecs
             let blockId;
             if (exps.length > 1) {
-                const secs = this.visitExp(exps[exps.length - 1]);
+                const secs = this.visitExp(exps[exps.length - 1], null, true);
                 blockId = this.generator.addBlock({
                     opcode: "looks_sayforsecs",
-                    inputs: {
-                        MESSAGE:
-                            typeof messageInput === "string"
-                                ? [1, [10, messageInput]]
-                                : messageInput,
-                        SECS:
-                            typeof secs === "object"
-                                ? secs
-                                : [1, [4, String(secs)]],
-                    },
+                    inputs: [
+                        this.wrapInput(messageInput),
+                        this.wrapInput(secs)
+                    ],
                     parent: null,
                     next: null,
                     shadow: false,
@@ -533,12 +529,9 @@ class visitor extends LuaParserVisitor {
             } else {
                 blockId = this.generator.addBlock({
                     opcode: "looks_say",
-                    inputs: {
-                        MESSAGE:
-                            typeof messageInput === "string"
-                                ? [1, [10, messageInput]]
-                                : messageInput,
-                    },
+                    inputs: [
+                        this.wrapInput(messageInput)
+                    ],
                     parent: null,
                     next: null,
                     shadow: false,
@@ -553,81 +546,28 @@ class visitor extends LuaParserVisitor {
 
             return blockId;
         }
-        // this is why we use ts kids
-        if (!this.customBlocks[funcName]) {
-            const explist = ctx.args(0).explist(0);
-            const exps = explist.exp ? explist.exp() : [];
-            let messageInput;
-            let joinBlockIds = [];
 
-            // Build the message input (join chain if needed)
-            if (exps.length > 0) {
-                let left = this.visitExp(exps[0], null, true);
-                for (
-                    let i = 1;
-                    i < exps.length - (exps.length > 1 ? 1 : 0);
-                    i++
-                ) {
-                    const right = this.visitExp(exps[i]);
-                    const joinId = this.generator.addBlock({
-                        opcode: "operator_join",
-                        inputs: {
-                            STRING1:
-                                typeof left === "string"
-                                    ? [1, [10, left]]
-                                    : left,
-                            STRING2:
-                                typeof right === "string"
-                                    ? [1, [10, right]]
-                                    : right,
-                        },
-                        parent: null,
-                        next: null,
-                        shadow: false,
-                        topLevel: false,
-                    });
-                    joinBlockIds.push(joinId);
-                    left = [3, joinId, [10, ""]];
-                }
-                messageInput = left;
-            } else {
-                messageInput = [1, [10, ""]];
+        // Handle built-in or extension opcode calls (not user-defined)
+        if (!this.customBlocks[funcName] && processedBlocks[funcName]) {
+            const inputsMeta = processedBlocks[funcName][0];
+            const explist = ctx.args && ctx.args(0) && ctx.args(0).explist
+                ? ctx.args(0).explist(0)
+                : null;
+            const exps = explist && explist.exp ? explist.exp() : [];
+            // Build array of inputs in order
+            const inputArr = [];
+            for (let i = 0; i < inputsMeta.length; i++) {
+                let val = exps[i] ? this.visitExp(exps[i], null, true) : "";
+                inputArr.push(this.wrapInput(val));
             }
-            if (typeof messageInput !== "string") {
-                // If messageInput is a block reference, set its parent to the say block's id (which we know will be assigned below)
-                if (
-                    Array.isArray(messageInput) &&
-                    messageInput[0] === 3 &&
-                    typeof messageInput[1] === "string"
-                ) {
-                    const sayBlockId = this.generator.letterCount(
-                        this.generator.blockIdCounter
-                    );
-                    this.generator.blocks[messageInput[1]].parent = sayBlockId;
-                }
-            }
-            // k
-            const inputs = processedBlocks[funcName][0];
-            console.log(inputs)
             let blockId = this.generator.addBlock({
-                    opcode: funcName,
-                    inputs: {
-                        //TODO: allow multiple inputs
-                        ...Object.fromEntries([[inputs[0].name, typeof messageInput === "string"
-                                ? [1, [10, messageInput]]
-                                : [1, [4, messageInput]]]])
-                    },
-                    parent: null,
-                    next: null,
-                    shadow: false,
-                    topLevel: false,
-                });
-
-            // Set parent of join blocks to the block
-            for (const joinId of joinBlockIds) {
-                this.generator.blocks[joinId].parent = blockId;
-            }
-
+                opcode: funcName,
+                inputs: inputArr,
+                parent: null,
+                next: null,
+                shadow: false,
+                topLevel: false,
+            });
             return blockId;
         }
         // User-defined function call
@@ -650,11 +590,11 @@ class visitor extends LuaParserVisitor {
                 if (explist && explist.exp) callArgs = explist.exp();
             }
         }
-        let callInputs = {};
+        let callInputs = [];
         for (let i = 0; i < proc.argumentids.length; i++) {
-            callInputs[proc.argumentids[i]] = callArgs[i]
-                ? this.visitExp(callArgs[i], callId)
-                : [1, [10, ""]];
+            callInputs.push(
+                callArgs[i] ? this.wrapInput(this.visitExp(callArgs[i], callId)) : ""
+            );
         }
         this.generator.addBlock({
             opcode: "procedures_call",
@@ -681,6 +621,29 @@ class visitor extends LuaParserVisitor {
             return ctx.getText().slice(1, -1); // Remove quotes
         }
 
+        // If it's a function call (reporter or user-defined)
+        if (
+            ctx.children &&
+            ctx.children.length === 1
+        ) {
+            const child = ctx.children[0];
+            // Direct function call
+            if (child.constructor && child.constructor.name === "FunctioncallContext") {
+                return this.visitFunctioncall(child, true);
+            }
+            // Prefixexp wrapping a function call
+            if (
+                child.constructor &&
+                child.constructor.name === "PrefixexpContext" &&
+                child.children &&
+                child.children.length === 1 &&
+                child.children[0].constructor &&
+                child.children[0].constructor.name === "FunctioncallContext"
+            ) {
+                return this.visitFunctioncall(child.children[0], true);
+            }
+        }
+
         // Concatenation: exp .. exp
         if (
             ctx.children &&
@@ -694,32 +657,26 @@ class visitor extends LuaParserVisitor {
                     exps.push(ctx.children[i]);
                 }
             }
+
+            // --- Use wrapInput for join inputs ---
+            // Use the class method for consistency
             // Left-associative: (((a .. b) .. c) .. d)
             let currentInput = this.visitExp(exps[0], null);
             for (let i = 1; i < exps.length; i++) {
                 const joinId = this.generator.letterCount(
-                    this.generator.blockIdCounter
+                    this.generator.blockIdCounter++
                 );
-                this.generator.blockIdCounter++; // Reserve for join block
+                const rightVal = this.visitExp(exps[i], null, true);
 
-                const left =
-                    typeof currentInput === "object"
-                        ? currentInput
-                        : [1, [10, String(currentInput)]];
-                const rightVal = this.visitExp(exps[i], joinId);
-                const right =
-                    typeof rightVal === "object"
-                        ? rightVal
-                        : [1, [10, String(rightVal)]];
                 this.generator.addBlock({
                     opcode: "operator_join",
                     id: joinId,
                     parent: parentId,
                     next: null,
-                    inputs: {
-                        STRING1: left,
-                        STRING2: right,
-                    },
+                    inputs: [
+                        this.wrapInput(currentInput),
+                        this.wrapInput(rightVal)
+                    ],
                 });
                 currentInput = [3, joinId, [10, ""]];
             }
@@ -796,7 +753,7 @@ class visitor extends LuaParserVisitor {
             };
 
             if (opMap[op]) {
-                const { opcode, left, right } = opMap[op];
+                const { opcode } = opMap[op];
                 const blockId = this.generator.letterCount(
                     this.generator.blockIdCounter++
                 );
@@ -809,16 +766,10 @@ class visitor extends LuaParserVisitor {
                     id: blockId,
                     parent: parentId, // Set parent to parentId
                     next: null,
-                    inputs: {
-                        [left]:
-                            typeof leftVal === "object"
-                                ? leftVal
-                                : [1, [4, String(leftVal)]],
-                        [right]:
-                            typeof rightVal === "object"
-                                ? rightVal
-                                : [1, [4, String(rightVal)]],
-                    },
+                    inputs: [
+                        this.wrapInput(leftVal),
+                        this.wrapInput(rightVal)
+                    ],
                 });
 
                 // Boolean blocks use [3, id, [4, ""]], string/number use [3, id, [10, ""]]
@@ -865,12 +816,9 @@ class visitor extends LuaParserVisitor {
                     id: blockId,
                     parent: parentId,
                     next: null,
-                    inputs: {
-                        OPERAND:
-                            typeof rightVal === "object"
-                                ? rightVal
-                                : [1, [4, String(rightVal)]],
-                    },
+                    inputs: [
+                        this.wrapInput(rightVal)
+                    ],
                 });
                 return forceStringFallback
                     ? [3, blockId, [10, ""]]
@@ -900,7 +848,9 @@ class visitor extends LuaParserVisitor {
             ctx.children &&
             ctx.children.length === 2 &&
             ctx.children[0].getText() === "-" &&
-            ctx.children[1].children[0].constructor.name.endsWith("NumberContext")
+            ctx.children[1].children[0].constructor.name.endsWith(
+                "NumberContext"
+            )
         ) {
             // Compile as negative number string
             return "-" + ctx.children[1].getText();
