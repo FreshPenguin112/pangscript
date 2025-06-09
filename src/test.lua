@@ -75,6 +75,22 @@ function test3()
     end
 end
 
+function test4()
+    --[[
+        The below code demonstrates how you can use use explicit opcodes as function calls for things that aren't
+        already implemented in this language.
+        Branch and hat blocks are not supported, but command and reporter blocks are.
+    ]]--
+    motion_movesteps(10)
+    sensing_askandwait("What is your name?")
+    print("Hello, " .. sensing_answer() .. "!", 2)
+    if sensing_answer() ~= "Joe" and sensing_answer() ~= "joe" and operator_trueBoolean() then
+        print("You're not Joe!", 2)
+    else
+        print("You're Joe!", 2)
+    end
+end
+
 function main()
     --[[
         The main function is a special reserved function that never gets compiled into a my blocks function,
@@ -88,8 +104,6 @@ function main()
     test1()
     test2()
     test3()
-    motion_movesteps(10)
-    sensing_askandwait("What is your name?")
-    print("Hello, " .. sensing_answer() .. "!")
+    test4()
 end
 
