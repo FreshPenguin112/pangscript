@@ -45,13 +45,7 @@ visitor.generator.importBlocks(mergedBlocks);
 
 // --- Chain main function body under whenflagclicked ---
 if (visitor.mainBodyBlockIds && visitor.mainBodyBlockIds.length > 0) {
-    // Set parent and next for main body blocks
-    for (let i = 0; i < visitor.mainBodyBlockIds.length; i++) {
-        const id = visitor.mainBodyBlockIds[i];
-        visitor.generator.blocks[id].parent = "a";
-        visitor.generator.blocks[id].next = visitor.mainBodyBlockIds[i + 1] || null;
-    }
-    // Set whenflagclicked's next to first main body block
+    visitor.generator.blocks[visitor.mainBodyBlockIds[0]].parent = "a";
     visitor.generator.blocks["a"].next = visitor.mainBodyBlockIds[0];
 }
 

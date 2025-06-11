@@ -10,8 +10,27 @@ class visitor extends LuaParserVisitor {
         this.blocks = {};
         this.generator = new _generator();
         this.customBlocks = {};
-        this.mainBodyBlockIds = []; // Store main's body block ids
+        this.mainBodyBlockIds = [];
+        this.variableScopes = {}; // { varName: "local" | "global" }
     }
+
+    // Helper to add variable to the correct place in the project template
+    addVariableToProject(varName, initialValue, scope = "global") {
+        // Get the generator's template object
+        const project = this.generator.template;
+        let target;
+        if (scope === "local") {
+            target = project.targets.find(t => t.name === "Sprite1");
+        } else {
+            target = project.targets.find(t => t.isStage);
+        }
+        if (!target.variables) target.variables = {};
+        // Only add if not already present
+        if (!Object.prototype.hasOwnProperty.call(target.variables, varName)) {
+            target.variables[varName] = [varName, initialValue];
+        }
+    }
+
     // isType and getText methods are just ripped straight from fplus
     /*
     might not even need isType because the you can just define
@@ -95,6 +114,16 @@ class visitor extends LuaParserVisitor {
                             if (stmtId) bodyBlockIds.push(stmtId);
                         }
                     }
+                }
+                // --- CHAINING MAIN BODY ---
+                if (bodyBlockIds.length > 0) {
+                    // Set parent and next using actual block IDs
+                    bodyBlockIds[0] && (this.generator.blocks[bodyBlockIds[0]].parent = null); // parent will be set to flag in index.js
+                    for (let i = 1; i < bodyBlockIds.length; i++) {
+                        this.generator.blocks[bodyBlockIds[i - 1]].next = bodyBlockIds[i];
+                        this.generator.blocks[bodyBlockIds[i]].parent = bodyBlockIds[i - 1];
+                    }
+                    this.generator.blocks[bodyBlockIds[bodyBlockIds.length - 1]].next = null;
                 }
                 // Save for index.js to chain under flag
                 this.mainBodyBlockIds = bodyBlockIds;
@@ -470,6 +499,166 @@ class visitor extends LuaParserVisitor {
                     CONDITION: [2, condition],
                     SUBSTACK: [2, body],
                 },
+            });
+            return blockId;
+        }
+        console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length < 10 &&
+            ctx.children[0].getText() === "for"
+        ) {
+            // Parse for loop: for x = start, end do ... end
+            const varName = ctx.children[1].getText();
+            const startExp = this.visitExp(ctx.children[3]);
+            const endExp = this.visitExp(ctx.children[5]);
+            const bodyIds = this.visitBlock(ctx.children[7]) || [];
+
+            // --- Variable declaration for for-loop variable ---
+            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                this.variableScopes[varName] = "global";
+                this.addVariableToProject(varName, typeof startExp === "number" ? startExp : 0, "global");
+            }
+
+            // Generate block IDs
+            const setVarId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const repeatId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const eqId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const changeId = this.generator.letterCount(this.generator.blockIdCounter++);
+
+            // 1. Set variable to start
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setVarId,
+                parent: null, // Will be set by parent (e.g., flag)
+                next: repeatId,   // Set next to repeatId here!
+                inputs: {
+                    VALUE: [1, [10, typeof startExp === "number" ? String(startExp) : String(startExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 2. operator_equals (loop exit condition)
+            this.generator.addBlock({
+                opcode: "operator_gt",
+                id: eqId,
+                parent: repeatId,
+                next: null,
+                inputs: {
+                    OPERAND1: [3, [12, varName, varName], [10, ""]],
+                    OPERAND2: [1, [10, String(endExp)]]
+                }
+            });
+
+            // 3. data_changevariableby (increment)
+            this.generator.addBlock({
+                opcode: "data_changevariableby",
+                id: changeId,
+                parent: null, // Will be set below
+                next: null,
+                inputs: {
+                    VALUE: [1, [4, "1"]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 4. Chain body blocks (if any), then chain increment after the last body block
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                // Chain body blocks
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                // Chain increment after last body block
+                this.generator.blocks[bodyIds[bodyIds.length - 1]].next = changeId;
+                this.generator.blocks[changeId].parent = bodyIds[bodyIds.length - 1];
+                // Set parent of first block in substack to repeatId
+                this.generator.blocks[bodyIds[0]].parent = repeatId;
+            } else {
+                // No body, increment is the only substack
+                substackFirst = changeId;
+                this.generator.blocks[changeId].parent = repeatId;
+            }
+            // Set parent of condition block to repeatId
+            this.generator.blocks[eqId].parent = repeatId;
+
+            // 5. control_repeat_until
+            this.generator.addBlock({
+                opcode: "control_repeat_until",
+                id: repeatId,
+                parent: setVarId,
+                next: null,
+                inputs: {
+                    SUBSTACK: [2, substackFirst],
+                    CONDITION: [2, eqId]
+                }
+            });
+
+            // Ensure setvariableto's next is set to repeatId
+            console.log(repeatId, setVarId);
+            this.generator.blocks[setVarId].next = repeatId;
+
+            // Return the id of the first block in the chain
+            return setVarId;
+        }
+
+        // --- Variable declaration/assignment support ---
+        // Syntax: local x = ... | x = ...
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local") || // local x = ...
+                (ctx.children.length === 3 && ctx.children[1].getText() === "=") // x = ...
+            )
+        ) {
+            let isLocal = false;
+            let varName, valueExp;
+            if (ctx.children.length === 4) {
+                // local x = ...
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                valueExp = this.visitExp(ctx.children[3]);
+            } else {
+                // x = ...
+                varName = ctx.children[0].getText();
+                valueExp = this.visitExp(ctx.children[2]);
+            }
+
+            // Check for redeclaration with different scope
+            if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                if (
+                    (isLocal && this.variableScopes[varName] !== "local") ||
+                    (!isLocal && this.variableScopes[varName] !== "global")
+                ) {
+                    throw new Error(
+                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`
+                    );
+                }
+            } else {
+                // First declaration: add to project
+                this.variableScopes[varName] = isLocal ? "local" : "global";
+                this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
+            }
+
+            // Assignment block
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [1, [10, typeof valueExp === "number" ? String(valueExp) : String(valueExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
             });
             return blockId;
         }
@@ -878,6 +1067,17 @@ class visitor extends LuaParserVisitor {
         ) {
             // Compile as negative number string
             return "-" + ctx.children[1].getText();
+        }
+        // If it's a variable
+        //console.log(this.getText(ctx.children[0]));
+        //console.log(ctx.children.map(c => c.constructor.name));
+        if (
+            ctx.children &&
+            ctx.children.length === 1 &&
+            ctx.children[0].constructor.name.endsWith("PrefixexpContext")
+        ) {
+            const varName = ctx.children[0].getText();
+            return [3, [12, varName, varName], [10, ""]];
         }
 
         // Not a concat or arithmetic, fallback to child or text

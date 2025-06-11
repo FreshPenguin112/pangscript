@@ -91,6 +91,25 @@ function test4()
     end
 end
 
+function test5()
+    --[[
+        The below code demonstrates how to use and declare variables.
+        Variables can be declared as local or global.
+        Local variables are defined under the main sprite, while global
+        variables are defined under the stage.
+        You can use the `local` keyword to declare a local variable, or you can just use the variable name
+        to declare a global variable.
+        Variables can be assigned values using the `=` operator.
+    ]]--
+    local myLocalVariable = 10 -- This is a local variable
+    myGlobalVariable = 20 -- This is a global variable, no `local` keyword used
+    print("myLocalVariable: " .. myLocalVariable) -- This will print "myLocalVariable: 10"
+    print("myGlobalVariable: " .. myGlobalVariable) -- This will print "myGlobalVariable: 20"
+    for i = 1, 5 do
+        print("Loop iteration: " .. i, 0.5) -- This will print "Loop iteration: 1", "Loop iteration: 2", etc.
+    end
+end
+
 function main()
     --[[
         The main function is a special reserved function that never gets compiled into a my blocks function,
@@ -105,5 +124,6 @@ function main()
     test2()
     test3()
     test4()
+    test5()
 end
 

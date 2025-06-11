@@ -1,9 +1,9 @@
-const template = {
+var template = {
     targets: [
         {
             isStage: true,
             name: "Stage",
-            variables: { "`jEk@4|i[#Fk?(8x)AV.-my variable": ["my variable", 0] },
+            variables: {"`jEk@4|i[#Fk?(8x)AV.-my variable": ["my variable", 0]},
             lists: {},
             broadcasts: {},
             customVars: [],
@@ -40,7 +40,7 @@ const template = {
             comments: {a:{
                     "blockId": null,
                     "x": 0,
-                    "y": 0,
+                    "y": -400,
                     "width": 200,
                     "height": 200,
                     "minimized": false,
@@ -102,6 +102,7 @@ class generator {
     constructor() {
         this.blocks = {};
         this.blockIdCounter = 1;
+        this.template = template;
     }
     //generatorBlocksArray(array) { }
     letterCount(num) {
@@ -128,6 +129,7 @@ class generator {
     }
 
     addBlock(options) {
+        //console.log(options.next ? `Adding block with next: ${options.next}` : "Adding block without next");
         const [id, opcode, next, parent, inputs, fields, shadow, topLevel, mutation] = [
             options.id || this.letterCount(this.blockIdCounter),
             options.opcode,
@@ -174,6 +176,7 @@ class generator {
                 y: 0,
             };
         } else {
+            //console.log(next)
             this.blocks[id] = {
                 opcode,
                 next,
@@ -193,7 +196,7 @@ class generator {
         return this;
     }
     getProject() {
-        let project = template;
+        let project = this.template;
         project.targets.find((x) => x.name === "Sprite1").blocks =
             this.getBlocks();
         let zip = new jszip();
