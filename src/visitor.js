@@ -449,7 +449,7 @@ class visitor extends LuaParserVisitor {
 
             return buildIfElse(this, branches);
         }
-        console.log(ctx.children.map(c => c.getText()));
+        //console.log(ctx.children.map(c => c.getText()));
         if (
             ctx.children &&
             ctx.children.length === 5 &&
