@@ -449,6 +449,30 @@ class visitor extends LuaParserVisitor {
 
             return buildIfElse(this, branches);
         }
+        console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length === 5 &&
+            ctx.children[0].getText() === "while"
+        ) {
+            // Handle while loop
+            const condition = this.visitExp(ctx.children[1])[1];
+            const body = this.visitBlock(ctx.children[3])[0];
+            const blockId = this.generator.letterCount(
+                this.generator.blockIdCounter++
+            );
+            this.generator.addBlock({
+                opcode: "control_while",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    CONDITION: [2, condition],
+                    SUBSTACK: [2, body],
+                },
+            });
+            return blockId;
+        }
 
         // fallback to default
         let x = this.visitChildren(ctx);
