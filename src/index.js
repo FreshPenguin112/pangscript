@@ -2,8 +2,8 @@ const { InputStream, CommonTokenStream, Token } = require("antlr4");
 const SimpleLangLexer = require("../lib/LuaLexer").default;
 const SimpleLangParser = require("../lib/LuaParser").default;
 const _visitor = require("./visitor");
-const visitor = new _visitor();
 const _generator = require("../utils/generator");
+const CompilerError = require('../utils/CompilerError');
 const generator = new _generator();
 const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
@@ -16,6 +16,7 @@ const outfile = process.argv.includes("-o") || process.argv.includes("--outfile"
 const input = new InputStream(
     readFileSync(path.join(__dirname, infile), "utf8").toString()
 );
+const visitor = new _visitor(input);
 const lexer = new SimpleLangLexer(input);
 /*if (debug) {
     let token = lexer.nextToken();
@@ -38,7 +39,18 @@ debug &&
 
 let a = generator.getBlocks();
 visitor.generator.blockIdCounter++;
-visitor.visitBlock(tree);
+try {
+    visitor.visitBlock(tree);
+} catch (err) {
+    if (err instanceof CompilerError) {
+        // Only print the user-friendly error
+        console.error(err.toString());
+    } else {
+        // Print full stack for unexpected errors
+        console.error(err.stack || err);
+    }
+    process.exit(1);
+}
 let result = visitor.getAndClearBlocks();
 const mergedBlocks = { ...a, ...result.blocks };
 visitor.generator.importBlocks(mergedBlocks);

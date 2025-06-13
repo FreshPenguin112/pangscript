@@ -1,13 +1,16 @@
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
+const CompilerError = require("../utils/CompilerError");
+
 const { processedBlocks } = require("./blocks.js");
 
 //console.log(Object.getOwnPropertyNames(v))
 class visitor extends LuaParserVisitor {
-    constructor() {
+    constructor(source) {
         super();
         this.idCounter = 0;
         this.blocks = {};
+        this.source = source.toString(); // Store the full source for error reporting
         this.generator = new _generator();
         this.customBlocks = {};
         this.mainBodyBlockIds = [];
@@ -123,7 +126,8 @@ class visitor extends LuaParserVisitor {
                         this.generator.blocks[bodyBlockIds[i - 1]].next = bodyBlockIds[i];
                         this.generator.blocks[bodyBlockIds[i]].parent = bodyBlockIds[i - 1];
                     }
-                    this.generator.blocks[bodyBlockIds[bodyBlockIds.length - 1]].next = null;
+                    //COMMENT OUT THIS BULLSHIT LINE TO FUCKING FIX LOOPS
+                    //this.generator.blocks[bodyBlockIds[bodyBlockIds.length - 1]].next = null;
                 }
                 // Save for index.js to chain under flag
                 this.mainBodyBlockIds = bodyBlockIds;
@@ -250,6 +254,7 @@ class visitor extends LuaParserVisitor {
                     bodyBlockIds[bodyBlockIds.length - 1]
                 ].next = null;
             } else {
+                //console.log(this.generator.blocks[defId].opcode)
                 this.generator.blocks[defId].next = null;
             }
 
@@ -464,6 +469,7 @@ class visitor extends LuaParserVisitor {
                         }
                         // Chain next pointers
                         for (let i = 1; i < substackIds.length; i++) {
+                            //console.log("hhh")
                             visitor.generator.blocks[substackIds[i - 1]].next =
                                 substackIds[i];
                             visitor.generator.blocks[substackIds[i]].parent =
@@ -486,10 +492,28 @@ class visitor extends LuaParserVisitor {
         ) {
             // Handle while loop
             const condition = this.visitExp(ctx.children[1])[1];
-            const body = this.visitBlock(ctx.children[3])[0];
+            const bodyIds = this.visitBlock(ctx.children[3]) || [];
+
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                // Chain body blocks
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                // Set parent of first block in substack to while block
+                this.generator.blocks[bodyIds[0]].parent = null; // will be set below
+            }
+
             const blockId = this.generator.letterCount(
                 this.generator.blockIdCounter++
             );
+            // Set parent of first block in substack to while block
+            if (substackFirst) {
+                this.generator.blocks[substackFirst].parent = blockId;
+            }
+
             this.generator.addBlock({
                 opcode: "control_while",
                 id: blockId,
@@ -497,22 +521,31 @@ class visitor extends LuaParserVisitor {
                 next: null,
                 inputs: {
                     CONDITION: [2, condition],
-                    SUBSTACK: [2, body],
+                    SUBSTACK: [2, substackFirst],
                 },
             });
             return blockId;
         }
-        console.log(ctx.children.map(c => c.getText()));
+        //console.log(ctx.children.map(c => c.getText()));
+        // ...existing code...
         if (
             ctx.children &&
-            ctx.children.length < 10 &&
+            ctx.children.length >= 7 &&
             ctx.children[0].getText() === "for"
         ) {
-            // Parse for loop: for x = start, end do ... end
+            // Handles both: for i = 1, 5 do ... end
+            //           and for i = 1, 5, 2 do ... end
             const varName = ctx.children[1].getText();
             const startExp = this.visitExp(ctx.children[3]);
             const endExp = this.visitExp(ctx.children[5]);
-            const bodyIds = this.visitBlock(ctx.children[7]) || [];
+            let stepExp = 1;
+            let bodyIdx = 7;
+            // Check for optional step
+            if (ctx.children.length >= 9 && ctx.children[6].getText() === ",") {
+                stepExp = this.visitExp(ctx.children[7]);
+                bodyIdx = 9;
+            }
+            const bodyIds = this.visitBlock(ctx.children[bodyIdx]) || [];
 
             // --- Variable declaration for for-loop variable ---
             if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
@@ -530,8 +563,8 @@ class visitor extends LuaParserVisitor {
             this.generator.addBlock({
                 opcode: "data_setvariableto",
                 id: setVarId,
-                parent: null, // Will be set by parent (e.g., flag)
-                next: repeatId,   // Set next to repeatId here!
+                parent: null,
+                next: null,
                 inputs: {
                     VALUE: [1, [10, typeof startExp === "number" ? String(startExp) : String(startExp)]]
                 },
@@ -542,24 +575,24 @@ class visitor extends LuaParserVisitor {
 
             // 2. operator_equals (loop exit condition)
             this.generator.addBlock({
-                opcode: "operator_gt",
+                opcode: "operator_equals",
                 id: eqId,
                 parent: repeatId,
                 next: null,
                 inputs: {
                     OPERAND1: [3, [12, varName, varName], [10, ""]],
-                    OPERAND2: [1, [10, String(endExp)]]
+                    OPERAND2: [1, [10, typeof endExp === "number" ? String(endExp) : String(endExp)]]
                 }
             });
 
-            // 3. data_changevariableby (increment)
+            // 3. data_changevariableby (increment, supports custom step)
             this.generator.addBlock({
                 opcode: "data_changevariableby",
                 id: changeId,
-                parent: null, // Will be set below
+                parent: null,
                 next: null,
                 inputs: {
-                    VALUE: [1, [4, "1"]]
+                    VALUE: [1, [4, typeof stepExp === "number" ? String(stepExp) : String(stepExp)]]
                 },
                 fields: {
                     VARIABLE: [varName, varName, ""]
@@ -570,22 +603,17 @@ class visitor extends LuaParserVisitor {
             let substackFirst = null;
             if (Array.isArray(bodyIds) && bodyIds.length > 0) {
                 substackFirst = bodyIds[0];
-                // Chain body blocks
                 for (let i = 1; i < bodyIds.length; i++) {
                     this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
                     this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
                 }
-                // Chain increment after last body block
                 this.generator.blocks[bodyIds[bodyIds.length - 1]].next = changeId;
                 this.generator.blocks[changeId].parent = bodyIds[bodyIds.length - 1];
-                // Set parent of first block in substack to repeatId
                 this.generator.blocks[bodyIds[0]].parent = repeatId;
             } else {
-                // No body, increment is the only substack
                 substackFirst = changeId;
                 this.generator.blocks[changeId].parent = repeatId;
             }
-            // Set parent of condition block to repeatId
             this.generator.blocks[eqId].parent = repeatId;
 
             // 5. control_repeat_until
@@ -600,13 +628,11 @@ class visitor extends LuaParserVisitor {
                 }
             });
 
-            // Ensure setvariableto's next is set to repeatId
-            console.log(repeatId, setVarId);
             this.generator.blocks[setVarId].next = repeatId;
 
-            // Return the id of the first block in the chain
             return setVarId;
         }
+        // ...existing code...
 
         // --- Variable declaration/assignment support ---
         // Syntax: local x = ... | x = ...
@@ -623,11 +649,13 @@ class visitor extends LuaParserVisitor {
                 // local x = ...
                 isLocal = true;
                 varName = ctx.children[1].getText();
-                valueExp = this.visitExp(ctx.children[3]);
+                const expResult = this.visitExp(ctx.children[3]);
+                valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
             } else {
                 // x = ...
                 varName = ctx.children[0].getText();
-                valueExp = this.visitExp(ctx.children[2]);
+                const expResult = this.visitExp(ctx.children[2]);
+                valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
             }
 
             // Check for redeclaration with different scope
@@ -636,9 +664,11 @@ class visitor extends LuaParserVisitor {
                     (isLocal && this.variableScopes[varName] !== "local") ||
                     (!isLocal && this.variableScopes[varName] !== "global")
                 ) {
-                    throw new Error(
-                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`
-                    );
+                    throw new CompilerError(
+                    `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
+                    ctx,
+                    this.source
+                );
                 }
             } else {
                 // First declaration: add to project
@@ -653,9 +683,7 @@ class visitor extends LuaParserVisitor {
                 id: blockId,
                 parent: null,
                 next: null,
-                inputs: {
-                    VALUE: [1, [10, typeof valueExp === "number" ? String(valueExp) : String(valueExp)]]
-                },
+                inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
                 fields: {
                     VARIABLE: [varName, varName, ""]
                 }

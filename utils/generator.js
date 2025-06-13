@@ -3,7 +3,7 @@ var template = {
         {
             isStage: true,
             name: "Stage",
-            variables: {"`jEk@4|i[#Fk?(8x)AV.-my variable": ["my variable", 0]},
+            variables: {},
             lists: {},
             broadcasts: {},
             customVars: [],
@@ -40,7 +40,7 @@ var template = {
             comments: {a:{
                     "blockId": null,
                     "x": 0,
-                    "y": -400,
+                    "y": -250,
                     "width": 200,
                     "height": 200,
                     "minimized": false,
@@ -150,6 +150,7 @@ class generator {
             for (let i = 0; i < inputMeta.length; i++) {
                 const inputName = inputMeta[i].name;
                 let val = inputs[i];
+                if (val === null) continue;
                 // If input is a one-item array, treat as block id reference
                 if (Array.isArray(val) && val.length === 1) {
                     mappedInputs[inputName] = [3, val[0], [10, ""]];
