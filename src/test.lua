@@ -114,12 +114,12 @@ function test6()
         The for loop iterates over a range of numbers, while the while loop continues until a condition is false.
     ]]--
     for i = 1, 5 do -- This loops from 1 to 5
-        print("This is iteration number: " .. i)
+        print("This is iteration number: " .. i, 0.5)
     end
     local j = 1
     while j <= 5 do -- This loops while j is less than or equal to 5
-        print("This is iteration number: " .. j)
-        local j = j + 1
+        print("This is iteration number: " .. j, 0.5)
+        local j += 1
     end
     --[[
         For loops can also have a step value, which is the third argument in the for loop.
@@ -127,8 +127,42 @@ function test6()
         The below code demonstrates a for loop with a step value of 2.
     ]]--
     for i = 1, 5, 2 do -- This loops from 1 to 5 with a step value of 2, i will be set as follows: 1, 3, 5.
-        print("This is iteration number: " .. i)
+        print("This is iteration number: " .. i, 0.5)
     end
+end
+
+function test7()
+    --[[
+        The below code demonstrates the use of compound assignment operators.
+        Compound operators allow you to perform an operation and assignment in one step.
+        The following compound operators are supported:
+            += : addition assignment
+            -= : subtraction assignment
+            *= : multiplication assignment
+            /= : division assignment
+            ^= : exponentiation assignment
+        The syntax is: variable <operator>= value
+        This is equivalent to: variable = variable <operator> value
+    ]]--
+    local a = 5
+    local a += 3 -- a = a + 3, a is now 8
+    print("a after += 3: " .. a, 2)
+
+    local b = 10
+    local b -= 4 -- b = b - 4, b is now 6
+    print("b after -= 4: " .. b, 2)
+
+    local c = 2
+    local c *= 7 -- c = c * 7, c is now 14
+    print("c after *= 7: " .. c, 2)
+
+    local d = 20
+    local d /= 5 -- d = d / 5, d is now 4
+    print("d after /= 5: " .. d, 2)
+
+    local e = 2
+    local e ^= 3 -- e = e ^ 3, e is now 8
+    print("e after ^= 3: " .. e, 2)
 end
 
 function main()
@@ -147,5 +181,6 @@ function main()
     test4()
     test5()
     test6()
+    test7()
 end
 

@@ -13,6 +13,11 @@ options {
 
 SEMI : ';';
 EQ   : '=';
+PLUSEQ  : '+=';
+MINUSEQ : '-=';
+STAREQ  : '*=';
+SLASHEQ : '/=';
+CARETEQ : '^=';
 
 BREAK    : 'break';
 GOTO     : 'goto';

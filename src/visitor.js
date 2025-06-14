@@ -1,3 +1,5 @@
+// the following regex can be used to find all uncommented console.log statements in vscode because i'm lazy
+// ^(?!\s*\/\/).*console\.log\([^)]*\);?
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
 const CompilerError = require("../utils/CompilerError");
@@ -120,14 +122,24 @@ class visitor extends LuaParserVisitor {
                 }
                 // --- CHAINING MAIN BODY ---
                 if (bodyBlockIds.length > 0) {
-                    // Set parent and next using actual block IDs
-                    bodyBlockIds[0] && (this.generator.blocks[bodyBlockIds[0]].parent = null); // parent will be set to flag in index.js
-                    for (let i = 1; i < bodyBlockIds.length; i++) {
-                        this.generator.blocks[bodyBlockIds[i - 1]].next = bodyBlockIds[i];
-                        this.generator.blocks[bodyBlockIds[i]].parent = bodyBlockIds[i - 1];
+                    // Use .entry for the first block
+                    const firstEntry = bodyBlockIds[0].entry ?? bodyBlockIds[0];
+                    if (this.generator.blocks[firstEntry]) {
+                        this.generator.blocks[firstEntry].parent = null;
                     }
-                    //COMMENT OUT THIS BULLSHIT LINE TO FUCKING FIX LOOPS
-                    //this.generator.blocks[bodyBlockIds[bodyBlockIds.length - 1]].next = null;
+                    for (let i = 0; i < bodyBlockIds.length - 1; i++) {
+                        const current = bodyBlockIds[i];
+                        const next = bodyBlockIds[i + 1];
+                        const currentExit = current.exit ?? current;
+                        const nextEntry = next.entry ?? next;
+                        if (
+                            this.generator.blocks[currentExit] &&
+                            this.generator.blocks[nextEntry] &&
+                            this.generator.blocks[currentExit].next == null
+                        ) {
+                            this.generator.blocks[currentExit].next = nextEntry;
+                        }
+                    }
                 }
                 // Save for index.js to chain under flag
                 this.mainBodyBlockIds = bodyBlockIds;
@@ -239,22 +251,23 @@ class visitor extends LuaParserVisitor {
                 children: bodyBlockIds,
             });
 
-            // --- CHAINING FIX ---
+            // --- CHAINING FIX for normal function/procedure ---
             if (bodyBlockIds.length > 0) {
                 // Set parent and next using actual block IDs
-                this.generator.blocks[bodyBlockIds[0]].parent = defId;
-                this.generator.blocks[defId].next = bodyBlockIds[0];
+                const firstEntry = bodyBlockIds[0].entry ?? bodyBlockIds[0];
+                this.generator.blocks[firstEntry].parent = defId;
+                this.generator.blocks[defId].next = firstEntry;
                 for (let i = 1; i < bodyBlockIds.length; i++) {
-                    const prevId = bodyBlockIds[i - 1];
-                    const currId = bodyBlockIds[i];
-                    this.generator.blocks[currId].parent = prevId;
-                    this.generator.blocks[prevId].next = currId;
+                    const prev = bodyBlockIds[i - 1];
+                    const curr = bodyBlockIds[i];
+                    const prevExit = prev.exit ?? prev;
+                    const currEntry = curr.entry ?? curr;
+                    this.generator.blocks[currEntry].parent = prevExit;
+                    this.generator.blocks[prevExit].next = currEntry;
                 }
-                this.generator.blocks[
-                    bodyBlockIds[bodyBlockIds.length - 1]
-                ].next = null;
+                const lastExit = (bodyBlockIds[bodyBlockIds.length - 1].exit ?? bodyBlockIds[bodyBlockIds.length - 1]);
+                this.generator.blocks[lastExit].next = null;
             } else {
-                //console.log(this.generator.blocks[defId].opcode)
                 this.generator.blocks[defId].next = null;
             }
 
@@ -527,7 +540,6 @@ class visitor extends LuaParserVisitor {
             return blockId;
         }
         //console.log(ctx.children.map(c => c.getText()));
-        // ...existing code...
         if (
             ctx.children &&
             ctx.children.length >= 7 &&
@@ -573,9 +585,9 @@ class visitor extends LuaParserVisitor {
                 }
             });
 
-            // 2. operator_equals (loop exit condition)
+            // 2. operator_gt (loop exit condition)
             this.generator.addBlock({
-                opcode: "operator_equals",
+                opcode: "operator_gt",
                 id: eqId,
                 parent: repeatId,
                 next: null,
@@ -629,10 +641,75 @@ class visitor extends LuaParserVisitor {
             });
 
             this.generator.blocks[setVarId].next = repeatId;
-
-            return setVarId;
+            return { entry: setVarId, exit: repeatId };
         }
-        // ...existing code...
+
+        // --- Compound assignment support: +=, -=, *=, /=, ^=
+        if (
+            ctx.children &&
+            (
+                // local x += ...
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local" && ctx.children[2].getText().match(/^\+=|-=|\*=|\/=|\^=$/)) ||
+                // x += ...
+                (ctx.children.length === 3 && ctx.children[1].getText().match(/^\+=|-=|\*=|\/=|\^=$/))
+            )
+        ) {
+            let isLocal = false;
+            let varName, op, expChild;
+            if (ctx.children.length === 4) {
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                op = ctx.children[2].getText();
+                expChild = ctx.children[3];
+            } else {
+                varName = ctx.children[0].getText();
+                op = ctx.children[1].getText();
+                expChild = ctx.children[2];
+            }
+            const expResult = this.visitExp(expChild);
+            let opcode;
+            switch (op) {
+                case "+=": opcode = "operator_add"; break;
+                case "-=": opcode = "operator_subtract"; break;
+                case "*=": opcode = "operator_multiply"; break;
+                case "/=": opcode = "operator_divide"; break;
+                case "^=": opcode = "operator_power"; break;
+                default: throw new CompilerError(`Unsupported compound assignment: ${op}`, ctx, this.source);
+            }
+            // Variable declaration if needed
+            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                this.variableScopes[varName] = isLocal ? "local" : "global";
+                this.addVariableToProject(varName, 0, isLocal ? "local" : "global");
+            }
+            // Build the operator block
+            const opBlockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const setBlockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            //console.log(this.wrapInput(expResult));
+            this.generator.addBlock({
+                opcode,
+                id: opBlockId,
+                parent: setBlockId, // <-- Set parent to set block
+                next: null,
+                inputs: {
+                    NUM1: [3, [12, varName, varName], [10, ""]],
+                    NUM2: [1, [10, String(this.wrapInput(expResult))]]
+                }
+            });
+            // Set variable to result
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setBlockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [3, opBlockId, [10, ""]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+            return setBlockId; // <-- Return the set block as the entry
+        }
 
         // --- Variable declaration/assignment support ---
         // Syntax: local x = ... | x = ...

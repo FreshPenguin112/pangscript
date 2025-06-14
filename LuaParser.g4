@@ -32,6 +32,11 @@ block
 statement
     : ';'
     | varlist '=' explist
+        | 'local' var PLUSEQ exp
+    | 'local'? var MINUSEQ exp
+    | 'local'? var STAREQ exp
+    | 'local'? var SLASHEQ exp
+    | 'local'? var CARETEQ exp
     | functioncall
     | label
     | 'break'

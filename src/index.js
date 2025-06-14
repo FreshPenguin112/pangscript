@@ -57,8 +57,9 @@ visitor.generator.importBlocks(mergedBlocks);
 
 // --- Chain main function body under whenflagclicked ---
 if (visitor.mainBodyBlockIds && visitor.mainBodyBlockIds.length > 0) {
-    visitor.generator.blocks[visitor.mainBodyBlockIds[0]].parent = "a";
-    visitor.generator.blocks["a"].next = visitor.mainBodyBlockIds[0];
+    const firstBlockId = visitor.mainBodyBlockIds[0].entry ?? visitor.mainBodyBlockIds[0];
+    visitor.generator.blocks[firstBlockId].parent = "a";
+    visitor.generator.blocks["a"].next = firstBlockId;
 }
 
 debug && console.log("blocks:\n");
