@@ -52,6 +52,7 @@ require('./pm-block/blocks_vertical/sound.js');
 require('./pm-block/blocks_vertical/sensing.js');
 require('./pm-block/blocks_vertical/data.js');
 
+
 // this is used for custom blocks
 // await import('./pm-block/blocks_vertical/procedures.js');
 
@@ -195,3 +196,33 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
     return processedBlocks
 }
 module.exports.processedBlocks = jsBlocksToJSON()
+// --------------------------------------------
+
+
+// --- Hardcoded input maps for pmOperatorsExpansion bitwise blocks ---
+Object.assign(module.exports.processedBlocks, {
+    pmOperatorsExpansion_shiftLeft: [[
+        { name: "num1", type: "number" },
+        { name: "num2", type: "number" }
+    ]],
+    pmOperatorsExpansion_shiftRight: [[
+        { name: "num1", type: "number" },
+        { name: "num2", type: "number" }
+    ]],
+    pmOperatorsExpansion_binnaryAnd: [[
+        { name: "num1", type: "number" },
+        { name: "num2", type: "number" }
+    ]],
+    pmOperatorsExpansion_binnaryOr: [[
+        { name: "num1", type: "number" },
+        { name: "num2", type: "number" }
+    ]],
+    pmOperatorsExpansion_binnaryXor: [[
+        { name: "num1", type: "number" },
+        { name: "num2", type: "number" }
+    ]],
+    pmOperatorsExpansion_binnaryNot: [[
+        { name: "num1", type: "number" }
+    ]]
+});
+// ---------------------------------------------------------------

@@ -1,11 +1,3 @@
-// simple fix for goog not working in standalone binaries
-const path = require("path");
-/*
-global.goog = {};
-require('google-closure-library/closure/goog/base.js');
-const goog = global.goog;
-goog.BASE_PATH = path.join(__dirname, 'closure/goog/');
-*/
 const { InputStream, CommonTokenStream, Token } = require("antlr4");
 const SimpleLangLexer = require("../lib/LuaLexer").default;
 const SimpleLangParser = require("../lib/LuaParser").default;
@@ -14,6 +6,7 @@ const _generator = require("../utils/generator");
 const CompilerError = require('../utils/CompilerError');
 const generator = new _generator();
 const { readFileSync, writeFileSync } = require("fs");
+const path = require("path");
 
 generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, next: null, id: "a" }); // Ensure id is "a" for reference
 //console.log(generator.blockIdCounter);

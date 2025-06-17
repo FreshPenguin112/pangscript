@@ -1068,6 +1068,11 @@ class visitor extends LuaParserVisitor {
                     left: "OPERAND1",
                     right: "OPERAND2",
                 },
+                "&": {opcode: "pmOperatorsExpansion_binnaryAnd", left: "num1", right: "num2"},
+                "|": {opcode: "pmOperatorsExpansion_binnaryOr", left: "num1", right: "num2"},
+                "~": {opcode: "pmOperatorsExpansion_binnaryXor", left: "num1", right: "num2"},
+                "<<": {opcode: "pmOperatorsExpansion_shiftLeft", left: "num1", right: "num2"},
+                ">>": {opcode: "pmOperatorsExpansion_shiftRight", left: "num1", right: "num2"},
             };
 
             if (opMap[op]) {
@@ -1120,7 +1125,7 @@ class visitor extends LuaParserVisitor {
         if (
             ctx.children &&
             ctx.children.length === 2 &&
-            this.getText(ctx.children[0]) === "not"
+            this.getText(ctx.children[0]) === "not" || this.getText(ctx.children[0]) === "~"
         ) {
             const op = this.getText(ctx.children[0]);
             const rightCtx = ctx.children[1];
@@ -1131,6 +1136,23 @@ class visitor extends LuaParserVisitor {
                 const rightVal = this.visitExp(rightCtx, blockId);
                 this.generator.addBlock({
                     opcode: "operator_not",
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [
+                        this.wrapInput(rightVal)
+                    ],
+                });
+                return forceStringFallback
+                    ? [3, blockId, [10, ""]]
+                    : [3, blockId];
+            } else if (op === "~") {
+                const blockId = this.generator.letterCount(
+                    this.generator.blockIdCounter++
+                );
+                const rightVal = this.visitExp(rightCtx, blockId);
+                this.generator.addBlock({
+                    opcode: "pmOperatorsExpansion_binnaryNot",
                     id: blockId,
                     parent: parentId,
                     next: null,

@@ -19,11 +19,17 @@
             ">=": { opcode: "operator_gtorequal"},
             "==": { opcode: "operator_equals"},
             "~=": { opcode: "operator_notequal"},
+            "&": { opcode: "pmOperatorsExpansion_binnaryAnd"},
+            "|": { opcode: "pmOperatorsExpansion_binnaryOr"},
+            "~": { opcode: "pmOperatorsExpansion_binnaryXor"},
+            "<<": { opcode: "pmOperatorsExpansion_shiftLeft"},
+            ">>": { opcode: "pmOperatorsExpansion_shiftRight"},
             "and": { opcode: "operator_and"},
             "or": { opcode: "operator_or"},
             }
             You can also the unary "-" operator before a number to make it negative.
             You can also use the `not` operator to negate a boolean value.
+            You can also use the bitwise "~" operator to perform a bitwise NOT on a value
 ]]--
 
 function test()
@@ -165,6 +171,35 @@ function test7()
     print("e after ^= 3: " .. e, 2)
 end
 
+function test8()
+    --[[
+        The below code demonstrates how to use bitwise operators.
+        Bitwise operators allow you to perform operations on the individual bits of a number.
+        The following bitwise operators are supported:
+            & : bitwise AND
+            | : bitwise OR
+            ~ : bitwise XOR
+            << : left shift
+            >> : right shift
+            ~ : bitwise NOT (unary form)(when put before a number like you do with the minus sign)
+    ]]--
+
+    local x = 5 -- 0101 in binary
+    local y = 3 -- 0011 in binary
+    local andResult = x & y -- 0001 in binary, which is 1 in decimal
+    local orResult = x | y -- 0111 in binary, which is 7 in decimal
+    local xorResult = x ~ y -- 0110 in binary, which is 6 in decimal
+    local leftShiftResult = x << 1 -- 1010 in binary, which is 10 in decimal
+    local rightShiftResult = x >> 1 -- 0010 in binary, which is 2 in decimal
+    local notResult = ~x -- 1010 in binary, which is -6 in decimal (two's complement representation)
+    print("x & y: " .. andResult, 0.5) -- This will print "x & y: 1"
+    print("x | y: " .. orResult, 0.5) -- This will print "x | y: 7"
+    print("x ~ y: " .. xorResult, 0.5) -- This will print "x ~ y: 6"
+    print("x << 1: " .. leftShiftResult, 0.5) -- This will print "x << 1: 10"
+    print("x >> 1: " .. rightShiftResult, 0.5) -- This will print "x >> 1: 2"
+    print("~x: " .. notResult, 0.5) -- This will print "~x: -6"
+end
+
 function main()
     --[[
         The main function is a special reserved function that never gets compiled into a my blocks function,
@@ -182,5 +217,6 @@ function main()
     test5()
     test6()
     test7()
+    test8()
 end
 

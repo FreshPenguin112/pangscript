@@ -102,7 +102,11 @@ exp
     | exp ('<' | '>' | '<=' | '>=' | '~=' | '==') exp
     | exp ('and') exp
     | exp ('or') exp
-    | exp ('&' | '|' | '~' | '<<' | '>>') exp
+    | exp ('&') exp
+    | exp ('~') exp
+    | exp ('|') exp
+    | exp ('<<') exp
+    | exp ('>>') exp
     ;
 
 // var ::=  Name | prefixexp '[' exp ']' | prefixexp '.' Name 
