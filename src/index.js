@@ -1,3 +1,11 @@
+// simple fix for goog not working in standalone binaries
+const path = require("path");
+/*
+global.goog = {};
+require('google-closure-library/closure/goog/base.js');
+const goog = global.goog;
+goog.BASE_PATH = path.join(__dirname, 'closure/goog/');
+*/
 const { InputStream, CommonTokenStream, Token } = require("antlr4");
 const SimpleLangLexer = require("../lib/LuaLexer").default;
 const SimpleLangParser = require("../lib/LuaParser").default;
@@ -6,7 +14,6 @@ const _generator = require("../utils/generator");
 const CompilerError = require('../utils/CompilerError');
 const generator = new _generator();
 const { readFileSync, writeFileSync } = require("fs");
-const path = require("path");
 
 generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, next: null, id: "a" }); // Ensure id is "a" for reference
 //console.log(generator.blockIdCounter);
@@ -14,7 +21,7 @@ const debug = process.argv.includes("--debug") || process.argv.includes("-d");
 const infile = process.argv.includes("-i") || process.argv.includes("--infile") ? process.argv[(process.argv.indexOf("-i") == -1 ? process.argv.indexOf("--infile") : process.argv.indexOf("-i")) + 1] : "test.lua";
 const outfile = process.argv.includes("-o") || process.argv.includes("--outfile") ? process.argv[(process.argv.indexOf("-o") == -1 ? process.argv.indexOf("-outfile") : process.argv.indexOf("-o")) + 1] : "../indexTest.pmp"
 const input = new InputStream(
-    readFileSync(path.join(__dirname, infile), "utf8").toString()
+    readFileSync(path.join(process.cwd(), infile), "utf8").toString()
 );
 const visitor = new _visitor(input);
 const lexer = new SimpleLangLexer(input);
@@ -69,6 +76,6 @@ debug && console.log();
 console.log(`saved to file: ${outfile}`);
 console.log();
 writeFileSync(
-    path.join(__dirname, outfile),
+    path.join(process.cwd(), outfile),
     visitor.generator.getProject()
 );
