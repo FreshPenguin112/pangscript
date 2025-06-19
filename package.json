@@ -2,8 +2,8 @@
     "scripts": {
         "build": "antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs",
         "install2": "npm install -g @babel/cli @babel/plugin-transform-modules-commonjs antlr4ng-cli",
-        "pkg": "npm run build && rm -rf dist && mkdir dist && pkg --targets node18-linux-x64,node18-win-x64,node18-macos-x64,node18-linux-arm64,node18-win-arm64,node18-macos-arm64 --compress GZip --out-path ./dist src/index.js && cd ./dist && zip -r dist.zip * && cd .. && mv ./dist/dist.zip ./dist.zip && rm -rf ./dist pangscript-*.zip",
-        "publish": "git tag -a \"$TAG\" -m \"Release $TAG\" && mv ./dist.zip \"./pangscript-${TAG}.zip\" && gh release create \"$TAG\" --title \"Release $TAG\" --notes \"\" -R https://github.com/FreshPenguin112/pangscript pangscript-\"$TAG\".zip && rm -rf pangscript-*.zip && rm -rf pangscript-*.zip"
+        "pkg": "npm run build && rm -rf dist && mkdir dist && pkg --targets node18-linux-x64,node18-win-x64,node18-macos-x64,node18-linux-arm64,node18-win-arm64,node18-macos-arm64 --compress GZip --out-path ./dist src/index.js",
+        "publish": "git tag -a \"$TAG\" -m \"Release $TAG\" && gh release create \"$TAG\" --title \"Release $TAG\" --notes \"\" -R https://github.com/FreshPenguin112/pangscript ./dist/* && rm -rf ./dist"
     },
     "dependencies": {
         "@babel/cli": "^7.27.2",
