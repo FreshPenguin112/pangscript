@@ -2,7 +2,7 @@
     "scripts": {
         "build": "antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs",
         "install2": "npm install -g @babel/cli @babel/plugin-transform-modules-commonjs antlr4ng-cli",
-        "pkg": "npm run build && rm -rf dist && mkdir dist && pkg --targets node14-linux-x64,node14-linuxstatic-x64,node14-win-x64,node14-macos-x64,node14-linux-arm64,node14-linuxstatic-arm64,node14-win-arm64,node14-macos-arm64 --compress Brotli --out-path ./dist src/index.js",
+        "pkg": "npm run build && rm -rf dist && mkdir dist && pkg --targets node16-linux-x64,node16-linuxstatic-x64,node16-win-x64,node16-macos-x64,node16-linux-arm64,node16-linuxstatic-arm64,node16-win-arm64,node16-macos-arm64 --compress Brotli --out-path ./dist src/index.js",
         "publish": "git tag -a \"$TAG\" -m \"Release $TAG\" && gh release create \"$TAG\" --title \"Release $TAG\" --notes \"$NOTES\" -R https://github.com/FreshPenguin112/pangscript ./dist/* && rm -rf ./dist"
     },
     "dependencies": {
@@ -12,10 +12,10 @@
         "@rollup/plugin-alias": "^5.1.1",
         "@rollup/plugin-commonjs": "^28.0.5",
         "@rollup/plugin-json": "^6.1.0",
-        "@rollup/plugin-node-resolve": "^14.0.1",
+        "@rollup/plugin-node-resolve": "^16.0.1",
         "@rollup/plugin-replace": "^6.0.2",
         "antlr4": "^4.13.2",
-        "antlr4ng": "^3.0.14",
+        "antlr4ng": "^3.0.16",
         "babel-minify": "^0.5.2",
         "cli-highlight": "^2.1.11",
         "google-closure-library": "^20230802.0.0",
