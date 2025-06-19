@@ -82,7 +82,7 @@ var template = {
     ],
     monitors: [],
     extensionData: {},
-    extensions: [],
+    extensions: ["pmOperatorsExpansion"],
     meta: {
         semver: "3.0.0",
         vm: "0.2.0",

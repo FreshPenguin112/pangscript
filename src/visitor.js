@@ -726,46 +726,76 @@ class visitor extends LuaParserVisitor {
                 // local x = ...
                 isLocal = true;
                 varName = ctx.children[1].getText();
-                const expResult = this.visitExp(ctx.children[3]);
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const expResult = this.visitExp(ctx.children[3], blockId); // <-- pass blockId
                 valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
+
+                // Check for redeclaration with different scope
+                if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                    if (
+                        (isLocal && this.variableScopes[varName] !== "local") ||
+                        (!isLocal && this.variableScopes[varName] !== "global")
+                    ) {
+                        throw new CompilerError(
+                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
+                        ctx,
+                        this.source
+                    );
+                    }
+                } else {
+                    // First declaration: add to project
+                    this.variableScopes[varName] = isLocal ? "local" : "global";
+                    this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
+                }
+
+                this.generator.addBlock({
+                    opcode: "data_setvariableto",
+                    id: blockId,
+                    parent: null,
+                    next: null,
+                    inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                    fields: {
+                        VARIABLE: [varName, varName, ""]
+                    }
+                });
+                return blockId;
             } else {
                 // x = ...
                 varName = ctx.children[0].getText();
-                const expResult = this.visitExp(ctx.children[2]);
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const expResult = this.visitExp(ctx.children[2], blockId); // <-- pass blockId
                 valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
-            }
 
-            // Check for redeclaration with different scope
-            if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
-                if (
-                    (isLocal && this.variableScopes[varName] !== "local") ||
-                    (!isLocal && this.variableScopes[varName] !== "global")
-                ) {
-                    throw new CompilerError(
-                    `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
-                    ctx,
-                    this.source
-                );
+                // Check for redeclaration with different scope
+                if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                    if (
+                        (isLocal && this.variableScopes[varName] !== "local") ||
+                        (!isLocal && this.variableScopes[varName] !== "global")
+                    ) {
+                        throw new CompilerError(
+                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
+                        ctx,
+                        this.source
+                    );
+                    }
+                } else {
+                    // First declaration: add to project
+                    this.variableScopes[varName] = isLocal ? "local" : "global";
+                    this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
                 }
-            } else {
-                // First declaration: add to project
-                this.variableScopes[varName] = isLocal ? "local" : "global";
-                this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
-            }
 
-            // Assignment block
-            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
-            this.generator.addBlock({
-                opcode: "data_setvariableto",
-                id: blockId,
-                parent: null,
-                next: null,
-                inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
-                fields: {
-                    VARIABLE: [varName, varName, ""]
-                }
-            });
-            return blockId;
+                this.generator.addBlock({
+                    opcode: "data_setvariableto",
+                    id: blockId,
+                    parent: null,
+                    next: null,
+                    inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                    fields: {
+                        VARIABLE: [varName, varName, ""]
+                    }
+                });
+                return blockId;
+            }
         }
 
         // fallback to default
