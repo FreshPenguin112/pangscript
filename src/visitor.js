@@ -17,82 +17,29 @@ class visitor extends LuaParserVisitor {
         this.customBlocks = {};
         this.mainBodyBlockIds = [];
         this.variableScopes = {}; // { varName: "local" | "global" }
+        // --- Semi-interpreted runtime ---
+        this.runtime = {
+            globals: {},
+            functions: {},
+            objects: {},
+            classes: {},
+        };
     }
 
-    // Helper to add variable to the correct place in the project template
-    addVariableToProject(varName, initialValue, scope = "global") {
-        // Get the generator's template object
-        const project = this.generator.template;
-        let target;
-        if (scope === "local") {
-            target = project.targets.find(t => t.name === "Sprite1");
-        } else {
-            target = project.targets.find(t => t.isStage);
-        }
-        if (!target.variables) target.variables = {};
-        // Only add if not already present
-        if (!Object.prototype.hasOwnProperty.call(target.variables, varName)) {
-            target.variables[varName] = [varName, initialValue];
-        }
-    }
+    // --- Interpreter helpers ---
+    setGlobal(name, value) { this.runtime.globals[name] = value; }
+    getGlobal(name) { return this.runtime.globals[name]; }
+    setFunction(name, fn) { this.runtime.functions[name] = fn; }
+    getFunction(name) { return this.runtime.functions[name]; }
 
-    // isType and getText methods are just ripped straight from fplus
-    /*
-    might not even need isType because the you can just define
-    visit methods for each type you need.
-    fplus would've been way easier to make if i knew this lmao
-    */
-    isType(ctx, type) {
-        return (() => {
-            try {
-                return !!ctx[type]();
-            } catch (e) {
-                return false;
-            }
-        })();
+    // --- Dynamic interpreter loop ---
+    interpretStatements(statements) {
+        for (const stmt of statements) {
+            this.interpretStatement(stmt);
+        }
     }
-    getText(ctx, parse = false) {
-        return (() => {
-            try {
-                return parse ? JSON.parse(ctx.getText()) : ctx.getText();
-            } catch (e) {
-                return "";
-            }
-        })();
-    }
-    getName(ctx) {
-        return (() => {
-            try {
-                return (
-                    /*
-                    shitty precedence order(based on what name you would most likely be looking for) 
-                    to try and get token name lol
-                    for example a statement would have the following precedence order,
-                    statement ||
-                    BREAK(the lexer token that equals the literal word "break") ||
-                    break(what BREAK equals, matches the literal word "break" anywhere in the input)
-                    */
-                    ctx.parser.ruleNames[ctx.ruleIndex] ||
-                    ctx.parser.symbolicNames[ctx.start.type] ||
-                    ctx.parser.literalNames[ctx.start.type]
-                );
-            } catch (e) {
-                return null;
-            }
-        })();
-    }
-    sendText(ctx, name = false) {
-        return `${name || this.getName(ctx)}: ${this.getText(ctx)}`;
-    }
-    getAndClearBlocks() {
-        let blocksCopy = { ...this.blocks };
-        this.blocks = {};
-        return blocksCopy;
-    }
-    visitStatement(ctx) {
-        //console.log("visiting statement", this.getText(ctx));
-        //console.log(ctx.children.length);
-        //console.log("Statement children:", ctx.children.map(c => c.getText()));
+    interpretStatement(ctx) {
+        // Function definition
         if (
             ctx.children &&
             ctx.children.length === 3 &&
@@ -100,188 +47,167 @@ class visitor extends LuaParserVisitor {
             ctx.children[1].constructor.name === "FuncnameContext" &&
             ctx.children[2].constructor.name === "FuncbodyContext"
         ) {
-            const funcnameCtx = ctx.children[1];
+            const funcName = ctx.children[1].getText();
             const funcbodyCtx = ctx.children[2];
-            const funcName = funcnameCtx.getText();
-
-            // Special handling for main
-            if (funcName === "main") {
-                // Visit the body and collect block IDs
-                const block = funcbodyCtx.block();
-                let bodyBlockIds = [];
-                if (block && block.children) {
-                    for (const child of block.children) {
-                        if (
-                            child.constructor &&
-                            child.constructor.name.endsWith("StatementContext")
-                        ) {
-                            const stmtId = this.visit(child);
-                            if (stmtId) bodyBlockIds.push(stmtId);
-                        }
-                    }
-                }
-                // --- CHAINING MAIN BODY ---
-                if (bodyBlockIds.length > 0) {
-                    // Use .entry for the first block
-                    const firstEntry = bodyBlockIds[0].entry ?? bodyBlockIds[0];
-                    if (this.generator.blocks[firstEntry]) {
-                        this.generator.blocks[firstEntry].parent = null;
-                    }
-                    for (let i = 0; i < bodyBlockIds.length - 1; i++) {
-                        const current = bodyBlockIds[i];
-                        const next = bodyBlockIds[i + 1];
-                        const currentExit = current.exit ?? current;
-                        const nextEntry = next.entry ?? next;
-                        if (
-                            this.generator.blocks[currentExit] &&
-                            this.generator.blocks[nextEntry] &&
-                            this.generator.blocks[currentExit].next == null
-                        ) {
-                            this.generator.blocks[currentExit].next = nextEntry;
-                        }
-                    }
-                }
-                // Save for index.js to chain under flag
-                this.mainBodyBlockIds = bodyBlockIds;
-                // Do NOT emit any blocks for main itself
-                return null;
-            }
-
-            // Get parameter names
             const parlist = funcbodyCtx.parlist();
-            let argumentnames = [];
+            let argNames = [];
             if (parlist && parlist.namelist) {
                 const namelist = parlist.namelist();
                 if (namelist && namelist.NAME) {
                     const names = namelist.NAME();
                     for (let i = 0; i < names.length; i++) {
-                        argumentnames.push(names[i].getText());
+                        argNames.push(names[i].getText());
                     }
                 }
             }
-
-            // Special rule for "main" function: must have no arguments
-            if (funcName === "main" && argumentnames.length > 0) {
-                throw new Error(
-                    'The "main" function must not have any arguments.'
-                );
-            }
-
-            // --- Normal function/procedure block generation ---
-            let argumentids = argumentnames.map(() =>
-                this.generator.letterCount(this.generator.blockIdCounter++)
-            );
-            let argumentdefaults = argumentnames.map(() => "");
-            let proccode =
-                funcName +
-                (argumentnames.length
-                    ? " " + argumentnames.map(() => "%s").join(", ")
-                    : "");
-            const defId = this.generator.letterCount(
-                this.generator.blockIdCounter++
-            );
-            const protoId = this.generator.letterCount(
-                this.generator.blockIdCounter++
-            );
-
-            // Add prototype block
-            this.generator.addBlock({
-                opcode: "procedures_prototype",
-                id: protoId,
-                parent: defId,
-                next: null,
-                shadow: true,
-                mutation: {
-                    tagName: "mutation",
-                    children: [],
-                    proccode,
-                    argumentids: JSON.stringify(argumentids),
-                    argumentnames: JSON.stringify(argumentnames),
-                    argumentdefaults: JSON.stringify(argumentdefaults),
-                    warp: "true",
-                    returns: "null",
-                    edited: "true",
-                    optype: "null",
-                    color: JSON.stringify(["#FF6680", "#FF4D6A", "#FF3355"]),
-                },
-            });
-
-            // Add argument blocks
-            argumentids.forEach((id, i) => {
-                this.generator.addBlock({
-                    opcode: "argument_reporter_string_number",
-                    id,
-                    parent: protoId,
-                    next: null,
-                    shadow: true,
-                    fields: { VALUE: [argumentnames[i], ""] },
-                    mutation: {
-                        color: JSON.stringify([
-                            "#FF6680",
-                            "#FF4D6A",
-                            "#FF3355",
-                        ]),
-                    },
+            // Store function as a closure
+            this.setFunction(funcName, (...args) => {
+                // Map args to globals for now (no local scope yet)
+                argNames.forEach((name, i) => {
+                    this.setGlobal(name, args[i]);
                 });
-            });
-
-            // --- BODY PARSING ---
-            const block = funcbodyCtx.block();
-            let bodyBlockIds = [];
-            if (block && block.children) {
-                for (const child of block.children) {
-                    if (
-                        child.constructor &&
-                        child.constructor.name.endsWith("StatementContext")
-                    ) {
-                        const stmtId = this.visit(child);
-                        if (stmtId) bodyBlockIds.push(stmtId);
-                    }
+                // Interpret body
+                const block = funcbodyCtx.block();
+                if (block && block.children) {
+                    this.interpretStatements(block.children);
                 }
-            }
-
-            // Add the definition block FIRST so it exists in generator.blocks
-            this.generator.addBlock({
-                opcode: "procedures_definition",
-                id: defId,
-                parent: null,
-                // next will be set below
-                topLevel: true,
-                inputs: { custom_block: [1, protoId] },
-                children: bodyBlockIds,
             });
-
-            // --- CHAINING FIX for normal function/procedure ---
-            if (bodyBlockIds.length > 0) {
-                // Set parent and next using actual block IDs
-                const firstEntry = bodyBlockIds[0].entry ?? bodyBlockIds[0];
-                this.generator.blocks[firstEntry].parent = defId;
-                this.generator.blocks[defId].next = firstEntry;
-                for (let i = 1; i < bodyBlockIds.length; i++) {
-                    const prev = bodyBlockIds[i - 1];
-                    const curr = bodyBlockIds[i];
-                    const prevExit = prev.exit ?? prev;
-                    const currEntry = curr.entry ?? curr;
-                    this.generator.blocks[currEntry].parent = prevExit;
-                    this.generator.blocks[prevExit].next = currEntry;
-                }
-                const lastExit = (bodyBlockIds[bodyBlockIds.length - 1].exit ?? bodyBlockIds[bodyBlockIds.length - 1]);
-                this.generator.blocks[lastExit].next = null;
-            } else {
-                this.generator.blocks[defId].next = null;
-            }
-
-            this.customBlocks[funcName] = {
-                proccode,
-                argumentids,
-                argumentnames,
-                protoId,
-                defId,
-            };
-
-            return defId;
+            return;
         }
-
+        // Variable assignment
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local") ||
+                (ctx.children.length === 3 && ctx.children[1].getText() === "=")
+            )
+        ) {
+            let varName, valueExp;
+            if (ctx.children.length === 4) {
+                varName = ctx.children[1].getText();
+                valueExp = this.interpretExp(ctx.children[3]);
+            } else {
+                varName = ctx.children[0].getText();
+                valueExp = this.interpretExp(ctx.children[2]);
+            }
+            this.setGlobal(varName, valueExp);
+            return;
+        }
+        // Compound assignment
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local" && ctx.children[2].getText().match(/^[+\-*/^]=$/)) ||
+                (ctx.children.length === 3 && ctx.children[1].getText().match(/^[+\-*/^]=$/))
+            )
+        ) {
+            let varName, op, expChild;
+            if (ctx.children.length === 4) {
+                varName = ctx.children[1].getText();
+                op = ctx.children[2].getText();
+                expChild = ctx.children[3];
+            } else {
+                varName = ctx.children[0].getText();
+                op = ctx.children[1].getText();
+                expChild = ctx.children[2];
+            }
+            const expResult = this.interpretExp(expChild);
+            let current = this.getGlobal(varName) || 0;
+            let result;
+            switch (op) {
+                case "+=": result = current + expResult; break;
+                case "-=": result = current - expResult; break;
+                case "*=": result = current * expResult; break;
+                case "/=": result = current / expResult; break;
+                case "^=": result = Math.pow(current, expResult); break;
+            }
+            this.setGlobal(varName, result);
+            return;
+        }
+        // Print
+        if (
+            ctx.children &&
+            ctx.children.length >= 2 &&
+            ctx.children[0].getText() === "print"
+        ) {
+            const arg = this.interpretExp(ctx.children[1]);
+            if (typeof arg === "function") {
+                console.log(`<global __function__ ${arg.name || "anonymous"}>`);
+            } else {
+                console.log(arg);
+            }
+            return;
+        }
+        // If/elseif/else
+        if (
+            ctx.children &&
+            ctx.children.length >= 3 &&
+            ctx.children[0].getText() === "if"
+        ) {
+            let i = 0;
+            let executed = false;
+            while (i < ctx.children.length) {
+                if (ctx.children[i].getText() === "if" || ctx.children[i].getText() === "elseif") {
+                    const cond = this.interpretExp(ctx.children[i + 1]);
+                    if (cond && !executed) {
+                        this.interpretStatements(ctx.children[i + 3].children);
+                        executed = true;
+                    }
+                    i += 3;
+                } else if (ctx.children[i].getText() === "else") {
+                    if (!executed) {
+                        this.interpretStatements(ctx.children[i + 1].children);
+                    }
+                    i += 2;
+                } else {
+                    i++;
+                }
+            }
+            return;
+        }
+        // While loop
+        if (
+            ctx.children &&
+            ctx.children.length === 5 &&
+            ctx.children[0].getText() === "while"
+        ) {
+            while (this.interpretExp(ctx.children[1])) {
+                this.interpretStatements(ctx.children[3].children);
+            }
+            return;
+        }
+        // For loop
+        if (
+            ctx.children &&
+            ctx.children.length >= 7 &&
+            ctx.children[0].getText() === "for"
+        ) {
+            const varName = ctx.children[1].getText();
+            const startExp = this.interpretExp(ctx.children[3]);
+            const endExp = this.interpretExp(ctx.children[5]);
+            let stepExp = 1;
+            let bodyIdx = 7;
+            if (ctx.children.length >= 9 && ctx.children[6].getText() === ",") {
+                stepExp = this.interpretExp(ctx.children[7]);
+                bodyIdx = 9;
+            }
+            for (let i = startExp; i <= endExp; i += stepExp) {
+                this.setGlobal(varName, i);
+                this.interpretStatements(ctx.children[bodyIdx].children);
+            }
+            return;
+        }
+        // Function call
+        if (
+            ctx.children &&
+            ctx.children.length === 1 &&
+            ctx.children[0].constructor.name === "FunctioncallContext"
+        ) {
+            const funcName = this.getText(ctx.children[0]);
+            const fn = this.getFunction(funcName);
+            if (fn) fn();
+            return;
+        }
         // --- IF/ELSEIF/ELSE CHAIN SUPPORT ---
         if (
             ctx.children &&
@@ -644,6 +570,708 @@ class visitor extends LuaParserVisitor {
             return { entry: setVarId, exit: repeatId };
         }
 
+        // --- Semi-interpreted: variable assignment ---
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local") ||
+                (ctx.children.length === 3 && ctx.children[1].getText() === "=")
+            )
+        ) {
+            let isLocal = false;
+            let varName, valueExp;
+            if (ctx.children.length === 4) {
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                valueExp = this.visitExp(ctx.children[3]);
+            } else {
+                varName = ctx.children[0].getText();
+                valueExp = this.visitExp(ctx.children[2]);
+            }
+            // --- Interpreted ---
+            this.setGlobal(varName, valueExp);
+            // --- Transpile ---
+            // Variable declaration/initialization block
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+            return blockId;
+        }
+
+        // --- Semi-interpreted: compound assignment ---
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local" && ctx.children[2].getText().match(/^[+\-*/^]=$/)) ||
+                (ctx.children.length === 3 && ctx.children[1].getText().match(/^[+\-*/^]=$/))
+            )
+        ) {
+            let isLocal = false;
+            let varName, op, expChild;
+            if (ctx.children.length === 4) {
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                op = ctx.children[2].getText();
+                expChild = ctx.children[3];
+            } else {
+                varName = ctx.children[0].getText();
+                op = ctx.children[1].getText();
+                expChild = ctx.children[2];
+            }
+            const expResult = this.visitExp(expChild);
+            let current = this.getGlobal(varName) || 0;
+            let result;
+            switch (op) {
+                case "+=": result = current + expResult; break;
+                case "-=": result = current - expResult; break;
+                case "*=": result = current * expResult; break;
+                case "/=": result = current / expResult; break;
+                case "^=": result = Math.pow(current, expResult); break;
+                default: throw new CompilerError(`Unsupported compound assignment: ${op}`, ctx, this.source);
+            }
+            this.setGlobal(varName, result);
+            // --- Transpile ---
+            // No need to declare variable again, just update its value
+            const setBlockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setBlockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [3, [12, varName, varName], [10, ""]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+            return setBlockId; // <-- Return the set block as the entry
+        }
+
+        // --- Normal statement handling ---
+        //console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length === 5 &&
+            ctx.children[0].getText() === "while"
+        ) {
+            // Handle while loop
+            const condition = this.visitExp(ctx.children[1])[1];
+            const bodyIds = this.visitBlock(ctx.children[3]) || [];
+
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                // Chain body blocks
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                // Set parent of first block in substack to while block
+                this.generator.blocks[bodyIds[0]].parent = null; // will be set below
+            }
+
+            const blockId = this.generator.letterCount(
+                this.generator.blockIdCounter++
+            );
+            // Set parent of first block in substack to while block
+            if (substackFirst) {
+                this.generator.blocks[substackFirst].parent = blockId;
+            }
+
+            this.generator.addBlock({
+                opcode: "control_while",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    CONDITION: [2, condition],
+                    SUBSTACK: [2, substackFirst],
+                },
+            });
+            return blockId;
+        }
+        //console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length >= 7 &&
+            ctx.children[0].getText() === "for"
+        ) {
+            // Handles both: for i = 1, 5 do ... end
+            //           and for i = 1, 5, 2 do ... end
+            const varName = ctx.children[1].getText();
+            const startExp = this.visitExp(ctx.children[3]);
+            const endExp = this.visitExp(ctx.children[5]);
+            let stepExp = 1;
+            let bodyIdx = 7;
+            // Check for optional step
+            if (ctx.children.length >= 9 && ctx.children[6].getText() === ",") {
+                stepExp = this.visitExp(ctx.children[7]);
+                bodyIdx = 9;
+            }
+            const bodyIds = this.visitBlock(ctx.children[bodyIdx]) || [];
+
+            // --- Variable declaration for for-loop variable ---
+            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                this.variableScopes[varName] = "global";
+                this.addVariableToProject(varName, typeof startExp === "number" ? startExp : 0, "global");
+            }
+
+            // Generate block IDs
+            const setVarId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const repeatId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const eqId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const changeId = this.generator.letterCount(this.generator.blockIdCounter++);
+
+            // 1. Set variable to start
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setVarId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [1, [10, typeof startExp === "number" ? String(startExp) : String(startExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 2. operator_gt (loop exit condition)
+            this.generator.addBlock({
+                opcode: "operator_gt",
+                id: eqId,
+                parent: repeatId,
+                next: null,
+                inputs: {
+                    OPERAND1: [3, [12, varName, varName], [10, ""]],
+                    OPERAND2: [1, [10, typeof endExp === "number" ? String(endExp) : String(endExp)]]
+                }
+            });
+
+            // 3. data_changevariableby (increment, supports custom step)
+            this.generator.addBlock({
+                opcode: "data_changevariableby",
+                id: changeId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [1, [4, typeof stepExp === "number" ? String(stepExp) : String(stepExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 4. Chain body blocks (if any), then chain increment after the last body block
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                this.generator.blocks[bodyIds[bodyIds.length - 1]].next = changeId;
+                this.generator.blocks[changeId].parent = bodyIds[bodyIds.length - 1];
+                this.generator.blocks[bodyIds[0]].parent = repeatId;
+            } else {
+                substackFirst = changeId;
+                this.generator.blocks[changeId].parent = repeatId;
+            }
+            this.generator.blocks[eqId].parent = repeatId;
+
+            // 5. control_repeat_until
+            this.generator.addBlock({
+                opcode: "control_repeat_until",
+                id: repeatId,
+                parent: setVarId,
+                next: null,
+                inputs: {
+                    SUBSTACK: [2, substackFirst],
+                    CONDITION: [2, eqId]
+                }
+            });
+
+            this.generator.blocks[setVarId].next = repeatId;
+            return { entry: setVarId, exit: repeatId };
+        }
+
+        // --- Semi-interpreted: variable assignment ---
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local") ||
+                (ctx.children.length === 3 && ctx.children[1].getText() === "=")
+            )
+        ) {
+            let isLocal = false;
+            let varName, valueExp;
+            if (ctx.children.length === 4) {
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                valueExp = this.visitExp(ctx.children[3]);
+            } else {
+                varName = ctx.children[0].getText();
+                valueExp = this.visitExp(ctx.children[2]);
+            }
+            // --- Interpreted ---
+            this.setGlobal(varName, valueExp);
+            // --- Transpile ---
+            // Variable declaration/initialization block
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+            return blockId;
+        }
+
+        // --- Semi-interpreted: compound assignment ---
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local" && ctx.children[2].getText().match(/^[+\-*/^]=$/)) ||
+                (ctx.children.length === 3 && ctx.children[1].getText().match(/^[+\-*/^]=$/))
+            )
+        ) {
+            let isLocal = false;
+            let varName, op, expChild;
+            if (ctx.children.length === 4) {
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                op = ctx.children[2].getText();
+                expChild = ctx.children[3];
+            } else {
+                varName = ctx.children[0].getText();
+                op = ctx.children[1].getText();
+                expChild = ctx.children[2];
+            }
+            const expResult = this.visitExp(expChild);
+            let current = this.getGlobal(varName) || 0;
+            let result;
+            switch (op) {
+                case "+=": result = current + expResult; break;
+                case "-=": result = current - expResult; break;
+                case "*=": result = current * expResult; break;
+                case "/=": result = current / expResult; break;
+                case "^=": result = Math.pow(current, expResult); break;
+                default: throw new CompilerError(`Unsupported compound assignment: ${op}`, ctx, this.source);
+            }
+            this.setGlobal(varName, result);
+            // --- Transpile ---
+            // No need to declare variable again, just update its value
+            const setBlockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setBlockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [3, [12, varName, varName], [10, ""]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+            return setBlockId; // <-- Return the set block as the entry
+        }
+
+        // --- Normal statement handling ---
+        //console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length === 5 &&
+            ctx.children[0].getText() === "while"
+        ) {
+            // Handle while loop
+            const condition = this.visitExp(ctx.children[1])[1];
+            const bodyIds = this.visitBlock(ctx.children[3]) || [];
+
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                // Chain body blocks
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                // Set parent of first block in substack to while block
+                this.generator.blocks[bodyIds[0]].parent = null; // will be set below
+            }
+
+            const blockId = this.generator.letterCount(
+                this.generator.blockIdCounter++
+            );
+            // Set parent of first block in substack to while block
+            if (substackFirst) {
+                this.generator.blocks[substackFirst].parent = blockId;
+            }
+
+            this.generator.addBlock({
+                opcode: "control_while",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    CONDITION: [2, condition],
+                    SUBSTACK: [2, substackFirst],
+                },
+            });
+            return blockId;
+        }
+        //console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length >= 7 &&
+            ctx.children[0].getText() === "for"
+        ) {
+            // Handles both: for i = 1, 5 do ... end
+            //           and for i = 1, 5, 2 do ... end
+            const varName = ctx.children[1].getText();
+            const startExp = this.visitExp(ctx.children[3]);
+            const endExp = this.visitExp(ctx.children[5]);
+            let stepExp = 1;
+            let bodyIdx = 7;
+            // Check for optional step
+            if (ctx.children.length >= 9 && ctx.children[6].getText() === ",") {
+                stepExp = this.visitExp(ctx.children[7]);
+                bodyIdx = 9;
+            }
+            const bodyIds = this.visitBlock(ctx.children[bodyIdx]) || [];
+
+            // --- Variable declaration for for-loop variable ---
+            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                this.variableScopes[varName] = "global";
+                this.addVariableToProject(varName, typeof startExp === "number" ? startExp : 0, "global");
+            }
+
+            // Generate block IDs
+            const setVarId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const repeatId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const eqId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const changeId = this.generator.letterCount(this.generator.blockIdCounter++);
+
+            // 1. Set variable to start
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setVarId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [1, [10, typeof startExp === "number" ? String(startExp) : String(startExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 2. operator_gt (loop exit condition)
+            this.generator.addBlock({
+                opcode: "operator_gt",
+                id: eqId,
+                parent: repeatId,
+                next: null,
+                inputs: {
+                    OPERAND1: [3, [12, varName, varName], [10, ""]],
+                    OPERAND2: [1, [10, typeof endExp === "number" ? String(endExp) : String(endExp)]]
+                }
+            });
+
+            // 3. data_changevariableby (increment, supports custom step)
+            this.generator.addBlock({
+                opcode: "data_changevariableby",
+                id: changeId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [1, [4, typeof stepExp === "number" ? String(stepExp) : String(stepExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 4. Chain body blocks (if any), then chain increment after the last body block
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                this.generator.blocks[bodyIds[bodyIds.length - 1]].next = changeId;
+                this.generator.blocks[changeId].parent = bodyIds[bodyIds.length - 1];
+                this.generator.blocks[bodyIds[0]].parent = repeatId;
+            } else {
+                substackFirst = changeId;
+                this.generator.blocks[changeId].parent = repeatId;
+            }
+            this.generator.blocks[eqId].parent = repeatId;
+
+            // 5. control_repeat_until
+            this.generator.addBlock({
+                opcode: "control_repeat_until",
+                id: repeatId,
+                parent: setVarId,
+                next: null,
+                inputs: {
+                    SUBSTACK: [2, substackFirst],
+                    CONDITION: [2, eqId]
+                }
+            });
+
+            this.generator.blocks[setVarId].next = repeatId;
+            return { entry: setVarId, exit: repeatId };
+        }
+
+        // --- Semi-interpreted: variable assignment ---
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local") ||
+                (ctx.children.length === 3 && ctx.children[1].getText() === "=")
+            )
+        ) {
+            let isLocal = false;
+            let varName, valueExp;
+            if (ctx.children.length === 4) {
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                valueExp = this.visitExp(ctx.children[3]);
+            } else {
+                varName = ctx.children[0].getText();
+                valueExp = this.visitExp(ctx.children[2]);
+            }
+            // --- Interpreted ---
+            this.setGlobal(varName, valueExp);
+            // --- Transpile ---
+            // Variable declaration/initialization block
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+            return blockId;
+        }
+
+        // --- Semi-interpreted: compound assignment ---
+        if (
+            ctx.children &&
+            (
+                (ctx.children.length === 4 && ctx.children[0].getText() === "local" && ctx.children[2].getText().match(/^[+\-*/^]=$/)) ||
+                (ctx.children.length === 3 && ctx.children[1].getText().match(/^[+\-*/^]=$/))
+            )
+        ) {
+            let isLocal = false;
+            let varName, op, expChild;
+            if (ctx.children.length === 4) {
+                isLocal = true;
+                varName = ctx.children[1].getText();
+                op = ctx.children[2].getText();
+                expChild = ctx.children[3];
+            } else {
+                varName = ctx.children[0].getText();
+                op = ctx.children[1].getText();
+                expChild = ctx.children[2];
+            }
+            const expResult = this.visitExp(expChild);
+            let current = this.getGlobal(varName) || 0;
+            let result;
+            switch (op) {
+                case "+=": result = current + expResult; break;
+                case "-=": result = current - expResult; break;
+                case "*=": result = current * expResult; break;
+                case "/=": result = current / expResult; break;
+                case "^=": result = Math.pow(current, expResult); break;
+                default: throw new CompilerError(`Unsupported compound assignment: ${op}`, ctx, this.source);
+            }
+            this.setGlobal(varName, result);
+            // --- Transpile ---
+            // No need to declare variable again, just update its value
+            const setBlockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setBlockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [3, [12, varName, varName], [10, ""]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+            return setBlockId; // <-- Return the set block as the entry
+        }
+
+        // --- Normal statement handling ---
+        //console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length === 5 &&
+            ctx.children[0].getText() === "while"
+        ) {
+            // Handle while loop
+            const condition = this.visitExp(ctx.children[1])[1];
+            const bodyIds = this.visitBlock(ctx.children[3]) || [];
+
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                // Chain body blocks
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                // Set parent of first block in substack to while block
+                this.generator.blocks[bodyIds[0]].parent = null; // will be set below
+            }
+
+            const blockId = this.generator.letterCount(
+                this.generator.blockIdCounter++
+            );
+            // Set parent of first block in substack to while block
+            if (substackFirst) {
+                this.generator.blocks[substackFirst].parent = blockId;
+            }
+
+            this.generator.addBlock({
+                opcode: "control_while",
+                id: blockId,
+                parent: null,
+                next: null,
+                inputs: {
+                    CONDITION: [2, condition],
+                    SUBSTACK: [2, substackFirst],
+                },
+            });
+            return blockId;
+        }
+        //console.log(ctx.children.map(c => c.getText()));
+        if (
+            ctx.children &&
+            ctx.children.length >= 7 &&
+            ctx.children[0].getText() === "for"
+        ) {
+            // Handles both: for i = 1, 5 do ... end
+            //           and for i = 1, 5, 2 do ... end
+            const varName = ctx.children[1].getText();
+            const startExp = this.visitExp(ctx.children[3]);
+            const endExp = this.visitExp(ctx.children[5]);
+            let stepExp = 1;
+            let bodyIdx = 7;
+            // Check for optional step
+            if (ctx.children.length >= 9 && ctx.children[6].getText() === ",") {
+                stepExp = this.visitExp(ctx.children[7]);
+                bodyIdx = 9;
+            }
+            const bodyIds = this.visitBlock(ctx.children[bodyIdx]) || [];
+
+            // --- Variable declaration for for-loop variable ---
+            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
+                this.variableScopes[varName] = "global";
+                this.addVariableToProject(varName, typeof startExp === "number" ? startExp : 0, "global");
+            }
+
+            // Generate block IDs
+            const setVarId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const repeatId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const eqId = this.generator.letterCount(this.generator.blockIdCounter++);
+            const changeId = this.generator.letterCount(this.generator.blockIdCounter++);
+
+            // 1. Set variable to start
+            this.generator.addBlock({
+                opcode: "data_setvariableto",
+                id: setVarId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [1, [10, typeof startExp === "number" ? String(startExp) : String(startExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 2. operator_gt (loop exit condition)
+            this.generator.addBlock({
+                opcode: "operator_gt",
+                id: eqId,
+                parent: repeatId,
+                next: null,
+                inputs: {
+                    OPERAND1: [3, [12, varName, varName], [10, ""]],
+                    OPERAND2: [1, [10, typeof endExp === "number" ? String(endExp) : String(endExp)]]
+                }
+            });
+
+            // 3. data_changevariableby (increment, supports custom step)
+            this.generator.addBlock({
+                opcode: "data_changevariableby",
+                id: changeId,
+                parent: null,
+                next: null,
+                inputs: {
+                    VALUE: [1, [4, typeof stepExp === "number" ? String(stepExp) : String(stepExp)]]
+                },
+                fields: {
+                    VARIABLE: [varName, varName, ""]
+                }
+            });
+
+            // 4. Chain body blocks (if any), then chain increment after the last body block
+            let substackFirst = null;
+            if (Array.isArray(bodyIds) && bodyIds.length > 0) {
+                substackFirst = bodyIds[0];
+                for (let i = 1; i < bodyIds.length; i++) {
+                    this.generator.blocks[bodyIds[i - 1]].next = bodyIds[i];
+                    this.generator.blocks[bodyIds[i]].parent = bodyIds[i - 1];
+                }
+                this.generator.blocks[bodyIds[bodyIds.length - 1]].next = changeId;
+                this.generator.blocks[changeId].parent = bodyIds[bodyIds.length - 1];
+                this.generator.blocks[bodyIds[0]].parent = repeatId;
+            } else {
+                substackFirst = changeId;
+                this.generator.blocks[changeId].parent = repeatId;
+            }
+            this.generator.blocks[eqId].parent = repeatId;
+
+            // 5. control_repeat_until
+            this.generator.addBlock({
+                opcode: "control_repeat_until",
+                id: repeatId,
+                parent: setVarId,
+                next: null,
+                inputs: {
+                    SUBSTACK: [2, substackFirst],
+                    CONDITION: [2, eqId]
+                }
+            });
+
+            this.generator.blocks[setVarId].next = repeatId;
+            return { entry: setVarId, exit: repeatId };
+        }
+
         // --- Compound assignment support: +=, -=, *=, /=, ^=
         if (
             ctx.children &&
@@ -811,54 +1439,22 @@ class visitor extends LuaParserVisitor {
     }
     visitFunctioncall(ctx, asReporter = false) {
         const funcName = this.getText(ctx.NAME ? ctx.NAME(0) : ctx);
-
-        // Handle built-in print
+        // --- Semi-interpreted: print ---
         if (funcName === "print") {
             const explist = ctx.args(0).explist(0);
             const exps = explist.exp ? explist.exp() : [];
-            let messageInput;
-            let joinBlockIds = [];
-
-            // Build the message input (join chain if needed)
-            if (exps.length > 0) {
-                let left = this.visitExp(exps[0], null, true);
-                for (
-                    let i = 1;
-                    i < exps.length - (exps.length > 1 ? 1 : 0);
-                    i++
-                ) {
-                    const rightVal = this.visitExp(exps[i], null, true);
-                    const joinId = this.generator.letterCount(this.generator.blockIdCounter++);
-                    this.generator.addBlock({
-                        opcode: "operator_join",
-                        id: joinId,
-                        parent: null,
-                        next: null,
-                        inputs: [
-                            this.wrapInput(left),
-                            this.wrapInput(rightVal)
-                        ],
-                    });
-                    joinBlockIds.push(joinId);
-                    left = [3, joinId, [10, ""]];
-                }
-                messageInput = left;
-            } else {
-                messageInput = "";
+            let messageInput = this.visitExp(exps[0], null, true);
+            // If printing a function reference
+            if (typeof messageInput === "string" && this.customBlocks[messageInput]) {
+                messageInput = `<global __function__ ${messageInput}>`;
+            } else if (typeof messageInput === "function") {
+                messageInput = `<global __function__ ${messageInput.name}>`;
             }
-
-            // If messageInput is a block reference, set its parent to the say block's id
-            if (
-                Array.isArray(messageInput) &&
-                messageInput[0] === 3 &&
-                typeof messageInput[1] === "string"
-            ) {
-                const sayBlockId = this.generator.letterCount(
-                    this.generator.blockIdCounter
-                );
-                this.generator.blocks[messageInput[1]].parent = sayBlockId;
+            // --- Interpreted output ---
+            if (typeof messageInput !== "undefined") {
+                console.log(messageInput);
             }
-
+            // ...existing transpile logic...
             // If there is a second argument, use sayforsecs
             let blockId;
             if (exps.length > 1) {
@@ -887,14 +1483,8 @@ class visitor extends LuaParserVisitor {
                 });
             }
 
-            // Set parent of join blocks to the say/sayforsecs block
-            for (const joinId of joinBlockIds) {
-                this.generator.blocks[joinId].parent = blockId;
-            }
-
             return blockId;
         }
-
         // Handle built-in or extension opcode calls (not user-defined)
         if (!this.customBlocks[funcName] && processedBlocks[funcName]) {
             const inputsMeta = processedBlocks[funcName][0];
@@ -964,71 +1554,32 @@ class visitor extends LuaParserVisitor {
         return callId;
     }
     visitExp(ctx, parentId = null, forceStringFallback = false) {
-        // If it's a string literal
+        // --- Semi-interpreted: math, bitwise, boolean, variable, function call ---
         if (ctx.STRING) {
-            return ctx.getText().slice(1, -1); // Remove quotes
+            return ctx.getText().slice(1, -1);
         }
-
-        // If it's a function call (reporter or user-defined)
+        if (ctx.NUMBER) {
+            return Number(ctx.getText());
+        }
+        if (ctx.getText() === "true") return true;
+        if (ctx.getText() === "false") return false;
+        // Variable reference
         if (
             ctx.children &&
-            ctx.children.length === 1
+            ctx.children.length === 1 &&
+            ctx.children[0].constructor.name.endsWith("PrefixexpContext")
         ) {
-            const child = ctx.children[0];
-            // Direct function call
-            if (child.constructor && child.constructor.name === "FunctioncallContext") {
-                return this.visitFunctioncall(child, true);
-            }
-            // Prefixexp wrapping a function call
-            if (
-                child.constructor &&
-                child.constructor.name === "PrefixexpContext" &&
-                child.children &&
-                child.children.length === 1 &&
-                child.children[0].constructor &&
-                child.children[0].constructor.name === "FunctioncallContext"
-            ) {
-                return this.visitFunctioncall(child.children[0], true);
-            }
+            const varName = ctx.children[0].getText();
+            return this.getGlobal(varName);
         }
-
-        // Concatenation: exp .. exp
+        // Function reference
         if (
             ctx.children &&
-            ctx.children.length >= 3 &&
-            ctx.children.some((child) => this.getText(child) === "..")
+            ctx.children.length === 1 &&
+            ctx.children[0].constructor.name === "FunctioncallContext"
         ) {
-            // Find all exp children and all '..' operators
-            let exps = [];
-            for (let i = 0; i < ctx.children.length; i++) {
-                if (ctx.children[i].constructor.name.endsWith("ExpContext")) {
-                    exps.push(ctx.children[i]);
-                }
-            }
-
-            // --- Use wrapInput for join inputs ---
-            // Use the class method for consistency
-            // Left-associative: (((a .. b) .. c) .. d)
-            let currentInput = this.visitExp(exps[0], null);
-            for (let i = 1; i < exps.length; i++) {
-                const joinId = this.generator.letterCount(
-                    this.generator.blockIdCounter++
-                );
-                const rightVal = this.visitExp(exps[i], null, true);
-
-                this.generator.addBlock({
-                    opcode: "operator_join",
-                    id: joinId,
-                    parent: parentId,
-                    next: null,
-                    inputs: [
-                        this.wrapInput(currentInput),
-                        this.wrapInput(rightVal)
-                    ],
-                });
-                currentInput = [3, joinId, [10, ""]];
-            }
-            return currentInput;
+            const funcName = this.getText(ctx.children[0]);
+            return this.getFunction(funcName) || funcName;
         }
 
         // Arithmetic, comparison, and boolean operators

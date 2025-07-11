@@ -7,6 +7,7 @@ const CompilerError = require('../utils/CompilerError');
 const generator = new _generator();
 const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
+const readline = require('readline');
 
 generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, next: null, id: "a" }); // Ensure id is "a" for reference
 //console.log(generator.blockIdCounter);
@@ -72,3 +73,39 @@ writeFileSync(
     path.join(process.cwd(), outfile),
     visitor.generator.getProject()
 );
+
+// REPL mode
+console.log('PangScript REPL mode. Type code and press Enter. Ctrl+C to exit.');
+
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: '> '
+});
+
+function runLine(line) {
+    if (!line.trim()) return;
+    try {
+        const chars = new antlr4.InputStream(line);
+        const lexer = new LuaLexer(chars);
+        const tokens = new antlr4.CommonTokenStream(lexer);
+        const parser = new LuaParser(tokens);
+        parser.buildParseTrees = true;
+        const tree = parser.chunk();
+        // Interpret all statements in the chunk
+        if (tree && tree.children) {
+            visitor.interpretStatements(tree.children);
+        }
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+rl.prompt();
+rl.on('line', (line) => {
+    runLine(line);
+    rl.prompt();
+}).on('close', () => {
+    console.log('Exiting PangScript REPL.');
+    process.exit(0);
+});
