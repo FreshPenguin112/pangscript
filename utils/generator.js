@@ -82,7 +82,7 @@ var template = {
     ],
     monitors: [],
     extensionData: {},
-    extensions: ["pmOperatorsExpansion"],
+    extensions: ["pmOperatorsExpansion", "jgJSON"],
     meta: {
         semver: "3.0.0",
         vm: "0.2.0",
@@ -154,8 +154,13 @@ class generator {
                 // If input is a one-item array, treat as block id reference
                 if (Array.isArray(val) && val.length === 1) {
                     mappedInputs[inputName] = [3, val[0], [10, ""]];
+                } else if (Array.isArray(val)) {
+                    // If already in [3, ...], [1, ...], [12, ...], etc., use as-is
+                    mappedInputs[inputName] = val;
                 } else if (typeof val === "number") {
                     mappedInputs[inputName] = [1, [4, String(val)]];
+                } else if (typeof val === "string") {
+                    mappedInputs[inputName] = [1, [10, val]];
                 } else {
                     mappedInputs[inputName] = [1, [10, String(val ?? "")]];
                 }

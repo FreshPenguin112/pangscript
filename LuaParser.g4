@@ -53,7 +53,7 @@ statement
     ;
 
 attnamelist
-    : NAME attrib (',' NAME attrib)*
+    : NAME typeAnnotation? attrib (',' NAME typeAnnotation? attrib)*
     ;
 
 attrib
@@ -111,7 +111,7 @@ exp
 
 // var ::=  Name | prefixexp '[' exp ']' | prefixexp '.' Name 
 var
-    : NAME
+    : NAME typeAnnotation?
     | prefixexp ('[' exp ']' | '.' NAME)
     ;
 
@@ -143,15 +143,20 @@ functiondef
     ;
 
 funcbody
-    : '(' parlist ')' block 'end'
+    : '(' parlist ')' typeAnnotation? block 'end'
     ;
 
 /* lparser.c says "is 'parlist' not empty?"
  * That code does so by checking la(1) == ')'.
  * This means that parlist can derive empty.
  */
+
+namelistWithTypes
+    : NAME typeAnnotation? (',' NAME typeAnnotation?)*
+    ;
+
 parlist
-    : namelist (',' '...')?
+    : namelistWithTypes (',' '...')?
     | '...'
     |
     ;
@@ -186,4 +191,8 @@ string
     : NORMALSTRING
     | CHARSTRING
     | LONGSTRING
+    ;
+
+typeAnnotation
+    : ':' NAME
     ;

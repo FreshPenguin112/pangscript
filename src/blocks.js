@@ -223,6 +223,121 @@ Object.assign(module.exports.processedBlocks, {
     ]],
     pmOperatorsExpansion_binnaryNot: [[
         { name: "num1", type: "number" }
+    ]],
+    // --- JSON extension input maps ---
+    json_validate: [[
+        { name: "json", type: "string" }
+    ]],
+    getValueFromJSON: [[
+        { name: "VALUE", type: "string" },
+        { name: "JSON", type: "string" }
+    ]],
+    getTreeValueFromJSON: [[
+        { name: "VALUE", type: "string" },
+        { name: "JSON", type: "string" }
+    ]],
+    setValueToKeyInJSON: [[
+        { name: "VALUE", type: "string" },
+        { name: "KEY", type: "string" },
+        { name: "JSON", type: "string" }
+    ]],
+    json_delete: [[
+        { name: "json", type: "string" },
+        { name: "key", type: "string" }
+    ]],
+    json_values: [[
+        { name: "json", type: "string" }
+    ]],
+    json_keys: [[
+        { name: "json", type: "string" }
+    ]],
+    json_has: [[
+        { name: "json", type: "string" },
+        { name: "key", type: "string" }
+    ]],
+    json_combine: [[
+        { name: "one", type: "string" },
+        { name: "two", type: "string" }
+    ]],
+    json_array_validate: [[
+        { name: "array", type: "string" }
+    ]],
+    json_array_split: [[
+        { name: "text", type: "string" },
+        { name: "delimeter", type: "string" }
+    ]],
+    json_array_join: [[
+        { name: "array", type: "string" },
+        { name: "delimeter", type: "string" }
+    ]],
+    json_array_push: [[
+        { name: "array", type: "string" },
+        { name: "item", type: "string" }
+    ]],
+    json_array_concatLayer1: [[
+        { name: "array1", type: "string" },
+        { name: "array2", type: "string" }
+    ]],
+    json_array_concatLayer2: [[
+        { name: "array1", type: "string" },
+        { name: "array2", type: "string" },
+        { name: "array3", type: "string" }
+    ]],
+    json_array_delete: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" }
+    ]],
+    json_array_reverse: [[
+        { name: "array", type: "string" }
+    ]],
+    json_array_insert: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" },
+        { name: "value", type: "string" }
+    ]],
+    json_array_set: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" },
+        { name: "value", type: "string" }
+    ]],
+    json_array_get: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" }
+    ]],
+    json_array_indexofNostart: [[
+        { name: "array", type: "string" },
+        { name: "value", type: "string" }
+    ]],
+    json_array_indexof: [[
+        { name: "array", type: "string" },
+        { name: "number", type: "number" },
+        { name: "value", type: "string" }
+    ]],
+    json_array_length: [[
+        { name: "array", type: "string" }
+    ]],
+    json_array_contains: [[
+        { name: "array", type: "string" },
+        { name: "value", type: "string" }
+    ]],
+    json_array_flat: [[
+        { name: "array", type: "string" },
+        { name: "layer", type: "number" }
+    ]],
+    json_array_getrange: [[
+        { name: "array", type: "string" },
+        { name: "index1", type: "number" },
+        { name: "index2", type: "number" }
+    ]],
+    json_array_isempty: [[
+        { name: "array", type: "string" }
+    ]],
+    json_array_listtoarray: [[
+        { name: "list", type: "string" }
+    ]],
+    json_array_tolist: [[
+        { name: "list", type: "string" },
+        { name: "array", type: "string" }
     ]]
 });
 // ---------------------------------------------------------------

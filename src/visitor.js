@@ -3,25 +3,40 @@
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
 const CompilerError = require("../utils/CompilerError");
-
 const { processedBlocks } = require("./blocks.js");
 
-//console.log(Object.getOwnPropertyNames(v))
 class visitor extends LuaParserVisitor {
     constructor(source) {
         super();
         this.idCounter = 0;
         this.blocks = {};
-        this.source = source.toString(); // Store the full source for error reporting
+        this.source = source.toString();
         this.generator = new _generator();
         this.customBlocks = {};
         this.mainBodyBlockIds = [];
-        this.variableScopes = {}; // { varName: "local" | "global" }
+        this.variableScopes = {};
+        this.types = {};
+    }
+
+    // Helper to extract type annotation from context
+    getTypeAnnotation(ctx) {
+        if (!ctx) return null;
+        if (ctx.typeAnnotation) {
+            return ctx.typeAnnotation(0).NAME().getText();
+        }
+        return null;
+    }
+
+    // Helper to extract base variable name and type from "name:type"
+    extractVarNameAndType(varString) {
+        if (typeof varString !== "string") return [varString, null];
+        const match = /^([a-zA-Z_][a-zA-Z0-9_]*)(?::([a-zA-Z_][a-zA-Z0-9_]*))?$/.exec(varString);
+        if (match) return [match[1], match[2] || null];
+        return [varString, null];
     }
 
     // Helper to add variable to the correct place in the project template
-    addVariableToProject(varName, initialValue, scope = "global") {
-        // Get the generator's template object
+    addVariableToProject(varName, initialValue, scope = "global", type = null) {
         const project = this.generator.template;
         let target;
         if (scope === "local") {
@@ -30,18 +45,14 @@ class visitor extends LuaParserVisitor {
             target = project.targets.find(t => t.isStage);
         }
         if (!target.variables) target.variables = {};
-        // Only add if not already present
-        if (!Object.prototype.hasOwnProperty.call(target.variables, varName)) {
-            target.variables[varName] = [varName, initialValue];
+        const [baseName, typeFromName] = this.extractVarNameAndType(varName);
+        // Always update type if provided (for reassignment)
+        if (type || typeFromName) this.types[baseName] = type || typeFromName;
+        if (!Object.prototype.hasOwnProperty.call(target.variables, baseName)) {
+            target.variables[baseName] = [baseName, initialValue];
         }
     }
 
-    // isType and getText methods are just ripped straight from fplus
-    /*
-    might not even need isType because the you can just define
-    visit methods for each type you need.
-    fplus would've been way easier to make if i knew this lmao
-    */
     isType(ctx, type) {
         return (() => {
             try {
@@ -64,14 +75,6 @@ class visitor extends LuaParserVisitor {
         return (() => {
             try {
                 return (
-                    /*
-                    shitty precedence order(based on what name you would most likely be looking for) 
-                    to try and get token name lol
-                    for example a statement would have the following precedence order,
-                    statement ||
-                    BREAK(the lexer token that equals the literal word "break") ||
-                    break(what BREAK equals, matches the literal word "break" anywhere in the input)
-                    */
                     ctx.parser.ruleNames[ctx.ruleIndex] ||
                     ctx.parser.symbolicNames[ctx.start.type] ||
                     ctx.parser.literalNames[ctx.start.type]
@@ -89,6 +92,20 @@ class visitor extends LuaParserVisitor {
         this.blocks = {};
         return blocksCopy;
     }
+
+    // Helper to wrap block references for input arrays
+    wrapInput(val) {
+        // If it's already a block reference
+        if (Array.isArray(val) && val[0] === 3) return val;
+        // If it's a variable reference (from visitExp): [12, varName, varName]
+        if (Array.isArray(val) && val[0] === 12) return [3, val, [10, ""]];
+        // If it's a block id string
+        if (typeof val === "string" && this.generator.blocks[val]) return [3, val, [10, ""]];
+        // Otherwise, treat as direct value
+        return [1, typeof val === "number" ? String(val) : val];
+    }
+
+    // --- Variable declaration/assignment support ---
     visitStatement(ctx) {
         //console.log("visiting statement", this.getText(ctx));
         //console.log(ctx.children.length);
@@ -721,80 +738,185 @@ class visitor extends LuaParserVisitor {
             )
         ) {
             let isLocal = false;
-            let varName, valueExp;
+            let varName, valueExp, type = null;
             if (ctx.children.length === 4) {
                 // local x = ...
                 isLocal = true;
                 varName = ctx.children[1].getText();
+                if (ctx.children[1].typeAnnotation) {
+                    type = this.getTypeAnnotation(ctx.children[1]);
+                }
+                const [baseName, typeFromName] = this.extractVarNameAndType(varName);
                 const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
-                const expResult = this.visitExp(ctx.children[3], blockId); // <-- pass blockId
-                valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
+                const expResult = this.visitExp(ctx.children[3], blockId);
+                valueExp = expResult; // <--- use expResult directly!
 
-                // Check for redeclaration with different scope
-                if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
-                    if (
-                        (isLocal && this.variableScopes[varName] !== "local") ||
-                        (!isLocal && this.variableScopes[varName] !== "global")
-                    ) {
-                        throw new CompilerError(
-                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
-                        ctx,
-                        this.source
-                    );
-                    }
-                } else {
-                    // First declaration: add to project
-                    this.variableScopes[varName] = isLocal ? "local" : "global";
-                    this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
+                this.variableScopes[baseName] = isLocal ? "local" : "global";
+                this.addVariableToProject(baseName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global", type || typeFromName);
+
+                // Special handling for JSON arrays/objects: assign as direct value
+                if (typeof valueExp === "string" && (valueExp.startsWith("[") || valueExp.startsWith("{"))) {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: [1, [10, valueExp]]
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
                 }
 
+                // If it's a block reference
+                if (Array.isArray(valueExp) && valueExp[0] === 3) {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: valueExp
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
+                }
+
+                // Otherwise, treat as direct value (number or string)
                 this.generator.addBlock({
                     opcode: "data_setvariableto",
                     id: blockId,
                     parent: null,
                     next: null,
-                    inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                    inputs: {
+                        VALUE: [1, typeof valueExp === "number" ? String(valueExp) : valueExp]
+                    },
                     fields: {
-                        VARIABLE: [varName, varName, ""]
+                        VARIABLE: [baseName, baseName, ""]
                     }
                 });
                 return blockId;
             } else {
                 // x = ...
                 varName = ctx.children[0].getText();
+                if (ctx.children[0].typeAnnotation) {
+                    type = this.getTypeAnnotation(ctx.children[0]);
+                }
+                const [baseName, typeFromName] = this.extractVarNameAndType(varName);
                 const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
-                const expResult = this.visitExp(ctx.children[2], blockId); // <-- pass blockId
-                valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
+                const expResult = this.visitExp(ctx.children[2], blockId);
+                valueExp = expResult; // <--- use expResult directly!
 
-                // Check for redeclaration with different scope
-                if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
-                    if (
-                        (isLocal && this.variableScopes[varName] !== "local") ||
-                        (!isLocal && this.variableScopes[varName] !== "global")
-                    ) {
-                        throw new CompilerError(
-                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
-                        ctx,
-                        this.source
-                    );
-                    }
-                } else {
-                    // First declaration: add to project
-                    this.variableScopes[varName] = isLocal ? "local" : "global";
-                    this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
+                this.variableScopes[baseName] = isLocal ? "local" : "global";
+                this.addVariableToProject(baseName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global", type || typeFromName);
+
+                // Special handling for JSON arrays/objects: assign as direct value
+                if (typeof valueExp === "string" && (valueExp.startsWith("[") || valueExp.startsWith("{"))) {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: [1, [10, valueExp]]
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
                 }
 
+                // If it's a block reference
+                if (Array.isArray(valueExp) && valueExp[0] === 3) {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: valueExp
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
+                }
+
+                // Otherwise, treat as direct value (number or string)
                 this.generator.addBlock({
                     opcode: "data_setvariableto",
                     id: blockId,
                     parent: null,
                     next: null,
-                    inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                    inputs: {
+                        VALUE: [1, typeof valueExp === "number" ? String(valueExp) : valueExp]
+                    },
                     fields: {
-                        VARIABLE: [varName, varName, ""]
+                        VARIABLE: [baseName, baseName, ""]
                     }
                 });
                 return blockId;
+            }
+        }
+
+        // Handle t[exp] = value (array/object set)
+        if (
+            ctx.children &&
+            ctx.children.length === 3 &&
+            ctx.children[0].constructor.name === "PrefixexpContext" &&
+            ctx.children[1].getText() === '='
+        ) {
+            const prefixexp = ctx.children[0];
+            // Table element assignment: t[exp] = value
+            if (
+                prefixexp.children &&
+                prefixexp.children.length >= 4 &&
+                prefixexp.children[1].getText() === '['
+            ) {
+                const tableVar = this.visitExp(prefixexp.children[0]);
+                const keyExp = prefixexp.children[2];
+                const valueExp = this.visitExp(ctx.children[2]);
+                const key = this.visitExp(keyExp);
+
+                if (!isNaN(Number(key))) {
+                    // json_array_set
+                    const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    this.generator.addBlock({
+                        opcode: "json_array_set",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: [
+                            this.wrapInput(tableVar),
+                            this.wrapInput(Number(key)),
+                            this.wrapInput(valueExp)
+                        ]
+                    });
+                    return blockId;
+                } else {
+                    // setValueToKeyInJSON
+                    const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    this.generator.addBlock({
+                        opcode: "setValueToKeyInJSON",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: [
+                            this.wrapInput(valueExp),
+                            this.wrapInput(key),
+                            this.wrapInput(tableVar)
+                        ]
+                    });
+                    return blockId;
+                }
             }
         }
 
@@ -802,13 +924,7 @@ class visitor extends LuaParserVisitor {
         let x = this.visitChildren(ctx);
         return x instanceof Array ? x[0] : x;
     }
-    visitConcatenation(ctx) {}
-    // Helper to wrap block references for input arrays
-    wrapInput(val) {
-        if (Array.isArray(val) && val[0] === 3) return [val[1]];
-        if (typeof val === "string" && this.generator.blocks[val]) return [val];
-        return val;
-    }
+    visitConcatenation(ctx) { }
     visitFunctioncall(ctx, asReporter = false) {
         const funcName = this.getText(ctx.NAME ? ctx.NAME(0) : ctx);
 
@@ -963,6 +1079,40 @@ class visitor extends LuaParserVisitor {
         });
         return callId;
     }
+    // Helper for table/array access: t[2] or t["key"]
+    handleTableAccess(tableVar, keyExp, parentId) {
+        const key = this.visitExp(keyExp);
+        // If key is a number, use json_array_get
+        if (!isNaN(Number(key))) {
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "json_array_get",
+                id: blockId,
+                parent: parentId,
+                next: null,
+                inputs: [
+                    this.wrapInput(tableVar),
+                    this.wrapInput(Number(key))
+                ]
+            });
+            return blockId;
+        } else {
+            // getValueFromJSON
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "getValueFromJSON",
+                id: blockId,
+                parent: parentId,
+                next: null,
+                inputs: [
+                    this.wrapInput(key),
+                    this.wrapInput(tableVar)
+                ]
+            });
+            return blockId;
+        }
+    }
+
     visitExp(ctx, parentId = null, forceStringFallback = false) {
         // If it's a string literal
         if (ctx.STRING) {
@@ -1098,11 +1248,11 @@ class visitor extends LuaParserVisitor {
                     left: "OPERAND1",
                     right: "OPERAND2",
                 },
-                "&": {opcode: "pmOperatorsExpansion_binnaryAnd", left: "num1", right: "num2"},
-                "|": {opcode: "pmOperatorsExpansion_binnaryOr", left: "num1", right: "num2"},
-                "~": {opcode: "pmOperatorsExpansion_binnaryXor", left: "num1", right: "num2"},
-                "<<": {opcode: "pmOperatorsExpansion_shiftLeft", left: "num1", right: "num2"},
-                ">>": {opcode: "pmOperatorsExpansion_shiftRight", left: "num1", right: "num2"},
+                "&": { opcode: "pmOperatorsExpansion_binnaryAnd", left: "num1", right: "num2" },
+                "|": { opcode: "pmOperatorsExpansion_binnaryOr", left: "num1", right: "num2" },
+                "~": { opcode: "pmOperatorsExpansion_binnaryXor", left: "num1", right: "num2" },
+                "<<": { opcode: "pmOperatorsExpansion_shiftLeft", left: "num1", right: "num2" },
+                ">>": { opcode: "pmOperatorsExpansion_shiftRight", left: "num1", right: "num2" },
             };
 
             if (opMap[op]) {
@@ -1234,7 +1384,49 @@ class visitor extends LuaParserVisitor {
             ctx.children[0].constructor.name.endsWith("PrefixexpContext")
         ) {
             const varName = ctx.children[0].getText();
-            return [3, [12, varName, varName], [10, ""]];
+            return [12, varName, varName];
+        }
+
+        // Table or string length: #t or #str
+        if (
+            ctx.children &&
+            ctx.children.length === 2 &&
+            ctx.children[0].getText() === "#"
+        ) {
+            const operand = this.visitExp(ctx.children[1]);
+            let varName = null;
+            if (Array.isArray(operand) && operand[1] && typeof operand[1] === "string") {
+                [varName] = this.extractVarNameAndType(operand[1]);
+            }
+            let isString = false;
+            if (typeof operand === "string" && operand[0] !== "[") isString = true;
+            if (varName && this.types[varName] === "string") isString = true;
+            if (isString) {
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                this.generator.addBlock({
+                    opcode: "operator_length",
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [
+                        this.wrapInput(operand)
+                    ]
+                });
+                return blockId;
+            } else {
+                // Default: treat as array
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                this.generator.addBlock({
+                    opcode: "json_array_length",
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [
+                        this.wrapInput(operand)
+                    ]
+                });
+                return blockId;
+            }
         }
 
         // Not a concat or arithmetic, fallback to child or text
@@ -1251,6 +1443,7 @@ class visitor extends LuaParserVisitor {
         // Get function name and body
         const funcbody = ctx.funcbody();
         const parlist = funcbody.parlist();
+        const returnType = this.getTypeAnnotation(funcbody.typeReturnAnnotation ? funcbody.typeReturnAnnotation() : null);
         const block = funcbody.block();
 
         // Generate a unique id for the prototype and definition
@@ -1326,5 +1519,51 @@ class visitor extends LuaParserVisitor {
 
         return;
     }
+    visitTableconstructor(ctx) {
+        // Empty table
+        if (!ctx.fieldlist || !ctx.fieldlist()) return "[]";
+        const fields = ctx.fieldlist().field();
+        let isArray = true;
+        let arrayValues = [];
+        let objectValues = {};
+
+        for (const field of fields) {
+            // [exp] = exp
+            if (field.children.length === 5 && field.children[1].getText() === '[' && field.children[3].getText() === '=') {
+                const key = this.visitExp(field.children[2]);
+                let value = this.visitExp(field.children[4]);
+                // Convert primitives to string for JSON
+                if (typeof value === "object") throw new CompilerError("Cannot use block reference as table value", field, this.source);
+                objectValues[key] = value;
+                isArray = false;
+            }
+            // name = exp
+            else if (field.children.length === 3 && field.children[1].getText() === '=') {
+                const key = field.children[0].getText();
+                let value = this.visitExp(field.children[2]);
+                if (typeof value === "object") throw new CompilerError("Cannot use block reference as table value", field, this.source);
+                objectValues[key] = value;
+                isArray = false;
+            }
+            // exp (array element)
+            else if (field.children.length === 1) {
+                let value = this.visitExp(field.children[0]);
+                if (typeof value === "object") throw new CompilerError("Cannot use block reference as array value", field, this.source);
+                arrayValues.push(value);
+            }
+        }
+
+        // Always stringify as JSON string
+        if (isArray && Object.keys(objectValues).length === 0) {
+            return JSON.stringify(arrayValues);
+        } else {
+            // Mixed: add array values as numeric keys (Lua is 1-based)
+            arrayValues.forEach((v, i) => {
+                objectValues[(i + 1).toString()] = v;
+            });
+            return JSON.stringify(objectValues);
+        }
+    }
 }
+
 module.exports = visitor;
