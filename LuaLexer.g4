@@ -119,13 +119,17 @@ fragment Digit: [0-9];
 
 fragment HexDigit: [0-9a-fA-F];
 
-fragment SingleLineInputCharacter: ~[\r\n\u0085\u2028\u2029];
+    // Directive-style comments for the generator. Syntax: --@directive ...
+    // Allow optional spaces between the dashes and the '@' so `-- @label` works too.
+    DIRECTIVE_COMMENT: '--' [ \t]* '@' ~[\r\n]* -> channel(HIDDEN);
 
-COMMENT: '--' { this.HandleComment(); } ~[\r\n]* -> channel(HIDDEN);
+    COMMENT: '--' ~'@' { this.HandleComment(); } ~[\r\n]* -> channel(HIDDEN);
 
-LONGCOMMENT: '--' '[[' .+? ']]' '--' -> channel(HIDDEN);
+    LONGCOMMENT: '--' '[[' .+? ']]' '--' -> channel(HIDDEN);
 
-WS: [ \t\u000C\r]+ -> channel(HIDDEN);
+    WS: [ \t\u000C\r]+ -> channel(HIDDEN);
+
+fragment SingleLineInputCharacter: ~[\r\n];
 
 NL: [\n] -> channel(2);
 

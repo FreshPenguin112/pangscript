@@ -94,6 +94,7 @@ exp
     | functiondef
     | prefixexp
     | tableconstructor
+    | arrayconstructor
     | <assoc = right> exp ('^') exp
     | ('not' | '#' | '-' | '~') exp
     | exp ('*' | '/' | '%' | '//') exp
@@ -162,7 +163,21 @@ parlist
     ;
 
 tableconstructor
-    : '{' fieldlist? '}'
+    : '{' bracketfieldlist? '}'
+    | '{' fieldlist? '}'
+    ;
+
+arrayconstructor
+    : '[' explist? ']'
+    ;
+
+bracketfieldlist
+    : bracketfield (fieldsep bracketfield)* fieldsep?
+    ;
+
+bracketfield
+    : '[' exp ']' '=' exp
+    | '[' exp ']'
     ;
 
 fieldlist
