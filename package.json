@@ -1,13 +1,13 @@
 {
     "scripts": {
-        "build": "rm -rf src/*.min* && antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && babel src/*.js --ignore src/visitor.js --out-file-extension .min.js --out-dir src --presets=@babel/preset-env --plugins=@babel/plugin-transform-modules-commonjs && babel src/index.min.js --out-dir src --plugins=./utils/babel-plugin-require-minify.js && babel-minify $(ls src/*.min.js | grep -v visitor.min.js) --out-dir src && babel lib --out-dir lib --plugins=@babel/plugin-transform-modules-commonjs",
+        "clean": "rm -rf src/*.min.js",
+        "build": "antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && babel src/*.js --ignore src/visitor.js --out-file-extension .min.js --out-dir src --presets=@babel/preset-env --plugins=@babel/plugin-transform-modules-commonjs && babel src/index.min.js --out-dir src --plugins=./utils/babel-plugin-require-minify.js && babel-minify $(ls src/*.min.js | grep -v visitor.min.js) --out-dir src && babel lib --out-dir lib --plugins=@babel/plugin-transform-modules-commonjs",
         "install2": "npm install -g @babel/cli @babel/plugin-transform-modules-commonjs babel-minify antlr4ng-cli",
         "pkg": "npm run build && rm -rf dist && mkdir dist && pkg --targets node14-linux-x64,node14-linuxstatic-x64,node14-win-x64,node14-macos-x64,node14-linux-arm64,node14-linuxstatic-arm64,node14-win-arm64,node14-macos-arm64 --compress Brotli --no-bytecode --public --out-path ./dist src/index.min.js && for f in dist/index.min*; do mv \"$f\" \"${f/index.min/index}\"; done",
         "publish": "git tag -a \"$TAG\" -m \"Release $TAG\" && gh release create \"$TAG\" --title \"Release $TAG\" --notes \"$NOTES\" -R https://github.com/FreshPenguin112/pangscript ./dist/* && rm -rf ./dist ./src/*.min.*"
     },
     "dependencies": {
         "@babel/cli": "^7.27.2",
-        "jsonh-ts": "^1.0.0",
         "@babel/core": "^7.27.2",
         "@babel/plugin-transform-modules-commonjs": "^7.27.1",
         "@babel/preset-env": "^7.27.1",
@@ -23,6 +23,7 @@
         "babel-plugin-module-resolver": "^5.0.2",
         "cli-highlight": "^2.1.11",
         "google-closure-library": "^20230802.0.0",
+        "jsonh-ts": "^1.0.0",
         "jszip": "2.6.1",
         "pkg": "^5.8.1",
         "rollup": "^4.43.0",

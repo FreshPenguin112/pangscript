@@ -74,7 +74,7 @@ var template = {
     ],
     monitors: [],
     extensionData: {},
-    extensions: ["pmOperatorsExpansion", "jgJSON"],
+    extensions: ["pmOperatorsExpansion", "jgJSON", "jwProto"],
     meta: {
         semver: "3.0.0",
         vm: "0.2.0",

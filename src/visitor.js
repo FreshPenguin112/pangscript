@@ -314,11 +314,16 @@ class visitor extends LuaParserVisitor {
             if (line && this._lineComments && this._lineComments[line]) {
                 this._pendingLineLabel = { line, text: this._lineComments[line], type: 'command' };
             }
-            // check for block comment starting at this line
+            // check for a block comment that ended immediately before this statement
+            // If a user wrote:
+            //   --@label-start ...
+            //   -- ...
+            //   --@label-end
+            //   <statement>
+            // then attach the block's text as a function-style label for <statement>.
             if (line && this._blockComments && Array.isArray(this._blockComments)) {
                 for (const bc of this._blockComments) {
-                    if (bc.startLine === line) {
-                        // schedule a function-style label for the block
+                    if (typeof bc.endLine === 'number' && bc.endLine === line - 1) {
                         this._pendingLineLabel = { line, text: bc.text || '', type: 'function' };
                         break;
                     }
@@ -1256,21 +1261,6 @@ class visitor extends LuaParserVisitor {
                                 }
                             }
 
-                            // If a pending line label exists for this hat, emit a labelHat before the real hat
-                            if (this._pendingLineLabel) {
-                                const labHatId = this.generator.letterCount(this.generator.blockIdCounter++);
-                                this.generator.addBlock({
-                                    opcode: 'jwProto_labelHat',
-                                    id: labHatId,
-                                    parent: null,
-                                    next: null,
-                                    shadow: false,
-                                    topLevel: true,
-                                    fields: { LABEL: [this._pendingLineLabel.text, this._pendingLineLabel.text, ''] }
-                                });
-                                // clear pending
-                                this._pendingLineLabel = null;
-                            }
                             // Add the hat block as top-level
                             const hatId = this.generator.letterCount(this.generator.blockIdCounter++);
                             this.generator.addBlock({
@@ -1284,13 +1274,59 @@ class visitor extends LuaParserVisitor {
                                 topLevel: true,
                             });
 
-                            // Chain and parent the child's blocks under the hat: set hat.next to first entry
+                            // If a pending line label exists for this hat and it was marked as a function-style block,
+                            // emit a jwProto_labelFunction immediately after the hat and attach the SUBSTACK to it.
+                            let labelFunctionId = null;
+                            if (this._pendingLineLabel && this._pendingLineLabel.type === 'function') {
+                                const pendingText = this._pendingLineLabel.text;
+                                labelFunctionId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                this.generator.addBlock({
+                                    opcode: 'jwProto_labelFunction',
+                                    id: labelFunctionId,
+                                    parent: hatId,
+                                    next: null,
+                                    shadow: false,
+                                    topLevel: false,
+                                    fields: { LABEL: [pendingText, pendingText, ''] },
+                                    // inputs.SUBSTACK will be set below when we know the first child id
+                                });
+                                // clear pending now that we've consumed it
+                                this._pendingLineLabel = null;
+                            } else if (this._pendingLineLabel) {
+                                // For other pending label types, fall back to emitting a labelHat above the hat (legacy behavior)
+                                const labHatId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                this.generator.addBlock({
+                                    opcode: 'jwProto_labelHat',
+                                    id: labHatId,
+                                    parent: null,
+                                    next: null,
+                                    shadow: false,
+                                    topLevel: true,
+                                    fields: { LABEL: [this._pendingLineLabel.text, this._pendingLineLabel.text, ''] }
+                                });
+                                this._pendingLineLabel = null;
+                            }
+
+                            // Chain and parent the child's blocks under the hat: set hat.next to either the labelFunction (if created)
+                            // or to the first entry in the body. Also set the SUBSTACK input of the labelFunction to the first entry.
                             if (bodyBlockIds.length > 0) {
                                 const firstEntry = bodyBlockIds[0].entry ?? bodyBlockIds[0];
-                                // Set hat.next to the first statement in the body
-                                if (this.generator.blocks[hatId]) this.generator.blocks[hatId].next = firstEntry;
-                                // Parent the first statement to the hat
-                                if (this.generator.blocks[firstEntry]) this.generator.blocks[firstEntry].parent = hatId;
+                                if (labelFunctionId) {
+                                    // hat -> labelFunction -> SUBSTACK -> firstEntry
+                                    if (this.generator.blocks[hatId]) this.generator.blocks[hatId].next = labelFunctionId;
+                                    if (this.generator.blocks[labelFunctionId]) {
+                                        this.generator.blocks[labelFunctionId].parent = hatId;
+                                        // set SUBSTACK input to point to firstEntry
+                                        this.generator.blocks[labelFunctionId].inputs = this.generator.blocks[labelFunctionId].inputs || {};
+                                        this.generator.blocks[labelFunctionId].inputs.SUBSTACK = [2, firstEntry];
+                                    }
+                                    // Parent the first statement to the labelFunction
+                                    if (this.generator.blocks[firstEntry]) this.generator.blocks[firstEntry].parent = labelFunctionId;
+                                } else {
+                                    // No labelFunction: hat -> firstEntry
+                                    if (this.generator.blocks[hatId]) this.generator.blocks[hatId].next = firstEntry;
+                                    if (this.generator.blocks[firstEntry]) this.generator.blocks[firstEntry].parent = hatId;
+                                }
 
                                 // Chain subsequent statements
                                 for (let i = 0; i < bodyBlockIds.length - 1; i++) {

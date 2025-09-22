@@ -2,7 +2,7 @@
     Stage: {
         luaFile: "", // null would also be valid
         costumes: [ // no need to differentiate backdrops and costumes
-            { name: "backdrop1", path: "startingAssets/cd21514d0531fdffb22204e0ec5ed84a.svg", default: true }
+            { name: "backdrop1", path: "../../startingAssets/cd21514d0531fdffb22204e0ec5ed84a.svg", default: true }
         ],
         variables: {
             score: 0,
@@ -10,9 +10,9 @@
         }
     },
     Sprite2: {
-        luaFile: "test_events.lua",
+        luaFile: "test_comments.lua",
         costumes: [
-            { name: "costume1", path: "/home/freshpenguin112/Documents/Projects/pangscript/startingAssets/c434b674f2da18ba13cdfe51dbc05ecc.svg", default: true }
+            { name: "costume1", path: "../../startingAssets/c434b674f2da18ba13cdfe51dbc05ecc.svg", default: true }
         ],
     }
     // there can be unlimited sprites, Stage is the only reserved name

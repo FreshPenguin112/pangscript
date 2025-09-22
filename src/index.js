@@ -10,7 +10,7 @@ let configPath = null;
 let configBaseDir = null;
 const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
-
+const debug = process.argv.includes("--debug") || process.argv.includes("-d");
 // Now that path/fs are available, parse config if provided
 if (process.argv.includes("--config") || process.argv.includes("-c")) {
     configPath = process.argv[(process.argv.indexOf("-c") === -1 ? process.argv.indexOf("--config") : process.argv.indexOf("-c")) + 1];
@@ -81,12 +81,23 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
                         }
                         // costumes
                         if (Array.isArray(spec.costumes)) {
+                            // If the config explicitly provides costumes, drop any
+                            // default costumes from the template copy so we don't
+                            // duplicate the built-in starter assets.
+                            base.costumes = [];
                             for (const c of spec.costumes) {
                                 if (!c || !c.path) continue;
-                                const absPath = path.isAbsolute(c.path) ? c.path : path.resolve(configBaseDir || process.cwd(), c.path);
-                                // Use target-prefixed dest name to avoid collisions
+                                const candidate = path.isAbsolute(c.path) ? c.path : path.resolve(configBaseDir || process.cwd(), c.path);
+                                const absPath = require('fs').existsSync(candidate) ? candidate : (path.isAbsolute(c.path) ? c.path : path.resolve(process.cwd(), c.path));
+                                if (debug) console.log(`DBG asset resolve (costume) for target=${targetName} name=${c.name || ''}: candidate='${candidate}', resolved='${absPath}', exists=${require('fs').existsSync(absPath)}`);
+                                // Use bare basename when possible so the md5ext matches
+                                // the actual filename; only prefix with the target
+                                // name if that basename is already registered.
                                 const basename = path.basename(absPath);
-                                const destName = `${targetName}_${basename}`;
+                                let destName = basename;
+                                if (generator._assets && Object.prototype.hasOwnProperty.call(generator._assets, destName)) {
+                                    destName = `${targetName}_${basename}`;
+                                }
                                 generator.registerAsset(destName, absPath);
                                 base.costumes.push({
                                     name: c.name || basename,
@@ -101,11 +112,19 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
                         }
                         // sounds
                         if (Array.isArray(spec.sounds)) {
+                            // Similarly, when sounds are provided explicitly,
+                            // clear template defaults so only config sounds remain.
+                            base.sounds = [];
                             for (const s of spec.sounds) {
                                 if (!s || !s.path) continue;
-                                const absPath = path.isAbsolute(s.path) ? s.path : path.resolve(configBaseDir || process.cwd(), s.path);
+                                const candidateS = path.isAbsolute(s.path) ? s.path : path.resolve(configBaseDir || process.cwd(), s.path);
+                                const absPath = require('fs').existsSync(candidateS) ? candidateS : (path.isAbsolute(s.path) ? s.path : path.resolve(process.cwd(), s.path));
+                                if (debug) console.log(`DBG asset resolve (sound) for target=${targetName} name=${s.name || ''}: candidate='${candidateS}', resolved='${absPath}', exists=${require('fs').existsSync(absPath)}`);
                                 const basename = path.basename(absPath);
-                                const destName = `${targetName}_${basename}`;
+                                let destName = basename;
+                                if (generator._assets && Object.prototype.hasOwnProperty.call(generator._assets, destName)) {
+                                    destName = `${targetName}_${basename}`;
+                                }
                                 generator.registerAsset(destName, absPath);
                                 base.sounds.push({
                                     name: s.name || basename,
@@ -151,14 +170,20 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
 // Do not add a global when-flag hat unconditionally; only inject it into
 // the merged blocks when the main/top-level code actually exists.
 //console.log(generator.blockIdCounter);
-const debug = process.argv.includes("--debug") || process.argv.includes("-d");
-const infile = process.argv.includes("-i") || process.argv.includes("--infile") ? process.argv[(process.argv.indexOf("-i") == -1 ? process.argv.indexOf("--infile") : process.argv.indexOf("-i")) + 1] : "test.lua";
-const outfile = process.argv.includes("-o") || process.argv.includes("--outfile") ? process.argv[(process.argv.indexOf("-o") == -1 ? process.argv.indexOf("-outfile") : process.argv.indexOf("-o")) + 1] : "../indexTest.pmp"
-// Normalize infile/outfile paths: allow absolute paths or resolve relative to CWD
-if (debug) console.log(`DBG: infile='${infile}', outfile='${outfile}', infile.isAbsolute=${path.isAbsolute(infile)}`);
-const infilePath = path.isAbsolute(infile) ? infile : path.resolve(process.cwd(), infile);
+
+// Determine infile/outfile, but when a config is provided, disallow passing -i/--infile
+if (configPath && (process.argv.includes("-i") || process.argv.includes("--infile"))) {
+    console.error('The -i/--infile option is not allowed when using -c/--config.');
+    process.exit(1);
+}
+const infile = (!configPath && (process.argv.includes("-i") || process.argv.includes("--infile"))) ? process.argv[(process.argv.indexOf("-i") == -1 ? process.argv.indexOf("--infile") : process.argv.indexOf("-i")) + 1] : (configPath ? null : "test.lua");
+const outfile = process.argv.includes("-o") || process.argv.includes("--outfile") ? process.argv[(process.argv.indexOf("-o") == -1 ? process.argv.indexOf("-outfile") : process.argv.indexOf("-o")) + 1] : "../indexTest.pmp";
+// Normalize outfile path; infilePath and rawSource are only relevant when not using a config
+if (debug) console.log(`DBG: infile='${infile}', outfile='${outfile}', infile.isAbsolute=${infile ? path.isAbsolute(infile) : 'N/A'}`);
+const infilePath = infile ? (path.isAbsolute(infile) ? infile : path.resolve(process.cwd(), infile)) : null;
 const outfilePath = path.isAbsolute(outfile) ? outfile : path.resolve(process.cwd(), outfile);
-const rawSource = readFileSync(infilePath, "utf8").toString();
+let rawSource = "";
+if (infilePath) rawSource = readFileSync(infilePath, "utf8").toString();
 
 // Replace bracket-array literals [ ... ] with table constructors { ... }
 // Heuristic: only replace a '[' that appears in a literal context, i.e. when the
@@ -215,95 +240,97 @@ function rewriteBracketArrays(src) {
     return out;
 }
 
-const processedSource = rewriteBracketArrays(rawSource);
-// Previously we stripped `--@` directive comments before lexing so the parser
-// wouldn't see them. Now we let the lexer handle directives via the
-// `DIRECTIVE_COMMENT` token (sent to the HIDDEN channel). Use the processed
-// source directly as the lexer input so directive tokens are emitted.
-const input = new InputStream(processedSource);
+// Process main input only when no config was provided. When a config is used
+// the project will be constructed from the config + any per-target luaFiles.
+const processedSource = rawSource ? rewriteBracketArrays(rawSource) : "";
 // Pass the original (unstripped) source to the visitor so it can parse directive comments
-const visitor = new _visitor(rawSource);
-const lexer = new SimpleLangLexer(input);
-/*if (debug) {
-    let token = lexer.nextToken();
-    while (token.type !== Token.EOF) {
-        console.log(`type: ${token.type}, text: ${token.text}`);
-        token = lexer.nextToken();
-    }
-}*/
-const tokens = new CommonTokenStream(lexer);
-const parser = new SimpleLangParser(tokens);
-//debug && console.log(parser.constructor)
-//parser.buildParseTrees = true;
-const tree = parser.block();
-if (debug) {
-    console.log(`Main input tree:\n\n${tree.toStringTree(null, parser) || "blank tree"}\n`);
-}
-//console.log(visitor)
-//console.log(parser);
-
-let a = generator.getBlocks();
-visitor.generator.blockIdCounter++;
-try {
-    visitor.visitBlock(tree);
-} catch (err) {
-    if (err instanceof CompilerError) {
-        // Only print the user-friendly error
-        console.error(err.toString());
-    } else {
-        // Print full stack for unexpected errors
-        console.error(err.stack || err);
-    }
-    process.exit(1);
-}
-let result = visitor.getAndClearBlocks();
-const mergedBlocks = { ...a, ...result.blocks };
-// If no top-level/main code was produced, do not import an empty global when-flag
-if ((!visitor.mainBodyBlockIds || visitor.mainBodyBlockIds.length === 0) && mergedBlocks["a"]) {
-    // Remove the synthetic when-flag hat 'a' so the Stage won't have an empty hat
-    delete mergedBlocks["a"];
-}
-visitor.generator.importBlocks(mergedBlocks);
-
-// --- Chain main function body under whenflagclicked ---
-if (visitor.mainBodyBlockIds && visitor.mainBodyBlockIds.length > 0) {
-    const firstBlockId = visitor.mainBodyBlockIds[0].entry ?? visitor.mainBodyBlockIds[0];
-    // Ensure the global 'a' hat exists in the main generator; create if missing
-    if (!visitor.generator.blocks["a"]) {
-        try {
-            visitor.generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, next: null, id: "a" });
-        } catch (e) {
-            // fallback: create minimal block object
-            visitor.generator.blocks["a"] = {
-                opcode: "event_whenflagclicked",
-                next: null,
-                parent: null,
-                inputs: {},
-                fields: {},
-                shadow: false,
-                topLevel: true,
-                mutation: null,
-                x: 0,
-                y: 0
-            };
+const visitor = new _visitor(rawSource || "");
+if (!configPath) {
+    // Previously we stripped `--@` directive comments before lexing so the parser
+    // wouldn't see them. Now we let the lexer handle directives via the
+    // `DIRECTIVE_COMMENT` token (sent to the HIDDEN channel). Use the processed
+    // source directly as the lexer input so directive tokens are emitted.
+    const input = new InputStream(processedSource);
+    const lexer = new SimpleLangLexer(input);
+    /*if (debug) {
+        let token = lexer.nextToken();
+        while (token.type !== Token.EOF) {
+            console.log(`type: ${token.type}, text: ${token.text}`);
+            token = lexer.nextToken();
         }
+    }*/
+    const tokens = new CommonTokenStream(lexer);
+    const parser = new SimpleLangParser(tokens);
+    //debug && console.log(parser.constructor)
+    //parser.buildParseTrees = true;
+    const tree = parser.block();
+    if (debug) {
+        console.log(`Main input tree:\n\n${tree.toStringTree(null, parser) || "blank tree"}\n`);
     }
-    visitor.generator.blocks[firstBlockId].parent = "a";
-    visitor.generator.blocks["a"].next = firstBlockId;
-}
 
-if (debug) {
-    console.log("Main blocks:\n");
-    console.log(JSON.stringify(visitor.generator.getBlocks(), null, 2));
+    let a = generator.getBlocks();
+    visitor.generator.blockIdCounter++;
+    try {
+        visitor.visitBlock(tree);
+    } catch (err) {
+        if (err instanceof CompilerError) {
+            // Only print the user-friendly error
+            console.error(err.toString());
+        } else {
+            // Print full stack for unexpected errors
+            console.error(err.stack || err);
+        }
+        process.exit(1);
+    }
+    let result = visitor.getAndClearBlocks();
+    const mergedBlocks = { ...a, ...result.blocks };
+    // If no top-level/main code was produced, do not import an empty global when-flag
+    if ((!visitor.mainBodyBlockIds || visitor.mainBodyBlockIds.length === 0) && mergedBlocks["a"]) {
+        // Remove the synthetic when-flag hat 'a' so the Stage won't have an empty hat
+        delete mergedBlocks["a"];
+    }
+    visitor.generator.importBlocks(mergedBlocks);
+
+    // --- Chain main function body under whenflagclicked ---
+    if (visitor.mainBodyBlockIds && visitor.mainBodyBlockIds.length > 0) {
+        const firstBlockId = visitor.mainBodyBlockIds[0].entry ?? visitor.mainBodyBlockIds[0];
+        // Ensure the global 'a' hat exists in the main generator; create if missing
+        if (!visitor.generator.blocks["a"]) {
+            try {
+                visitor.generator.addBlock({ opcode: "event_whenflagclicked", topLevel: true, next: null, id: "a" });
+            } catch (e) {
+                // fallback: create minimal block object
+                visitor.generator.blocks["a"] = {
+                    opcode: "event_whenflagclicked",
+                    next: null,
+                    parent: null,
+                    inputs: {},
+                    fields: {},
+                    shadow: false,
+                    topLevel: true,
+                    mutation: null,
+                    x: 0,
+                    y: 0
+                };
+            }
+        }
+        visitor.generator.blocks[firstBlockId].parent = "a";
+        visitor.generator.blocks["a"].next = firstBlockId;
+    }
+
+    if (debug) {
+        console.log("Main blocks:\n");
+        console.log(JSON.stringify(visitor.generator.getBlocks(), null, 2));
+        console.log();
+    }
+    // Write initial output containing main blocks
+    console.log(`saved to file: ${outfilePath}`);
     console.log();
+    writeFileSync(
+        outfilePath,
+        visitor.generator.getProject()
+    );
 }
-//console.log("result:\n");
-console.log(`saved to file: ${outfilePath}`);
-console.log();
-writeFileSync(
-    outfilePath,
-    visitor.generator.getProject()
-);
 
 // If any targets have per-target luaFile set in their extensionData, compile them and embed their blocks
 try {
