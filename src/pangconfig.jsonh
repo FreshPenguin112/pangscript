@@ -4,7 +4,7 @@
         costumes: [ // no need to differentiate backdrops and costumes
             { name: "backdrop1", path: "../../startingAssets/cd21514d0531fdffb22204e0ec5ed84a.svg", default: true }
         ],
-        variables: {
+        variables: { // stage variables are just global variables aka "for all sprites"
             score: 0,
             lives: 3
         }
@@ -14,6 +14,13 @@
         costumes: [
             { name: "costume1", path: "../../startingAssets/c434b674f2da18ba13cdfe51dbc05ecc.svg", default: true }
         ],
+        sounds: [
+            { name: "squawk", path: "../../e140d7ff07de8fa35c3d1595bba835ac.wav" }
+        ]
+        variables: { // sprite-specific variables
+            val1: "hello",
+            val2: 123
+        }
     }
     // there can be unlimited sprites, Stage is the only reserved name
 }

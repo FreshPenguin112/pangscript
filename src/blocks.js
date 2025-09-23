@@ -93,10 +93,7 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
                 .map(n => block[n])
                 .filter(a => a[0]?.type != 'field_image');
             } catch (error) {
-                console.error(block,
-                    Object.keys(block)
-                    .filter(a => a.startsWith('args'))
-                    .map(n => block[n]))
+                try { const dbg = require('./debug'); if (dbg.enabled()) dbg.debug(block, Object.keys(block).filter(a => a.startsWith('args')).map(n => block[n])); } catch (e) {}
                 throw error
             }
             const args = Object.keys(block)
@@ -142,7 +139,7 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
                     return {
                         name: arg.name,
                         type: arg.type == 'input_value' ? 1 : (() => {
-                            console.error(block, args)
+                            try { const dbg = require('./debug'); if (dbg.enabled()) dbg.debug(block, args); } catch (e) {}
                             throw `Unknown input type ${arg.type} in ${opcode}.${arg.name}`
                         })(),
                         variableTypes: arg.variableTypes

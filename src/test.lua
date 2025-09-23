@@ -200,6 +200,59 @@ function test8()
     print("~x: " .. notResult, 0.5) -- This will print "~x: -6"
 end
 
+function test9()
+    -- Demonstrate length operator and nested tables
+    arr = {10, 20, 30, 40}
+    print("arr length: " .. #arr, 1)
+    arr[2] = 99
+    print("arr[2]: " .. arr[2], 1)
+
+    local obj = {a = 1, b = 2}
+    --print("nested.x: " .. obj.nested.x, 1)
+    obj.c = 5 -- dot-assignment to add a field
+    print("obj.c: " .. obj.c, 1)
+
+    local s: string = "hello"
+    print("string length: " .. #s, 1)
+end
+
+function test_string_indexing()
+    -- Literal index on a typed string variable
+    local s: string = "abcdef"
+    print("s[3]: " .. s[3], 1)
+    -- Substring literal range
+    print("s[1..3]: " .. s[1..3], 1)
+    -- Range-like access using two indices (simulate by calling substring block via visitor)
+    -- We'll use variables so the compiler must treat s as a string
+    local i = 2
+    local j = 4
+    print("s[i]: " .. s[i], 1)
+    print("s[i..j]: " .. operator_getLettersFromIndexToIndexInTextFixed(i, j, s), 1)
+end
+
+-- Simple parameterized function and method-style table call
+function addAndPrint(a, b)
+    local res = a + b
+    print("addAndPrint: " .. res, 1)
+end
+
+function test10()
+    addAndPrint(7, 8)
+
+    local arr2 = [1, 2]
+    -- method-style insert (parser supports dotted/colon calls)
+    table.insert(arr2, 2, 99)
+    print("arr2 after insert: " .. table.concat(arr2, ","), 1)
+end
+
+function labels()
+    --@label inline single line label
+    print("Hello, ", "World!", 2) --@val2 world text
+    --@label-start multiline label start
+    print("This is inside a multiline label", 2)
+    --@label-end
+end
+
 function main()
     --[[
         The main function is a special reserved function that never gets compiled into a my blocks function,
@@ -218,5 +271,8 @@ function main()
     test6()
     test7()
     test8()
+    test9()
+    test_string_indexing()
+    test10()
 end
 

@@ -10,7 +10,9 @@ let configPath = null;
 let configBaseDir = null;
 const { readFileSync, writeFileSync } = require("fs");
 const path = require("path");
+const dbg = require('./debug');
 const debug = process.argv.includes("--debug") || process.argv.includes("-d");
+if (debug) dbg.setEnabled(true);
 // Now that path/fs are available, parse config if provided
 if (process.argv.includes("--config") || process.argv.includes("-c")) {
     configPath = process.argv[(process.argv.indexOf("-c") === -1 ? process.argv.indexOf("--config") : process.argv.indexOf("-c")) + 1];
@@ -42,8 +44,8 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
             }
             // Debug: show parsed config keys
             try {
-                if (cfg && typeof cfg === 'object') console.log('Parsed config keys:', Object.keys(cfg));
-                else console.log('Parsed config is not an object:', typeof cfg);
+                if (cfg && typeof cfg === 'object') dbg.debug('Parsed config keys:', Object.keys(cfg));
+                else dbg.debug('Parsed config is not an object:', typeof cfg);
             } catch (e) {}
 
             // Apply per-target config. Top-level keys are target names (e.g. "Stage", "Sprite1").
@@ -89,7 +91,7 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
                                 if (!c || !c.path) continue;
                                 const candidate = path.isAbsolute(c.path) ? c.path : path.resolve(configBaseDir || process.cwd(), c.path);
                                 const absPath = require('fs').existsSync(candidate) ? candidate : (path.isAbsolute(c.path) ? c.path : path.resolve(process.cwd(), c.path));
-                                if (debug) console.log(`DBG asset resolve (costume) for target=${targetName} name=${c.name || ''}: candidate='${candidate}', resolved='${absPath}', exists=${require('fs').existsSync(absPath)}`);
+                                if (dbg.enabled()) dbg.debug(`DBG asset resolve (costume) for target=${targetName} name=${c.name || ''}: candidate='${candidate}', resolved='${absPath}', exists=${require('fs').existsSync(absPath)}`);
                                 // Use bare basename when possible so the md5ext matches
                                 // the actual filename; only prefix with the target
                                 // name if that basename is already registered.
@@ -119,7 +121,7 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
                                 if (!s || !s.path) continue;
                                 const candidateS = path.isAbsolute(s.path) ? s.path : path.resolve(configBaseDir || process.cwd(), s.path);
                                 const absPath = require('fs').existsSync(candidateS) ? candidateS : (path.isAbsolute(s.path) ? s.path : path.resolve(process.cwd(), s.path));
-                                if (debug) console.log(`DBG asset resolve (sound) for target=${targetName} name=${s.name || ''}: candidate='${candidateS}', resolved='${absPath}', exists=${require('fs').existsSync(absPath)}`);
+                                if (dbg.enabled()) dbg.debug(`DBG asset resolve (sound) for target=${targetName} name=${s.name || ''}: candidate='${candidateS}', resolved='${absPath}', exists=${require('fs').existsSync(absPath)}`);
                                 const basename = path.basename(absPath);
                                 let destName = basename;
                                 if (generator._assets && Object.prototype.hasOwnProperty.call(generator._assets, destName)) {
@@ -147,8 +149,8 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
                 try {
                     for (const t of newTargets) {
                         const lf = t.extensionData && t.extensionData.luaFile ? t.extensionData.luaFile : null;
-                        if (!lf) console.log(`DBG: target ${t.name} luaFile: <none>`);
-                        else console.log(`DBG: target ${t.name} luaFile: ${lf} (isAbsolute=${path.isAbsolute(lf)})`);
+                        if (!lf) dbg.debug(`DBG: target ${t.name} luaFile: <none>`);
+                        else dbg.debug(`DBG: target ${t.name} luaFile: ${lf} (isAbsolute=${path.isAbsolute(lf)})`);
                     }
                 } catch (e) {}
             }
@@ -160,9 +162,9 @@ if (process.argv.includes("--config") || process.argv.includes("-c")) {
 
     // Debug: print targets and their luaFile entries after applying config
     try {
-        console.log('Targets after config parse:');
+        dbg.debug('Targets after config parse:');
         for (const t of generator.template.targets) {
-            console.log(` - ${t.name}: luaFile=${t.extensionData && t.extensionData.luaFile ? t.extensionData.luaFile : '<none>'}`);
+            dbg.debug(` - ${t.name}: luaFile=${t.extensionData && t.extensionData.luaFile ? t.extensionData.luaFile : '<none>'}`);
         }
     } catch (e) {}
 }
@@ -263,10 +265,10 @@ if (!configPath) {
     const parser = new SimpleLangParser(tokens);
     //debug && console.log(parser.constructor)
     //parser.buildParseTrees = true;
-    const tree = parser.block();
-    if (debug) {
-        console.log(`Main input tree:\n\n${tree.toStringTree(null, parser) || "blank tree"}\n`);
-    }
+        const tree = parser.block();
+        if (dbg.enabled()) {
+            dbg.debug(`Main input tree:\n\n${tree.toStringTree(null, parser) || "blank tree"}\n`);
+        }
 
     let a = generator.getBlocks();
     visitor.generator.blockIdCounter++;
@@ -318,14 +320,15 @@ if (!configPath) {
         visitor.generator.blocks["a"].next = firstBlockId;
     }
 
-    if (debug) {
-        console.log("Main blocks:\n");
-        console.log(JSON.stringify(visitor.generator.getBlocks(), null, 2));
-        console.log();
+    if (dbg.enabled()) {
+        dbg.debug("Main blocks:\n");
+        dbg.debug(JSON.stringify(visitor.generator.getBlocks(), null, 2));
+        dbg.debug();
     }
+    // NOTE: sanitization pass removed; visitor/visitor.visitStatement now ensures
+    // table/dotted LHS are handled without creating variables containing '.' or '['.
+
     // Write initial output containing main blocks
-    console.log(`saved to file: ${outfilePath}`);
-    console.log();
     writeFileSync(
         outfilePath,
         visitor.generator.getProject()
@@ -340,7 +343,7 @@ try {
         if (!luaFile) continue;
         // Resolve path relative to CWD if not absolute
     const luaPath = path.isAbsolute(luaFile) ? luaFile : path.resolve(configBaseDir || process.cwd(), luaFile);
-    if (debug) console.log(`DBG per-target: t.name=${t.name}, luaFile='${luaFile}', luaPath='${luaPath}', isAbsolute=${path.isAbsolute(luaFile)}`);
+    if (dbg.enabled()) dbg.debug(`DBG per-target: t.name=${t.name}, luaFile='${luaFile}', luaPath='${luaPath}', isAbsolute=${path.isAbsolute(luaFile)}`);
         try {
             const src = readFileSync(luaPath, 'utf8');
             const psrc = rewriteBracketArrays(src);
@@ -353,9 +356,7 @@ try {
             const toks = new CommonTokenStream(lx);
             const pars = new SimpleLangParser(toks);
             const tr = pars.block();
-            if (debug) {
-                console.log(`Per-target input tree for ${t.name}:\n\n${tr.toStringTree ? tr.toStringTree(null, pars) : '<no-tree>'}\n`);
-            }
+            if (dbg.enabled()) dbg.debug(`Per-target input tree for ${t.name}:\n\n${tr.toStringTree ? tr.toStringTree(null, pars) : '<no-tree>'}\n`);
             // Ensure per-target generator has a when-flag hat with id 'a' so
             // main() of that lua file can be chained under it.
             try {
@@ -374,14 +375,14 @@ try {
                     }
                 }
             } catch (e) {
-                if (debug) console.log('Per-target chaining warning:', e && e.message ? e.message : e);
+                if (dbg.enabled()) dbg.debug('Per-target chaining warning:', e && e.message ? e.message : e);
             }
             // Prefer blocks collected in the visitor's internal generator
             const blocksFromGen = v.generator && typeof v.generator.getBlocks === 'function' ? v.generator.getBlocks() : {};
             try {
                 const keys = Object.keys(blocksFromGen || {});
-                if (debug) console.log(`Per-target compile for ${t.name}: visitor.generator block keys: ${keys.join(', ')}`);
-            } catch (e) { if (debug) console.log('Per-target debug error', e && e.message ? e.message : e); }
+                if (dbg.enabled()) dbg.debug(`Per-target compile for ${t.name}: visitor.generator block keys: ${keys.join(', ')}`);
+            } catch (e) { if (dbg.enabled()) dbg.debug('Per-target debug error', e && e.message ? e.message : e); }
             // Also include any visitor.local blocks if returned by getAndClearBlocks()
             let localBlocks = {};
             try {
@@ -394,9 +395,9 @@ try {
             } catch (e) {
                 localBlocks = {};
             }
-            if (debug) {
-                console.log(`Per-target blocks for ${t.name}: ${Object.keys(localBlocks || {}).length} local blocks, ${Object.keys(blocksFromGen || {}).length} from generator`);
-                console.log(JSON.stringify({ ...blocksFromGen, ...localBlocks }, null, 2));
+            if (dbg.enabled()) {
+                dbg.debug(`Per-target blocks for ${t.name}: ${Object.keys(localBlocks || {}).length} local blocks, ${Object.keys(blocksFromGen || {}).length} from generator`);
+                dbg.debug(JSON.stringify({ ...blocksFromGen, ...localBlocks }, null, 2));
             }
             explicitBlocksMap[t.name] = { ...blocksFromGen, ...localBlocks };
         } catch (e) {
@@ -404,12 +405,12 @@ try {
         }
     }
     // Apply explicit blocks to generator so getProject uses them
-    console.log('Per-target explicitBlocksMap:', Object.keys(explicitBlocksMap).map(k => ({ target: k, count: Object.keys(explicitBlocksMap[k] || {}).length })));
+    dbg.debug('Per-target explicitBlocksMap:', Object.keys(explicitBlocksMap).map(k => ({ target: k, count: Object.keys(explicitBlocksMap[k] || {}).length })));
     // Apply explicit per-target blocks into the same generator instance that
     // already contains the main/merged blocks (visitor.generator). This ensures
     // label/wrapper blocks from the main input are preserved in the final PMP.
     for (const [tname, blocks] of Object.entries(explicitBlocksMap)) {
-        console.log(`Applying ${Object.keys(blocks || {}).length} blocks to target ${tname}`);
+    dbg.debug(`Applying ${Object.keys(blocks || {}).length} blocks to target ${tname}`);
         try {
             // Prefer to set on visitor.generator which holds the merged main blocks
             const mainBlocks = (visitor && visitor.generator && typeof visitor.generator.getBlocks === 'function') ? visitor.generator.getBlocks() : generator.getBlocks();
@@ -505,6 +506,9 @@ try {
         // Final fallback
         writeFileSync(outfilePath, generator.getProject());
     }
+    // Always inform user where the file was written
+    console.log(`saved to file: ${outfile}`);
+    console.log();
 } catch (e) {
     console.warn('Error while compiling per-target lua files:', e && e.message ? e.message : e);
 }

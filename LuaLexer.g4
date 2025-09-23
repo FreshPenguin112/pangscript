@@ -43,7 +43,6 @@ CC       : '::';
 NIL      : 'nil';
 FALSE    : 'false';
 TRUE     : 'true';
-DOT      : '.';
 SQUIG    : '~';
 MINUS    : '-';
 POUND    : '#';
@@ -67,7 +66,9 @@ CCU      : '}';
 OB       : '[';
 CB       : ']';
 EE       : '==';
+DDD      : '...';
 DD       : '..';
+DOT      : '.';
 PIPE     : '|';
 CARET    : '^';
 SLASH    : '/';
@@ -89,7 +90,10 @@ INT: Digit+;
 
 HEX: '0' [xX] HexDigit+;
 
-FLOAT: Digit+ '.' Digit* ExponentPart? | '.' Digit+ ExponentPart? | Digit+ ExponentPart;
+// Require at least one digit after a decimal point to avoid lexing `1..3`
+// as a FLOAT followed by '.' and '3'. This makes `1..3` tokenize as
+// INT '..' INT which the parser can accept as a range expression.
+FLOAT: Digit+ '.' Digit+ ExponentPart? | '.' Digit+ ExponentPart? | Digit+ ExponentPart;
 
 HEX_FLOAT:
     '0' [xX] HexDigit+ '.' HexDigit* HexExponentPart?

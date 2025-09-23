@@ -12,7 +12,8 @@ function parseComments(source) {
     const inlineComments = {}; // lineNum -> text
     const blockComments = []; // {startLine, endLine, text}
 
-    let activeBlock = null;
+    // support nested multiline label blocks using a stack
+    const activeStack = [];
     for (let i = 0; i < lines.length; i++) {
         const ln = lines[i];
         const lineNum = i + 1;
@@ -20,21 +21,26 @@ function parseComments(source) {
         // Detect multiline block start
         const mStart = ln.match(/^\s*--@label-start(?:\s+(.+))?$/);
         if (mStart) {
-            activeBlock = { startLine: lineNum, text: (mStart[1] || '').trim() };
+            activeStack.push({ startLine: lineNum, text: (mStart[1] || '').trim() });
             continue;
         }
         // Detect multiline block end
         const mEnd = ln.match(/^\s*--@label-end\s*$/);
-        if (mEnd && activeBlock) {
-            activeBlock.endLine = lineNum;
-            blockComments.push(activeBlock);
-            activeBlock = null;
+        if (mEnd && activeStack.length > 0) {
+            const completed = activeStack.pop();
+            completed.endLine = lineNum;
+            blockComments.push(completed);
             continue;
         }
 
-        // If inside an active block, accumulate the text
-        if (activeBlock) {
-            activeBlock.text += (activeBlock.text ? '\n' : '') + ln.replace(/^\s*--\s?/, '').trim();
+        // If inside an active block, accumulate the text only from comment lines
+        if (activeStack.length > 0) {
+            const top = activeStack[activeStack.length - 1];
+            // Only lines that actually start with `--` should be added to the block text
+            const mCommentLine = ln.match(/^\s*--\s?(.*)$/);
+            if (mCommentLine) {
+                top.text += (top.text ? '\n' : '') + mCommentLine[1].trim();
+            }
             continue;
         }
 
@@ -45,18 +51,36 @@ function parseComments(source) {
             continue;
         }
 
-        // Inline value comment at end of line: --@val:some text
-        const mInline = ln.match(/--@val:([^\n\r]+)$/);
-        if (mInline) {
-            inlineComments[lineNum] = (mInline[1] || '').trim();
+        // Inline value comment at end of line.
+        // Support old form: --@val: some text  (maps to arg 1)
+        const mInlineOld = ln.match(/--\s*@val:([^\n\r]+)$/);
+        if (mInlineOld) {
+            inlineComments[lineNum] = { byIndex: { 1: (mInlineOld[1] || '').trim() }, raw: (mInlineOld[1] || '').trim() };
             continue;
+        }
+        // New numbered form: --@val1 text @val2 other text ...
+        if (ln.indexOf('@val') !== -1) {
+            const rest = ln.substring(ln.indexOf('@val'));
+            const byIndex = {};
+            const tokenRe = /@val(\d+)\s*([^@]*)/g;
+            let m;
+            while ((m = tokenRe.exec(rest)) !== null) {
+                const idx = Number(m[1]);
+                const txt = (m[2] || '').trim();
+                if (idx && txt) byIndex[idx] = txt;
+            }
+            if (Object.keys(byIndex).length > 0) {
+                inlineComments[lineNum] = { byIndex, raw: rest };
+                continue;
+            }
         }
     }
 
-    // If a block was left open, close it at EOF
-    if (activeBlock) {
-        activeBlock.endLine = lines.length;
-        blockComments.push(activeBlock);
+    // If any blocks were left open, close them at EOF (preserve nesting order)
+    while (activeStack.length > 0) {
+        const rem = activeStack.pop();
+        rem.endLine = lines.length;
+        blockComments.push(rem);
     }
 
     return { lineComments, inlineComments, blockComments };
