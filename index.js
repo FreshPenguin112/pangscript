@@ -1,6 +1,6 @@
 // compiler.js — fixed version using string-placeholder preprocessing
 // Usage: node compiler.js [input.lang]
-// npm install ohm-js
+// npm install antlr4
 
 const fs = require("fs");
 /* -------------------------
@@ -242,22 +242,13 @@ on("flag", *{
 // Strip single-line // comments and leading blank lines; strings are parsed directly by the grammar
 const cleaned = input.replace(/^\s*\/\/.*$/gm, "").replace(/^\n+/, "");
 
-// Debug: show cleaned input for parser
-// console.log('CLEANED:', JSON.stringify(cleaned));
-// Parse with Ohm
-const match = g.match(cleaned, 'Program');
-if (!match.succeeded()) {
-  console.error("Parse error:", match.message);
-  process.exit(1);
-}
-
-// Build AST
+// Parse with ANTLR and build AST
 let ast;
 try {
-  ast = semantics(match).ast();
-  console.log('AST built');
+  ast = parseWithAntlr(cleaned);
+  console.log('AST built (ANTLR)');
 } catch (e) {
-  console.error("AST error:", e && e.message || e);
+  console.error("Parse/AST error:", e && e.message || e);
   process.exit(1);
 }
 
