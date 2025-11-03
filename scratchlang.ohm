@@ -1,9 +1,0 @@
-ScratchLang {
-  Program = Statement+
-  Statement = Say | Move | Turn
-  Say = "say" String
-  Move = "move" number
-  Turn = "turn" number
-  String = "\"" (~"\"" any)* "\""
-  number = digit+
-}

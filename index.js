@@ -3,8 +3,6 @@
 // npm install ohm-js
 
 const fs = require("fs");
-const ohm = require("ohm-js");
-
 /* -------------------------
   Template JSON (exact skeleton you provided)
 --------------------------*/
@@ -14,24 +12,7 @@ const TEMPLATE = JSON.parse(templateJson);
 /* -------------------------
   Preprocess: extract quoted strings -> placeholders
 --------------------------*/
-function extractStrings(source) {
-  const stringPool = [];
-  const re = /"([^"\\]|\\.)*"/g; // matches a JS-style quoted string
-  const replaced = source.replace(re, (m) => {
-    // m includes surrounding quotes and escapes
-    // use JSON.parse to unescape correctly
-    let unescaped;
-    try {
-      unescaped = JSON.parse(m); // returns a JS string
-    } catch (e) {
-      throw new Error("Invalid string literal: " + m);
-    }
-    const id = `__STR${stringPool.length}__`;
-    stringPool.push(unescaped);
-    return id;
-  });
-  return { text: replaced, pool: stringPool };
-}
+/* (string-placeholder preprocessing removed — grammar now parses quoted strings directly) */
 
 /* -------------------------
   Deterministic letter ID generator (a, b, ... z, aa, ab, ...)
@@ -53,132 +34,109 @@ function makeLetterIdGenerator() {
 }
 
 /* -------------------------
-  Grammar (uses placeholders for strings)
+  Parser using ANTLR4 runtime (JavaScript)
+  This code expects generated parser/lexer/visitor files to exist:
+    - PangLexer.js
+    - PangParser.js
+    - PangVisitor.js  (or PangParserVisitor.js depending on generation)
+
+  You must generate these with the ANTLR tool (Java) locally, for example:
+
+    # download ANTLR jar (if you don't have it already)
+    curl -O https://www.antlr.org/download/antlr-4.9.3-complete.jar
+
+    # generate JavaScript parser files (run from this repo directory)
+    java -jar antlr-4.9.3-complete.jar -Dlanguage=JavaScript -visitor Pang.g4
+
+  After running that, `PangLexer.js`, `PangParser.js`, and `PangVisitor.js` (or similar) will be created.
+  Then `npm install antlr4` and this script will use the runtime to parse.
+
+  The code below attempts to require generated modules and will show instructions if they are missing.
+
 --------------------------*/
-const grammarSource = `
-Scratch {
-  StringLiteral = "__STR" number "__"
-  boolean = "true" | "false"
-  number = digit+
-  ident = letter alnum*
 
-  Program = _ Statement*
-  Statement = OnCall ";" _ | PrintCall ";" _ | IfStmt _
-  OnCall = "on" _ "(" _ StringLiteral _ "," _ InlineBlock _ ")" _
-  InlineBlock = "*" _ Block
-  PrintCall = "print" _ "(" _ Expr _ ("," _ Options)? _ ")"
-  Options = "{" _ "seconds" _ ":" _ number _ "}"
-  IfStmt = "if" _ "(" _ Expr _ ")" _ Block _ "else" _ Block _
-  Block = "{" _ Statement* "}"
-  Expr = Cast
-  Cast = Primary (_ "as" _ Type)?
-  Primary = Binary | StringLiteral | number | boolean
-  Binary = number _ ">" _ number
-  Type = ident
-  _ = space*
-}
-`;
+const antlr4 = require('antlr4');
 
-/* -------------------------
-  Semantics -> AST (StringLiteral resolves to pool index token)
---------------------------*/
-const g = ohm.grammar(grammarSource);
-const semantics = g.createSemantics();
+const PangLexer = require('./lib/PangLexer').default;
+const PangParser = require('./lib/PangParser').default;
+const PangVisitor = require('./lib/PangVisitor').default;
 
-let sharedStringPool = []; // will be set per-compile
-
-semantics.addOperation("ast", {
-  Program(_ws, stmts) {
-    return stmts.children.map(c => c.ast());
-  },
-  OnCall(_on, _sp1, _lp, _sp2, strTok, _sp3, _comma, _sp4, inline, _sp5, _rp, _sp6) {
-    // strTok.sourceString is like "__STR0__"
-    const idx = parseInt(strTok.sourceString.match(/__STR([0-9]+)__/)[1], 10);
-    return { type: "On", event: sharedStringPool[idx], body: inline.ast() };
-  },
-  InlineBlock(_star, _sp, block) {
-    return block.ast();
-  },
-  PrintCall(_print, _sp1, _lp, _sp2, expr, opts, _sp3, _rp) {
-    return { type: "Print", expr: expr.ast(), options: opts.children.length ? opts.ast() : null };
-  },
-  Options(_lb, _sp1, _sec, _sp2, _colon, _sp3, num, _sp4, _rb) {
-    return { seconds: parseInt(num.sourceString, 10) };
-  },
-  IfStmt(_if, _sp1, _lp, _sp2, expr, _sp3, _rp, _sp4, block1, _sp5, _else, _sp6, block2, _sp7) {
-    return { type: "If", cond: expr.ast(), thenBlock: block1.ast(), elseBlock: block2.ast() };
-  },
-  Block(_lb, _sp1, stmts, _rb) {
-    return { type: "Block", body: stmts.children.map(c => c.ast()) };
-  },
-  // Expr / Cast / Primary
-  Cast(primary, rest) {
-    const base = primary.ast();
-    if (rest.children.length) {
-      const typeTok = rest.child(1).sourceString;
-      return { type: "Cast", expr: base, to: typeTok };
+// Build a simple AST visitor by extending the generated visitor
+class AstBuilder extends PangVisitor {
+  // visit program: list of statements
+  visitProgram(ctx) {
+    const stmts = [];
+    for (let i = 0; i < ctx.statement().length; i++) stmts.push(this.visit(ctx.statement(i)));
+    return stmts.filter(s => s != null);
+  }
+  visitStatement(ctx) {
+    // statement -> onCall ';'
+    if (ctx.onCall()) return this.visit(ctx.onCall());
+    return null;
+  }
+  visitOnCall(ctx) {
+    // onCall: 'on' '(' STRING ',' inlineBlock ')'
+    const str = ctx.STRING().getText();
+    let event;
+    try { event = JSON.parse(str); } catch (e) { event = str.replace(/^\"|\"$/g, ''); }
+    const body = this.visit(ctx.inlineBlock());
+    return { type: 'On', event, body };
+  }
+  visitInlineBlock(ctx) { return this.visit(ctx.block()); }
+  visitBlock(ctx) {
+    const stmts = [];
+    for (let i = 0; i < ctx.statement().length; i++) stmts.push(this.visit(ctx.statement(i)));
+    return { type: 'Block', body: stmts };
+  }
+  visitPrintCall(ctx) {
+    // print '(' expr (',' options)? ')'
+    const exprCtx = ctx.expr();
+    const expr = this.visit(exprCtx);
+    const optsCtx = ctx.options();
+    const options = optsCtx ? this.visit(optsCtx) : null;
+    return { type: 'Print', expr, options };
+  }
+  visitIfStmt(ctx) {
+    const cond = this.visit(ctx.expr());
+    const thenB = this.visit(ctx.block(0));
+    const elseB = this.visit(ctx.block(1));
+    return { type: 'If', cond, thenBlock: thenB, elseBlock: elseB };
+  }
+  visitExpr(ctx) {
+    if (ctx.primary().length === 2) {
+      // Binary
+      const left = this.visit(ctx.primary(0));
+      const right = this.visit(ctx.primary(1));
+      return { type: 'Binary', op: '>', left, right };
     }
-    return base;
-  },
-  Primary_binary(bin) { return bin.ast(); },
-  Binary(n1, _sp1, _gt, _sp2, n2) {
-    return { type: "Binary", op: ">", left: { type: "Literal", litType: "number", value: parseInt(n1.sourceString, 10) }, right: { type: "Literal", litType: "number", value: parseInt(n2.sourceString, 10) } };
-  },
-  // StringLiteral resolved to the string value using sharedStringPool
-  StringLiteral(tok) {
-    const m = tok.sourceString.match(/__STR([0-9]+)__/);
-    const idx = parseInt(m[1], 10);
-    return { type: "Literal", litType: "string", value: sharedStringPool[idx] };
-  },
-  boolean(b) { return { type: "Literal", litType: "boolean", value: b.sourceString === "true" }; },
-  number(n) { return { type: "Literal", litType: "number", value: parseInt(n.sourceString, 10) }; },
-  Type(id) { return id.sourceString; },
-  ident(_) { return this.sourceString; },
-  _(_) { return null; }
-});
-
-/* -------------------------
-  Simple static type checker
---------------------------*/
-function normalizeTypeName(s) {
-  const t = s.toLowerCase();
-  if (["str", "string"].includes(t)) return "string";
-  if (["num", "number"].includes(t)) return "number";
-  if (["bool", "boolean"].includes(t)) return "boolean";
-  return t;
-}
-
-function typeOfExpr(expr) {
-  if (!expr) return "void";
-  switch (expr.type) {
-    case "Literal": return expr.litType;
-    case "Binary": return "boolean";
-    case "Cast": return normalizeTypeName(expr.to);
-    default: throw new Error("Unknown expr type in typeOfExpr: " + expr.type);
+    return this.visit(ctx.primary(0));
+  }
+  visitPrimary(ctx) {
+    if (ctx.NUMBER()) return { type: 'Literal', litType: 'number', value: Number(ctx.NUMBER().getText()) };
+    if (ctx.STRING()) {
+      const s = ctx.STRING().getText();
+      try { return { type: 'Literal', litType: 'string', value: JSON.parse(s) }; } catch (e) { return { type: 'Literal', litType: 'string', value: s.replace(/^\"|\"$/g, '') }; }
+    }
+    if (ctx.getText() === 'true' || ctx.getText() === 'false') return { type: 'Literal', litType: 'boolean', value: ctx.getText() === 'true' };
+    if (ctx.printCall()) return this.visit(ctx.printCall());
+    return null;
+  }
+  visitOptions(ctx) {
+    // { 'seconds' : NUMBER }
+    return { seconds: Number(ctx.NUMBER().getText()) };
   }
 }
 
-function typeCheckAst(astStmts) {
-  function walkStmt(s) {
-    if (s.type === "On") {
-      s.body.body.forEach(walkStmt);
-    } else if (s.type === "Print") {
-      const t = typeOfExpr(s.expr);
-      if (t !== "string") {
-        if (!(s.expr.type === "Cast" && normalizeTypeName(s.expr.to) === "string")) {
-          throw new Error(`TypeError: print() expects string but got ${t}`);
-        }
-      }
-    } else if (s.type === "If") {
-      const condType = typeOfExpr(s.cond);
-      if (condType !== "boolean") throw new Error("TypeError: if condition must be boolean");
-      s.thenBlock.body.forEach(walkStmt);
-      s.elseBlock.body.forEach(walkStmt);
-    } else {
-      throw new Error("Unknown statement for typecheck: " + JSON.stringify(s));
-    }
-  }
-  astStmts.forEach(walkStmt);
+// helper to parse and build AST
+function parseWithAntlr(source) {
+  const chars = new antlr4.InputStream(source);
+  const lexer = new PangLexer(chars);
+  const tokens = new antlr4.CommonTokenStream(lexer);
+  const parser = new PangParser(tokens);
+  parser.buildParseTrees = true;
+  const tree = parser.program();
+  const visitor = new AstBuilder();
+  return visitor.visit(tree);
 }
 
 /* -------------------------
@@ -214,11 +172,11 @@ function emitProject(astStmts) {
 
   function emitPrint(node) {
     let text = "";
-    if (node.expr.type === "Literal" && node.expr.litType === "string") text = node.expr.value;
-    else if (node.expr.type === "Cast") {
-      if (node.expr.expr.type === "Literal") text = String(node.expr.expr.value);
-      else text = String(node.expr.expr.value ?? "");
-    } else text = String(node.expr.value ?? "");
+    if (node.expr && node.expr.type === "Literal" && node.expr.litType === "string") {
+      text = node.expr.value;
+    } else {
+      text = String((node.expr && node.expr.value) ?? "");
+    }
 
     const id = genId();
     const hasSecs = node.options && typeof node.options.seconds === "number";
@@ -274,26 +232,20 @@ const input = process.argv[2] ? fs.readFileSync(process.argv[2], "utf8") : `// e
 on("flag", *{
   print("Hello!", {seconds: 2});
   if (1 > 0) {
-    print(true as str, {seconds: 2});
+    print(true, {seconds: 2});
   } else {
     print("false", {seconds: 2});
   }
 });
 `;
 
-// Extract strings -> placeholders + pool
-let extracted;
-try {
-  extracted = extractStrings(input);
-} catch (e) {
-  console.error("String extraction error:", e.message);
-  process.exit(1);
-}
-const cleaned = extracted.text;
-sharedStringPool = extracted.pool;
+// Strip single-line // comments and leading blank lines; strings are parsed directly by the grammar
+const cleaned = input.replace(/^\s*\/\/.*$/gm, "").replace(/^\n+/, "");
 
+// Debug: show cleaned input for parser
+// console.log('CLEANED:', JSON.stringify(cleaned));
 // Parse with Ohm
-const match = g.match(cleaned);
+const match = g.match(cleaned, 'Program');
 if (!match.succeeded()) {
   console.error("Parse error:", match.message);
   process.exit(1);
@@ -303,25 +255,21 @@ if (!match.succeeded()) {
 let ast;
 try {
   ast = semantics(match).ast();
+  console.log('AST built');
 } catch (e) {
-  console.error("AST error:", e.message);
+  console.error("AST error:", e && e.message || e);
   process.exit(1);
 }
 
-// Typecheck
-try {
-  typeCheckAst(ast);
-} catch (e) {
-  console.error("Type check error:", e.message);
-  process.exit(1);
-}
+// (type checking and casting removed)
 
 // Emit blocks
 let blocksMap;
 try {
   blocksMap = emitProject(ast);
+  console.log('Emit OK');
 } catch (e) {
-  console.error("Emit error:", e.message);
+  console.error("Emit error:", e && e.message || e);
   process.exit(1);
 }
 

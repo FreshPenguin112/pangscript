@@ -1,3 +1,6 @@
 node_modules
 *.lock
-package-locl.json
+package-lock.json
+lib/*
+.antlr
+*.jar
