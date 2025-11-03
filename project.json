@@ -44,7 +44,7 @@
       "customVars": [],
       "blocks": {
         "b": {
-          "opcode": "looks_say",
+          "opcode": "looks_sayforsecs",
           "next": "g",
           "parent": "a",
           "inputs": {
@@ -53,6 +53,13 @@
               [
                 10,
                 "Hello!"
+              ]
+            ],
+            "SECS": [
+              1,
+              [
+                4,
+                "2"
               ]
             ]
           },
@@ -92,7 +99,7 @@
           "fields": {
             "CHECKBOX": [
               "FALSE",
-              "eo9bp8ue"
+              "cf1jdcu1"
             ]
           },
           "shadow": true,
@@ -101,7 +108,7 @@
           "y": 297
         },
         "e": {
-          "opcode": "looks_say",
+          "opcode": "looks_sayforsecs",
           "next": null,
           "parent": "g",
           "inputs": {
@@ -111,6 +118,13 @@
                 10,
                 "true"
               ]
+            ],
+            "SECS": [
+              1,
+              [
+                4,
+                "2"
+              ]
             ]
           },
           "fields": {},
@@ -118,7 +132,7 @@
           "topLevel": false
         },
         "f": {
-          "opcode": "looks_say",
+          "opcode": "looks_sayforsecs",
           "next": null,
           "parent": "g",
           "inputs": {
@@ -127,6 +141,13 @@
               [
                 10,
                 "false"
+              ]
+            ],
+            "SECS": [
+              1,
+              [
+                4,
+                "2"
               ]
             ]
           },

@@ -70,8 +70,14 @@ class AstBuilder extends PangVisitor {
     return stmts.filter(s => s != null);
   }
   visitStatement(ctx) {
-    // statement -> onCall ';'
-    if (ctx.onCall()) return this.visit(ctx.onCall());
+    // statement can be a statementItem (onCall/printCall) or an ifStmt.
+    const item = ctx.statementItem ? ctx.statementItem() : null;
+    if (item) {
+      if (item.onCall && item.onCall()) return this.visit(item.onCall());
+      if (item.printCall && item.printCall()) return this.visit(item.printCall());
+      return null;
+    }
+    if (ctx.ifStmt && ctx.ifStmt()) return this.visit(ctx.ifStmt());
     return null;
   }
   visitOnCall(ctx) {
@@ -82,7 +88,26 @@ class AstBuilder extends PangVisitor {
     const body = this.visit(ctx.inlineBlock());
     return { type: 'On', event, body };
   }
-  visitInlineBlock(ctx) { return this.visit(ctx.block()); }
+  // inlineBlock now contains an `inlineBlockBody` instead of a normal `block`.
+  // Build a Block AST from its inlineStatement children.
+  visitInlineBlock(ctx) {
+    const bodyCtx = ctx.inlineBlockBody();
+    const stmts = [];
+    if (bodyCtx && bodyCtx.inlineStatement) {
+      for (let i = 0; i < bodyCtx.inlineStatement().length; i++) {
+        const st = bodyCtx.inlineStatement(i);
+        // inlineStatement may contain a statementItem() (which contains onCall/printCall)
+        if (st.statementItem && st.statementItem()) {
+          const si = st.statementItem();
+          if (si.onCall && si.onCall()) stmts.push(this.visit(si.onCall()));
+          else if (si.printCall && si.printCall()) stmts.push(this.visit(si.printCall()));
+        } else if (st.ifStmt && st.ifStmt()) {
+          stmts.push(this.visit(st.ifStmt()));
+        }
+      }
+    }
+    return { type: 'Block', body: stmts };
+  }
   visitBlock(ctx) {
     const stmts = [];
     for (let i = 0; i < ctx.statement().length; i++) stmts.push(this.visit(ctx.statement(i)));
@@ -92,8 +117,9 @@ class AstBuilder extends PangVisitor {
     // print '(' expr (',' options)? ')'
     const exprCtx = ctx.expr();
     const expr = this.visit(exprCtx);
-    const optsCtx = ctx.options();
-    const options = optsCtx ? this.visit(optsCtx) : null;
+    // grammar uses `options_` rule name
+    const optsCtx = ctx.options_ ? ctx.options_() : (ctx.options ? ctx.options() : null);
+    const options = optsCtx ? this.visitOptions_(optsCtx) : null;
     return { type: 'Print', expr, options };
   }
   visitIfStmt(ctx) {
@@ -121,9 +147,36 @@ class AstBuilder extends PangVisitor {
     if (ctx.printCall()) return this.visit(ctx.printCall());
     return null;
   }
-  visitOptions(ctx) {
-    // { 'seconds' : NUMBER }
-    return { seconds: Number(ctx.NUMBER().getText()) };
+  // Build options object from options_ context
+  visitOptions_(ctx) {
+    const obj = {};
+    const pairs = ctx.optionPair ? ctx.optionPair() : [];
+    for (let i = 0; i < pairs.length; i++) {
+      const p = pairs[i];
+      // optionKey can be STRING or IDENT
+      let key = null;
+      const keyCtx = p.optionKey();
+      if (keyCtx.STRING && keyCtx.STRING()) {
+        try { key = JSON.parse(keyCtx.STRING().getText()); } catch (e) { key = keyCtx.STRING().getText().replace(/^\"|\"$/g, ''); }
+      } else if (keyCtx.IDENT && keyCtx.IDENT()) {
+        key = keyCtx.IDENT().getText();
+      }
+      // optionValue
+      const valCtx = p.optionValue();
+      let val = null;
+      if (valCtx.STRING && valCtx.STRING()) {
+        try { val = JSON.parse(valCtx.STRING().getText()); } catch (e) { val = valCtx.STRING().getText().replace(/^\"|\"$/g, ''); }
+      } else if (valCtx.NUMBER && valCtx.NUMBER()) {
+        val = Number(valCtx.NUMBER().getText());
+      } else if (valCtx.getText && (valCtx.getText() === 'true' || valCtx.getText() === 'false')) {
+        val = valCtx.getText() === 'true';
+      } else {
+        // fallback
+        val = valCtx.getText();
+      }
+      if (key != null) obj[key] = val;
+    }
+    return obj;
   }
 }
 
