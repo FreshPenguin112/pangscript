@@ -1,8 +1,11 @@
 on("flag", *{
-  print("Hello!", {seconds: 2});
-  if (1 > 0) {
-    print(true, {seconds: 2});
-  } else {
-    print("false", {seconds: 2});
-  }
+    let name = ask("What is your name?");
+    name = name != "Joe" ? name : "Evil Joe";
+    if (name == "Alice") {
+        print("Hello, Alice the Great!", {seconds: 2});
+    } else if (name == "Bob") {
+        print("Hello, Bob the Great!", {seconds: 2});
+    } else {
+        print("Hello, " .. name .. "!", {seconds: 2});
+    }
 });

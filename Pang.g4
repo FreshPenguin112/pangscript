@@ -8,6 +8,9 @@ program
 statementItem
     : onCall
     | printCall
+    | functionCall
+    | varDecl
+    | assignStmt
     ;
 
 // statements require semicolons by default (most statements end with ';')
@@ -44,12 +47,40 @@ printCall
     : 'print' '(' expr (',' options_)? ')'
     ;
 
+// Variable declaration: let or const
+varDecl
+    : ('let' | 'const') IDENT ('=' expr)?
+    ;
+
+// Assignment statement (implicit let if variable not declared)
+assignStmt
+    : IDENT '=' expr
+    ;
+
 ifStmt
-    : 'if' '(' expr ')' block 'else' block
+    : 'if' '(' expr ')' block ( 'else' 'if' '(' expr ')' block )* ( 'else' block )?
     ;
 
 expr
-    : primary ( '>' primary )?
+    : primary
+    | '!' expr
+    // power (right-associative)
+    | expr POWER expr
+    // multiplicative
+    | expr ('*' | '/') expr
+    // additive
+    | expr ('+' | '-') expr
+    // concatenation (Lua-style)
+    | expr CONCAT expr
+    // comparisons
+    | expr ('<' | '<=' | '>' | '>=') expr
+    // equality
+    | expr ('==' | '!=' | '===' | '!==') expr
+    // logical
+    | expr '&&' expr
+    | expr '||' expr
+    // ternary conditional: cond ? then : else
+    | expr '?' expr ':' expr
     ;
 
 primary
@@ -57,7 +88,10 @@ primary
     | STRING
     | 'true'
     | 'false'
+    | IDENT
     | printCall
+    | functionCall
+    | '(' expr ')'
     ;
 // have to use options_ since options is a reserved word in ANTLR
 // options_ accepts a simple JSON-like object with string keys (quoted or unquoted)
@@ -80,10 +114,25 @@ optionValue
     | NUMBER
     | 'true'
     | 'false'
+    | expr
+    ;
+
+functionCall
+    : IDENT '(' (expr (',' expr)*)? ')'
     ;
 
 IDENT
     : [a-zA-Z_][a-zA-Z0-9_]*
+    ;
+
+// POWER token for exponentiation operator (**)
+POWER
+    : '*' '*'
+    ;
+
+// CONCAT token for Lua-style concatenation operator (..)
+CONCAT
+    : '.' '.'
     ;
 
 // --- lexer rules ---

@@ -1,0 +1,3 @@
+[submodule "pm-blocks"]
+	path = pm-blocks
+	url = https://github.com/PenguinMod/PenguinMod-Blocks

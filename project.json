@@ -38,92 +38,53 @@
     {
       "isStage": false,
       "name": "Sprite1",
-      "variables": {},
+      "variables": {
+        "b|name": [
+          "name",
+          0
+        ]
+      },
       "lists": {},
       "broadcasts": {},
       "customVars": [],
       "blocks": {
-        "b": {
-          "opcode": "looks_sayforsecs",
-          "next": "g",
-          "parent": "a",
-          "inputs": {
-            "MESSAGE": [
-              1,
-              [
-                10,
-                "Hello!"
-              ]
-            ],
-            "SECS": [
-              1,
-              [
-                4,
-                "2"
-              ]
-            ]
-          },
-          "fields": {},
-          "shadow": false,
-          "topLevel": false
-        },
         "c": {
-          "opcode": "operator_gt",
+          "opcode": "sensing_answer",
           "next": null,
-          "parent": "g",
-          "inputs": {
-            "OPERAND1": [
-              1,
-              [
-                10,
-                "1"
-              ]
-            ],
-            "OPERAND2": [
-              1,
-              [
-                10,
-                "0"
-              ]
-            ]
-          },
+          "parent": "d",
+          "inputs": {},
           "fields": {},
           "shadow": false,
           "topLevel": false
         },
         "d": {
-          "opcode": "checkbox",
+          "opcode": "procedures_return",
           "next": null,
-          "parent": null,
-          "inputs": {},
-          "fields": {
-            "CHECKBOX": [
-              "FALSE",
-              "cf1jdcu1"
+          "parent": "e",
+          "inputs": {
+            "return": [
+              3,
+              "c",
+              [
+                10,
+                "1"
+              ]
             ]
           },
-          "shadow": true,
-          "topLevel": true,
-          "x": 72,
-          "y": 297
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
         },
         "e": {
-          "opcode": "looks_sayforsecs",
-          "next": null,
-          "parent": "g",
+          "opcode": "sensing_askandwait",
+          "next": "d",
+          "parent": "f",
           "inputs": {
-            "MESSAGE": [
+            "QUESTION": [
               1,
               [
                 10,
-                "true"
-              ]
-            ],
-            "SECS": [
-              1,
-              [
-                4,
-                "2"
+                "What is your name?"
               ]
             ]
           },
@@ -132,15 +93,261 @@
           "topLevel": false
         },
         "f": {
-          "opcode": "looks_sayforsecs",
+          "opcode": "control_inline_stack_output",
           "next": null,
           "parent": "g",
           "inputs": {
-            "MESSAGE": [
+            "SUBSTACK": [
+              2,
+              "e"
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "g": {
+          "opcode": "SPtempVars_setVar",
+          "next": "m",
+          "parent": "a",
+          "inputs": {
+            "NAME": [
               1,
               [
                 10,
-                "false"
+                "name"
+              ]
+            ],
+            "VALUE": [
+              3,
+              "f",
+              [
+                10,
+                ""
+              ]
+            ]
+          },
+          "fields": {
+            "TYPE": [
+              "global",
+              "m2zsv83l"
+            ]
+          },
+          "shadow": false,
+          "topLevel": false
+        },
+        "i": {
+          "opcode": "SPtempVars_getVar",
+          "next": null,
+          "parent": "h",
+          "inputs": {
+            "NAME": [
+              1,
+              [
+                10,
+                "name"
+              ]
+            ]
+          },
+          "fields": {
+            "TYPE": [
+              "global",
+              "m2zsv83l"
+            ]
+          },
+          "shadow": false,
+          "topLevel": false
+        },
+        "h": {
+          "opcode": "operator_equals",
+          "next": null,
+          "parent": "k",
+          "inputs": {
+            "OPERAND1": [
+              3,
+              "i",
+              null
+            ],
+            "OPERAND2": [
+              1,
+              [
+                10,
+                ""
+              ]
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "j": {
+          "opcode": "checkbox",
+          "next": null,
+          "parent": null,
+          "inputs": {},
+          "fields": {
+            "CHECKBOX": [
+              "FALSE",
+              "nota68u3"
+            ]
+          },
+          "shadow": true,
+          "topLevel": true,
+          "x": 329,
+          "y": 425
+        },
+        "l": {
+          "opcode": "SPtempVars_getVar",
+          "next": null,
+          "parent": "k",
+          "inputs": {
+            "NAME": [
+              1,
+              [
+                10,
+                "name"
+              ]
+            ]
+          },
+          "fields": {
+            "TYPE": [
+              "global",
+              "m2zsv83l"
+            ]
+          },
+          "shadow": false,
+          "topLevel": false
+        },
+        "k": {
+          "opcode": "control_if_return_else_return",
+          "next": null,
+          "parent": "m",
+          "inputs": {
+            "boolean": [
+              3,
+              "h",
+              "j"
+            ],
+            "TEXT1": [
+              1,
+              [
+                10,
+                "Joe"
+              ]
+            ],
+            "TEXT2": [
+              3,
+              "l",
+              [
+                10,
+                ""
+              ]
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false
+        },
+        "m": {
+          "opcode": "SPtempVars_setVar",
+          "next": "p",
+          "parent": "g",
+          "inputs": {
+            "NAME": [
+              1,
+              [
+                10,
+                "name"
+              ]
+            ],
+            "VALUE": [
+              3,
+              "k",
+              [
+                10,
+                ""
+              ]
+            ]
+          },
+          "fields": {
+            "TYPE": [
+              "global",
+              "m2zsv83l"
+            ]
+          },
+          "shadow": false,
+          "topLevel": false
+        },
+        "o": {
+          "opcode": "SPtempVars_getVar",
+          "next": null,
+          "parent": "n",
+          "inputs": {
+            "NAME": [
+              1,
+              [
+                10,
+                "name"
+              ]
+            ]
+          },
+          "fields": {
+            "TYPE": [
+              "global",
+              "m2zsv83l"
+            ]
+          },
+          "shadow": false,
+          "topLevel": false
+        },
+        "n": {
+          "opcode": "operator_expandablejoininputs",
+          "next": null,
+          "parent": "p",
+          "inputs": {
+            "INPUT1": [
+              1,
+              [
+                10,
+                "Hello, "
+              ]
+            ],
+            "INPUT2": [
+              3,
+              "o",
+              [
+                10,
+                ""
+              ]
+            ],
+            "INPUT3": [
+              1,
+              [
+                10,
+                "!"
+              ]
+            ]
+          },
+          "fields": {},
+          "shadow": false,
+          "topLevel": false,
+          "mutation": {
+            "tagName": "mutation",
+            "children": [],
+            "inputcount": "3"
+          }
+        },
+        "p": {
+          "opcode": "looks_sayforsecs",
+          "next": null,
+          "parent": "m",
+          "inputs": {
+            "MESSAGE": [
+              3,
+              "n",
+              [
+                10,
+                ""
               ]
             ],
             "SECS": [
@@ -155,38 +362,9 @@
           "shadow": false,
           "topLevel": false
         },
-        "g": {
-          "opcode": "control_expandableIf",
-          "next": null,
-          "parent": "b",
-          "inputs": {
-            "BOOL1": [
-              3,
-              "c",
-              "d"
-            ],
-            "SUBSTACK1": [
-              2,
-              "e"
-            ],
-            "SUBSTACK2": [
-              2,
-              "f"
-            ]
-          },
-          "fields": {},
-          "shadow": false,
-          "topLevel": false,
-          "mutation": {
-            "tagName": "mutation",
-            "children": [],
-            "branches": "2",
-            "ends-in-else": "true"
-          }
-        },
         "a": {
           "opcode": "event_whenflagclicked",
-          "next": "b",
+          "next": "g",
           "parent": null,
           "inputs": {},
           "fields": {},
@@ -234,7 +412,10 @@
   ],
   "monitors": [],
   "extensionData": {},
-  "extensions": [],
+  "extensions": [
+    "SPtempVars",
+    "pmControlsExpansion"
+  ],
   "meta": {
     "semver": "3.0.0",
     "vm": "0.2.0",
@@ -244,5 +425,8 @@
       "url": "https://penguinmod.com/",
       "version": "stable"
     }
+  },
+  "extensionURLs": {
+    "SPtempVars": "https://sharkpools-extensions.vercel.app/extension-code/Temporary-Variables.js"
   }
 }
