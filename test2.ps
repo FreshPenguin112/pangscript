@@ -1,0 +1,9 @@
+on("flag", *{
+    let name = ask("What's your name?");
+    if (name != "Joe") {
+        print("Hello, " .. name .. "!", {seconds: 2});        
+    } else {
+        print("Hello, " .. "Evil " .. name .. "!", {seconds: 2});
+    }
+});
+

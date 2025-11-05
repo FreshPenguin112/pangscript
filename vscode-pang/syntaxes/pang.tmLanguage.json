@@ -1,0 +1,66 @@
+{
+  "scopeName": "source.pang",
+  "name": "Pang",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#operators" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.pang",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.pang",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.pang",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "match": "\\\\.", "name": "constant.character.escape.pang" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.pang", "match": "\\b\\d+(?:\\.\\d+)?\\b" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.pang",
+          "match": "\\b(on|let|const|if|else|print|ask|return|true|false)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "match": "\\.\\.", "name": "keyword.operator.concat.pang" },
+        { "match": "\\*\\*", "name": "keyword.operator.power.pang" },
+        { "match": "===|!==|==|!=|>=|<=|&&|\\|\\||[+\\-*/%<>?:=!]=?", "name": "keyword.operator.pang" }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        { "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b", "name": "variable.other.pang" }
+      ]
+    }
+  },
+  "foldingStartMarker": "\\{",
+  "foldingStopMarker": "\\}"
+}

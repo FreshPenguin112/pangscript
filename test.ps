@@ -1,11 +1,14 @@
 on("flag", *{
     let name = ask("What is your name?");
-    name = name != "Joe" ? name : "Evil Joe";
     if (name == "Alice") {
         print("Hello, Alice the Great!", {seconds: 2});
     } else if (name == "Bob") {
         print("Hello, Bob the Great!", {seconds: 2});
     } else {
-        print("Hello, " .. name .. "!", {seconds: 2});
+        print("Hello, " .. (name != "Joe" ? name : "Evil Joe") .. "!", {seconds: 2});
     }
+});
+
+on("click", *{
+    print("Hello There!", {seconds: 2});
 });
