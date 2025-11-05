@@ -6,7 +6,7 @@ Object.defineProperty(exports, "__esModule", {
 exports.default = void 0;
 var _antlr = _interopRequireDefault(require("antlr4"));
 function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
-// Generated from Pang.g4 by ANTLR 4.13.2
+// Generated from Pang.g4 by ANTLR 4.13.1
 // jshint ignore: start
 
 // This class defines a complete generic visitor for a parse tree produced by PangParser.

@@ -1,0 +1,16 @@
+{
+  "scopeName": "markdown.pang.codeblock",
+  "injectTo": ["text.html.markdown"],
+  "patterns": [
+    {
+      "begin": "(?<=```)(pang)(\\s*$)",
+      "beginCaptures": {
+        "1": { "name": "fenced_code.block.language.markdown" }
+      },
+      "end": "(^```\\s*$)",
+      "patterns": [
+        { "include": "source.pang" }
+      ]
+    }
+  ]
+}

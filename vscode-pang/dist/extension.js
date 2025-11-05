@@ -4381,17 +4381,28 @@ function tryLoadParsers(extensionPath) {
   const candidates = [];
   if (extensionPath) {
     try {
-      const serverBundle = path.join(extensionPath, "server", "dist", "server.js");
+      const serverBundle = path.join(
+        extensionPath,
+        "server",
+        "dist",
+        "server.js"
+      );
       if (fs.existsSync(serverBundle)) {
         try {
           const mod = require(serverBundle);
           if (mod && typeof mod.validateText === "function") {
             serverModule = mod;
-            log(`Using bundled server validateText from ${serverBundle}`);
+            log(
+              `Using bundled server validateText from ${serverBundle}`
+            );
             return true;
           }
         } catch (e) {
-          log(`Failed requiring bundled server at ${serverBundle}: ${String(e)}`);
+          log(
+            `Failed requiring bundled server at ${serverBundle}: ${String(
+              e
+            )}`
+          );
         }
       }
     } catch (e) {
@@ -4440,14 +4451,25 @@ function validateText(text) {
         const declared2 = serverResult && serverResult._declared ? serverResult._declared : sd._declared || /* @__PURE__ */ new Map();
         return { diagnostics: sd, _declared: declared2 };
       } catch (e) {
-        diagnostics.push({ severity: 0, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, message: "Bundled server validation failed: " + String(e), source: "pang" });
+        diagnostics.push({
+          severity: 0,
+          range: {
+            start: { line: 0, character: 0 },
+            end: { line: 0, character: 1 }
+          },
+          message: "Bundled server validation failed: " + String(e),
+          source: "pang"
+        });
         return { diagnostics, _declared: /* @__PURE__ */ new Map() };
       }
     }
     diagnostics.push({
       severity: 0,
       // Error
-      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 1 }
+      },
       message: "Pang parser not found. Generate parser with ANTLR and ensure lib/PangParser.js exists next to the extension or in the workspace lib/.",
       source: "pang"
     });
@@ -4476,28 +4498,72 @@ function validateText(text) {
     if (typeof parser.program === "function")
       parser.program();
     for (const e of errors) {
-      diagnostics.push({ severity: 0, range: { start: { line: Math.max(0, e.line - 1), character: Math.max(0, e.column) }, end: { line: Math.max(0, e.line - 1), character: Math.max(0, e.column + 1) } }, message: e.msg, source: "pang" });
+      diagnostics.push({
+        severity: 0,
+        range: {
+          start: {
+            line: Math.max(0, e.line - 1),
+            character: Math.max(0, e.column)
+          },
+          end: {
+            line: Math.max(0, e.line - 1),
+            character: Math.max(0, e.column + 1)
+          }
+        },
+        message: e.msg,
+        source: "pang"
+      });
     }
   } catch (err) {
-    diagnostics.push({ severity: 0, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, message: "Parser runtime error: " + (err && err.message ? err.message : String(err)), source: "pang" });
+    diagnostics.push({
+      severity: 0,
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 1 }
+      },
+      message: "Parser runtime error: " + (err && err.message ? err.message : String(err)),
+      source: "pang"
+    });
   }
-  const keywords = /* @__PURE__ */ new Set(["on", "let", "const", "if", "else", "print", "ask", "return", "true", "false"]);
+  const keywords = /* @__PURE__ */ new Set([
+    "on",
+    "let",
+    "const",
+    "if",
+    "else",
+    "print",
+    "ask",
+    "return",
+    "true",
+    "false"
+  ]);
   const builtins = /* @__PURE__ */ new Set(["print", "ask", "on"]);
   const declared = /* @__PURE__ */ new Map();
   const lines = text.split(/\r?\n/);
   function stripStrings(s) {
-    return s.replace(/'[^']*'|"[^"]*"|`[^`]*`/g, (m) => " ".repeat(m.length));
+    return s.replace(
+      /'[^']*'|"[^"]*"|`[^`]*`/g,
+      (m) => " ".repeat(m.length)
+    );
   }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const declRe = /\b(?:let|const)\s+([a-zA-Z_][a-zA-Z0-9_]*)/g;
     let m;
     while (m = declRe.exec(line))
-      declared.set(m[1], { line: i, start: m.index + m[0].indexOf(m[1]), end: m.index + m[0].indexOf(m[1]) + m[1].length });
+      declared.set(m[1], {
+        line: i,
+        start: m.index + m[0].indexOf(m[1]),
+        end: m.index + m[0].indexOf(m[1]) + m[1].length
+      });
     const assignRe = /^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=/;
     const am = assignRe.exec(line);
     if (am)
-      declared.set(am[1], { line: i, start: line.indexOf(am[1]), end: line.indexOf(am[1]) + am[1].length });
+      declared.set(am[1], {
+        line: i,
+        start: line.indexOf(am[1]),
+        end: line.indexOf(am[1]) + am[1].length
+      });
   }
   const identRe = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
   for (let i = 0; i < lines.length; i++) {
@@ -4517,7 +4583,15 @@ function validateText(text) {
       if (/^\s*:/.test(rest))
         continue;
       if (!declared.has(name)) {
-        diagnostics.push({ severity: 2, range: { start: { line: i, character: m2.index }, end: { line: i, character: m2.index + name.length } }, message: `Undeclared variable '${name}' \u2014 consider 'let ${name}' or implicit assignment.`, source: "pang" });
+        diagnostics.push({
+          severity: 2,
+          range: {
+            start: { line: i, character: m2.index },
+            end: { line: i, character: m2.index + name.length }
+          },
+          message: `Undeclared variable '${name}' \u2014 consider 'let ${name}' or implicit assignment.`,
+          source: "pang"
+        });
       }
     }
   }
@@ -4528,113 +4602,183 @@ function registerProviders(context) {
   diagnosticCollection = languages.createDiagnosticCollection("pang");
   context.subscriptions.push(diagnosticCollection);
   let currentCursorPosition = null;
-  context.subscriptions.push(window2.onDidChangeTextEditorSelection((e) => {
-    if (e.textEditor.document.languageId === "pang" || e.textEditor.document.fileName.endsWith(".ps")) {
-      const pos = e.selections[0].active;
-      currentCursorPosition = pos;
-      runValidate(e.textEditor.document, pos);
-    }
-  }));
-  context.subscriptions.push(workspace.onDidOpenTextDocument((doc) => {
-    if (doc.languageId === "pang" || doc.fileName.endsWith(".ps")) {
-      const editor = window2.activeTextEditor;
-      const cursorPos = editor && editor.document === doc ? editor.selection.active : null;
-      runValidate(doc, cursorPos);
-    }
-  }));
-  context.subscriptions.push(workspace.onDidChangeTextDocument((e) => {
-    if (e.document.languageId === "pang" || e.document.fileName.endsWith(".ps")) {
-      runValidate(e.document, currentCursorPosition);
-    }
-  }));
-  context.subscriptions.push(workspace.onDidSaveTextDocument((doc) => {
-    if (doc.languageId === "pang" || doc.fileName.endsWith(".ps")) {
-      const editor = window2.activeTextEditor;
-      const cursorPos = editor && editor.document === doc ? editor.selection.active : null;
-      runValidate(doc, cursorPos);
-    }
-  }));
+  context.subscriptions.push(
+    window2.onDidChangeTextEditorSelection((e) => {
+      if (e.textEditor.document.languageId === "pang" || e.textEditor.document.fileName.endsWith(".ps")) {
+        const pos = e.selections[0].active;
+        currentCursorPosition = pos;
+        runValidate(e.textEditor.document, pos);
+      }
+    })
+  );
+  context.subscriptions.push(
+    workspace.onDidOpenTextDocument((doc) => {
+      if (doc.languageId === "pang" || doc.fileName.endsWith(".ps")) {
+        const editor = window2.activeTextEditor;
+        const cursorPos = editor && editor.document === doc ? editor.selection.active : null;
+        runValidate(doc, cursorPos);
+      }
+    })
+  );
+  context.subscriptions.push(
+    workspace.onDidChangeTextDocument((e) => {
+      if (e.document.languageId === "pang" || e.document.fileName.endsWith(".ps")) {
+        runValidate(e.document, currentCursorPosition);
+      }
+    })
+  );
+  context.subscriptions.push(
+    workspace.onDidSaveTextDocument((doc) => {
+      if (doc.languageId === "pang" || doc.fileName.endsWith(".ps")) {
+        const editor = window2.activeTextEditor;
+        const cursorPos = editor && editor.document === doc ? editor.selection.active : null;
+        runValidate(doc, cursorPos);
+      }
+    })
+  );
   for (const doc of workspace.textDocuments)
     if (doc.languageId === "pang" || doc.fileName.endsWith(".ps"))
       runValidate(doc);
-  context.subscriptions.push(languages.registerCompletionItemProvider({ scheme: "file", language: "pang" }, {
-    provideCompletionItems(document, position) {
-      try {
-        const text = document.getText();
-        const items = [];
-        try {
-          const snippetPath = path.join(context.extensionPath || __dirname, "snippets", "pang.json");
-          if (fs.existsSync(snippetPath)) {
-            const raw = fs.readFileSync(snippetPath, "utf8");
-            const sn = JSON.parse(raw);
-            for (const key of Object.keys(sn)) {
-              const s = sn[key];
-              const label = s.prefix || key;
-              const insert = Array.isArray(s.body) ? s.body.join("\n") : s.body;
-              items.push(new (require("vscode")).CompletionItem(label, require("vscode").CompletionItemKind.Snippet));
+  context.subscriptions.push(
+    languages.registerCompletionItemProvider(
+      { scheme: "file", language: "pang" },
+      {
+        provideCompletionItems(document, position) {
+          try {
+            const text = document.getText();
+            const items = [];
+            try {
+              const snippetPath = path.join(
+                context.extensionPath || __dirname,
+                "snippets",
+                "pang.json"
+              );
+              if (fs.existsSync(snippetPath)) {
+                const raw = fs.readFileSync(
+                  snippetPath,
+                  "utf8"
+                );
+                const sn = JSON.parse(raw);
+                for (const key of Object.keys(sn)) {
+                  const s = sn[key];
+                  const label = s.prefix || key;
+                  const insert = Array.isArray(s.body) ? s.body.join("\n") : s.body;
+                  items.push(
+                    new (require("vscode")).CompletionItem(
+                      label,
+                      require("vscode").CompletionItemKind.Snippet
+                    )
+                  );
+                }
+              }
+            } catch (e) {
             }
-          }
-        } catch (e) {
-        }
-        const declared = /* @__PURE__ */ new Set();
-        const lines = text.split(/\r?\n/);
-        const declRe = /\b(?:let|const)\s+([a-zA-Z_][a-zA-Z0-9_]*)/g;
-        const assignRe = /^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=/;
-        for (let i = 0; i < lines.length; i++) {
-          let m;
-          while (m = declRe.exec(lines[i]))
-            declared.add(m[1]);
-          const am = assignRe.exec(lines[i]);
-          if (am)
-            declared.add(am[1]);
-        }
-        for (const v of declared)
-          items.push(new (require("vscode")).CompletionItem(v, require("vscode").CompletionItemKind.Variable));
-        return items;
-      } catch (e) {
-        return [];
-      }
-    }
-  }, ".", "(", " "));
-  context.subscriptions.push(languages.registerDefinitionProvider({ scheme: "file", language: "pang" }, {
-    provideDefinition(document, position) {
-      try {
-        const line = document.getText().split(/\r?\n/)[position.line] || "";
-        const re = /[a-zA-Z_][a-zA-Z0-9_]*/g;
-        let match;
-        let found = null;
-        while (match = re.exec(line)) {
-          const start = match.index;
-          const end = start + match[0].length;
-          if (position.character >= start && position.character <= end) {
-            found = match[0];
-            break;
+            const declared = /* @__PURE__ */ new Set();
+            const lines = text.split(/\r?\n/);
+            const declRe = /\b(?:let|const)\s+([a-zA-Z_][a-zA-Z0-9_]*)/g;
+            const assignRe = /^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=/;
+            for (let i = 0; i < lines.length; i++) {
+              let m;
+              while (m = declRe.exec(lines[i]))
+                declared.add(m[1]);
+              const am = assignRe.exec(lines[i]);
+              if (am)
+                declared.add(am[1]);
+            }
+            for (const v of declared)
+              items.push(
+                new (require("vscode")).CompletionItem(
+                  v,
+                  require("vscode").CompletionItemKind.Variable
+                )
+              );
+            return items;
+          } catch (e) {
+            return [];
           }
         }
-        if (!found)
-          return null;
-        const out = validateText(document.getText());
-        const declared = out._declared || /* @__PURE__ */ new Map();
-        if (declared.has(found)) {
-          const pos = declared.get(found);
-          return [{ uri: document.uri, range: new (require("vscode")).Range(pos.line, pos.start, pos.line, pos.end) }];
+      },
+      ".",
+      "(",
+      " "
+    )
+  );
+  context.subscriptions.push(
+    languages.registerDefinitionProvider(
+      { scheme: "file", language: "pang" },
+      {
+        provideDefinition(document, position) {
+          try {
+            const line = document.getText().split(/\r?\n/)[position.line] || "";
+            const re = /[a-zA-Z_][a-zA-Z0-9_]*/g;
+            let match;
+            let found = null;
+            while (match = re.exec(line)) {
+              const start = match.index;
+              const end = start + match[0].length;
+              if (position.character >= start && position.character <= end) {
+                found = match[0];
+                break;
+              }
+            }
+            if (!found)
+              return null;
+            const out = validateText(document.getText());
+            const declared = out._declared || /* @__PURE__ */ new Map();
+            if (declared.has(found)) {
+              const pos = declared.get(found);
+              return [
+                {
+                  uri: document.uri,
+                  range: new (require("vscode")).Range(
+                    pos.line,
+                    pos.start,
+                    pos.line,
+                    pos.end
+                  )
+                }
+              ];
+            }
+            return null;
+          } catch (e) {
+            return null;
+          }
         }
-        return null;
-      } catch (e) {
-        return null;
       }
-    }
-  }));
+    )
+  );
 }
 function runValidate(document, cursorPos) {
   try {
     if (serverModule && typeof serverModule.validateText === "function") {
       const res = validateText(document.getText(), cursorPos);
-      const diags = res.diagnostics.map((d) => new (require("vscode")).Diagnostic(new (require("vscode")).Range(d.range.start.line, d.range.start.character, d.range.end.line, d.range.end.character), d.message, d.severity === 0 ? require("vscode").DiagnosticSeverity.Error : d.severity === 2 ? require("vscode").DiagnosticSeverity.Warning : require("vscode").DiagnosticSeverity.Information));
+      const diags = res.diagnostics.map(
+        (d) => new (require("vscode")).Diagnostic(
+          new (require("vscode")).Range(
+            d.range.start.line,
+            d.range.start.character,
+            d.range.end.line,
+            d.range.end.character
+          ),
+          d.message,
+          d.severity === 0 ? require("vscode").DiagnosticSeverity.Error : d.severity === 2 ? require("vscode").DiagnosticSeverity.Warning : require("vscode").DiagnosticSeverity.Information
+        )
+      );
       diagnosticCollection.set(document.uri, diags);
     } else {
       const res = validateText(document.getText());
-      const diags = res.diagnostics.map((d) => new (require("vscode")).Diagnostic(new (require("vscode")).Range(d.range.start.line, d.range.start.character, d.range.end.line, d.range.end.character), d.message, d.severity === 0 ? require("vscode").DiagnosticSeverity.Error : d.severity === 2 ? require("vscode").DiagnosticSeverity.Warning : require("vscode").DiagnosticSeverity.Information));
+      const diags = res.diagnostics.map(
+        (d) => new (require("vscode")).Diagnostic(
+          new (require("vscode")).Range(
+            d.range.start.line,
+            d.range.start.character,
+            d.range.end.line,
+            d.range.end.character
+          ),
+          d.message,
+          d.severity === 0 ? require("vscode").DiagnosticSeverity.Error : d.severity === 2 ? require("vscode").DiagnosticSeverity.Warning : require("vscode").DiagnosticSeverity.Information
+        )
+      );
       diagnosticCollection.set(document.uri, diags);
     }
   } catch (e) {
@@ -4646,6 +4790,79 @@ function activate(context) {
   log("Extension activate called (in-process providers)");
   try {
     tryLoadParsers(context.extensionPath || __dirname);
+    const builtinDocs = {
+      on: `Defines an event handler.
+Valid events are any hat opcodes(only works with hats without arguments),
+as well as the following defined ones:
+- "flag": when the blue flag is clicked
+- "stop" || "stopped": when the stop button is clicked
+- "click" || "clicked": when the sprite is clicked
+Example: \`on("flag", *{ /* code here */ });\`
+`,
+      ask: `Prompts the user for input and returns their response.
+Uses the ask and wait block
+Example: \`let name = ask("Your name?");\`
+`,
+      print: `Generates a say or a say for seconds block(if you provide the seconds option)
+Example: \`print("Hello!", {seconds: 2});\`
+`,
+      true: `Boolean literal \`true\`.
+`,
+      false: `Boolean literal \`false\`.
+`
+    };
+    context.subscriptions.push(
+      languages.registerHoverProvider(
+        { scheme: "file", language: "pang" },
+        {
+          provideHover(document, position) {
+            const line = document.lineAt(position.line).text;
+            const re = /[a-zA-Z_][a-zA-Z0-9_]*/g;
+            let match;
+            while (match = re.exec(line)) {
+              const start = match.index;
+              const end = start + match[0].length;
+              if (position.character >= start && position.character < end) {
+                const name = match[0];
+                const docText = builtinDocs[name];
+                if (!docText)
+                  return null;
+                const {
+                  MarkdownString,
+                  Hover
+                } = require("vscode");
+                const md = new MarkdownString();
+                md.isTrusted = true;
+                const codeRegex = /```pang\s*([\s\S]*?)```|`([^`\n]+)`/g;
+                let lastIndex = 0;
+                let cbMatch;
+                while ((cbMatch = codeRegex.exec(docText)) !== null) {
+                  if (cbMatch.index > lastIndex) {
+                    md.appendMarkdown(
+                      docText.slice(
+                        lastIndex,
+                        cbMatch.index
+                      )
+                    );
+                  }
+                  if (cbMatch[1] !== void 0) {
+                    md.appendCodeblock(cbMatch[1], "pang");
+                  } else if (cbMatch[2] !== void 0) {
+                    md.appendCodeblock(cbMatch[2], "pang");
+                  }
+                  lastIndex = cbMatch.index + cbMatch[0].length;
+                }
+                if (lastIndex < docText.length) {
+                  md.appendMarkdown(docText.slice(lastIndex));
+                }
+                return new Hover(md);
+              }
+            }
+            return null;
+          }
+        }
+      )
+    );
     registerProviders(context);
     log("Registered in-process language providers for Pang");
   } catch (e) {

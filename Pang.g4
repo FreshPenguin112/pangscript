@@ -153,4 +153,12 @@ WS
     : [ \t\r\n]+ -> skip
     ;
 
+LINE_COMMENT
+    : '//' ~[\r\n]* -> skip
+    ;
+
+BLOCK_COMMENT
+    : '/*' .*? '*/' -> skip
+    ;
+
 // symbols are literal chars in parser rules

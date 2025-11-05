@@ -23705,25 +23705,6 @@ var require_blocks = __commonJS({
 });
 
 // server/server.js
-var builtinDocs = {
-  on: `Defines an event handler.
-  Valid events are any hat opcodes(only works with hats without arguments),
-  as well as the following defined ones:
-  - "flag": when the blue flag is clicked
-  - "stop" || "stopped": when the stop button is clicked
-  - "click" || "clicked": when the sprite is clicked
-  Example: \`on("flag", *{ ... })\`
-  `,
-  ask: `Prompts the user for input and returns their response.
-  Uses the ask and wait block
-  Example: \`let name = ask("Your name?")\`
-  `,
-  print: `Generates a say or a say for seconds block(if you provide the seconds option)
-  Example: \`print("Hello!", {seconds: 2})\`
-  `,
-  true: `Boolean literal \`true\`.`,
-  false: `Boolean literal \`false\`.`
-};
 var {
   createConnection,
   ProposedFeatures,
@@ -24055,37 +24036,6 @@ if (require.main === module) {
   documents.listen(connection);
   connection.listen();
 }
-connection.onHover((params) => {
-  try {
-    const doc = documents.get(params.textDocument.uri);
-    if (!doc)
-      return null;
-    const lines = doc.getText().split(/\r?\n/);
-    const line = lines[params.position.line] || "";
-    const re = /[a-zA-Z_][a-zA-Z0-9_]*/g;
-    let match;
-    let found = null;
-    while (match = re.exec(line)) {
-      const start = match.index;
-      const end = start + match[0].length;
-      if (params.position.character >= start && params.position.character <= end) {
-        found = match[0];
-        break;
-      }
-    }
-    if (found && builtinDocs[found]) {
-      return {
-        contents: {
-          kind: "markdown",
-          value: `**${found}** \u2014 ${builtinDocs[found]}`
-        }
-      };
-    }
-    return null;
-  } catch (e) {
-    return null;
-  }
-});
 connection.onDefinition((params) => {
   try {
     const doc = documents.get(params.textDocument.uri);

@@ -1212,8 +1212,8 @@ on("flag", *{
 `;
 const outJSONLocation = process.argv[3] || path.join(__dirname, "project.json");
 
-// Strip single-line // comments and leading blank lines; strings are parsed directly by the grammar
-const cleaned = input.replace(/^\s*\/\/.*$/gm, "").replace(/^\n+/, "");
+// Do not strip comments here; ANTLR grammar handles both // and /* */ comments via lexer rules.
+const cleaned = input;
 
 // Parse with ANTLR and build AST
 let ast;
