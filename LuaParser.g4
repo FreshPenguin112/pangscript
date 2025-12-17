@@ -53,7 +53,7 @@ statement
     ;
 
 attnamelist
-    : NAME attrib (',' NAME attrib)*
+    : NAME typeAnnotation? attrib (',' NAME typeAnnotation? attrib)*
     ;
 
 attrib
@@ -94,6 +94,7 @@ exp
     | functiondef
     | prefixexp
     | tableconstructor
+    | arrayconstructor
     | <assoc = right> exp ('^') exp
     | ('not' | '#' | '-' | '~') exp
     | exp ('*' | '/' | '%' | '//') exp
@@ -111,7 +112,7 @@ exp
 
 // var ::=  Name | prefixexp '[' exp ']' | prefixexp '.' Name 
 var
-    : NAME
+    : NAME typeAnnotation?
     | prefixexp ('[' exp ']' | '.' NAME)
     ;
 
@@ -143,21 +144,40 @@ functiondef
     ;
 
 funcbody
-    : '(' parlist ')' block 'end'
+    : '(' parlist ')' typeAnnotation? block 'end'
     ;
 
 /* lparser.c says "is 'parlist' not empty?"
  * That code does so by checking la(1) == ')'.
  * This means that parlist can derive empty.
  */
+
+namelistWithTypes
+    : NAME typeAnnotation? (',' NAME typeAnnotation?)*
+    ;
+
 parlist
-    : namelist (',' '...')?
+    : namelistWithTypes (',' '...')?
     | '...'
     |
     ;
 
 tableconstructor
-    : '{' fieldlist? '}'
+    : '{' bracketfieldlist? '}'
+    | '{' fieldlist? '}'
+    ;
+
+arrayconstructor
+    : '[' explist? ']'
+    ;
+
+bracketfieldlist
+    : bracketfield (fieldsep bracketfield)* fieldsep?
+    ;
+
+bracketfield
+    : '[' exp ']' '=' exp
+    | '[' exp ']'
     ;
 
 fieldlist
@@ -186,4 +206,8 @@ string
     : NORMALSTRING
     | CHARSTRING
     | LONGSTRING
+    ;
+
+typeAnnotation
+    : ':' NAME
     ;

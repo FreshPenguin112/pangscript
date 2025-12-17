@@ -93,10 +93,7 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
                 .map(n => block[n])
                 .filter(a => a[0]?.type != 'field_image');
             } catch (error) {
-                console.error(block,
-                    Object.keys(block)
-                    .filter(a => a.startsWith('args'))
-                    .map(n => block[n]))
+                try { const dbg = require('./debug'); if (dbg.enabled()) dbg.debug(block, Object.keys(block).filter(a => a.startsWith('args')).map(n => block[n])); } catch (e) {}
                 throw error
             }
             const args = Object.keys(block)
@@ -142,7 +139,7 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
                     return {
                         name: arg.name,
                         type: arg.type == 'input_value' ? 1 : (() => {
-                            console.error(block, args)
+                            try { const dbg = require('./debug'); if (dbg.enabled()) dbg.debug(block, args); } catch (e) {}
                             throw `Unknown input type ${arg.type} in ${opcode}.${arg.name}`
                         })(),
                         variableTypes: arg.variableTypes
@@ -223,6 +220,121 @@ Object.assign(module.exports.processedBlocks, {
     ]],
     pmOperatorsExpansion_binnaryNot: [[
         { name: "num1", type: "number" }
+    ]],
+    // --- JSON extension input maps ---
+    jgJSON_json_validate: [[
+        { name: "json", type: "string" }
+    ]],
+    jgJSON_getValueFromJSON: [[
+        { name: "VALUE", type: "string" },
+        { name: "JSON", type: "string" }
+    ]],
+    jgJSON_getTreeValueFromJSON: [[
+        { name: "VALUE", type: "string" },
+        { name: "JSON", type: "string" }
+    ]],
+    jgJSON_setValueToKeyInJSON: [[
+        { name: "VALUE", type: "string" },
+        { name: "KEY", type: "string" },
+        { name: "JSON", type: "string" }
+    ]],
+    jgJSON_json_delete: [[
+        { name: "json", type: "string" },
+        { name: "key", type: "string" }
+    ]],
+    jgJSON_json_values: [[
+        { name: "json", type: "string" }
+    ]],
+    jgJSON_json_keys: [[
+        { name: "json", type: "string" }
+    ]],
+    jgJSON_json_has: [[
+        { name: "json", type: "string" },
+        { name: "key", type: "string" }
+    ]],
+    jgJSON_json_combine: [[
+        { name: "one", type: "string" },
+        { name: "two", type: "string" }
+    ]],
+    jgJSON_json_array_validate: [[
+        { name: "array", type: "string" }
+    ]],
+    jgJSON_json_array_split: [[
+        { name: "text", type: "string" },
+        { name: "delimeter", type: "string" }
+    ]],
+    jgJSON_json_array_join: [[
+        { name: "array", type: "string" },
+        { name: "delimeter", type: "string" }
+    ]],
+    jgJSON_json_array_push: [[
+        { name: "array", type: "string" },
+        { name: "item", type: "string" }
+    ]],
+    jgJSON_json_array_concatLayer1: [[
+        { name: "array1", type: "string" },
+        { name: "array2", type: "string" }
+    ]],
+    jgJSON_json_array_concatLayer2: [[
+        { name: "array1", type: "string" },
+        { name: "array2", type: "string" },
+        { name: "array3", type: "string" }
+    ]],
+    jgJSON_json_array_delete: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" }
+    ]],
+    jgJSON_json_array_reverse: [[
+        { name: "array", type: "string" }
+    ]],
+    jgJSON_json_array_insert: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" },
+        { name: "value", type: "string" }
+    ]],
+    jgJSON_json_array_set: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" },
+        { name: "value", type: "string" }
+    ]],
+    jgJSON_json_array_get: [[
+        { name: "array", type: "string" },
+        { name: "index", type: "number" }
+    ]],
+    jgJSON_json_array_indexofNostart: [[
+        { name: "array", type: "string" },
+        { name: "value", type: "string" }
+    ]],
+    jgJSON_json_array_indexof: [[
+        { name: "array", type: "string" },
+        { name: "number", type: "number" },
+        { name: "value", type: "string" }
+    ]],
+    jgJSON_json_array_length: [[
+        { name: "array", type: "string" }
+    ]],
+    jgJSON_json_array_contains: [[
+        { name: "array", type: "string" },
+        { name: "value", type: "string" }
+    ]],
+    jgJSON_json_array_flat: [[
+        { name: "array", type: "string" },
+        { name: "layer", type: "number" }
+    ]],
+    jgJSON_json_array_getrange: [[
+        { name: "array", type: "string" },
+        { name: "index1", type: "number" },
+        { name: "index2", type: "number" }
+    ]],
+    jgJSON_json_array_isempty: [[
+        { name: "array", type: "string" }
+    ]],
+    jgJSON_json_array_listtoarray: [[
+        { name: "list", type: "string" }
+    ]],
+    jgJSON_json_array_tolist: [[
+        { name: "list", type: "string" },
+        { name: "array", type: "string" }
     ]]
 });
 // ---------------------------------------------------------------

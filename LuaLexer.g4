@@ -43,7 +43,6 @@ CC       : '::';
 NIL      : 'nil';
 FALSE    : 'false';
 TRUE     : 'true';
-DOT      : '.';
 SQUIG    : '~';
 MINUS    : '-';
 POUND    : '#';
@@ -67,7 +66,9 @@ CCU      : '}';
 OB       : '[';
 CB       : ']';
 EE       : '==';
+DDD      : '...';
 DD       : '..';
+DOT      : '.';
 PIPE     : '|';
 CARET    : '^';
 SLASH    : '/';
@@ -89,7 +90,10 @@ INT: Digit+;
 
 HEX: '0' [xX] HexDigit+;
 
-FLOAT: Digit+ '.' Digit* ExponentPart? | '.' Digit+ ExponentPart? | Digit+ ExponentPart;
+// Require at least one digit after a decimal point to avoid lexing `1..3`
+// as a FLOAT followed by '.' and '3'. This makes `1..3` tokenize as
+// INT '..' INT which the parser can accept as a range expression.
+FLOAT: Digit+ '.' Digit+ ExponentPart? | '.' Digit+ ExponentPart? | Digit+ ExponentPart;
 
 HEX_FLOAT:
     '0' [xX] HexDigit+ '.' HexDigit* HexExponentPart?
@@ -119,13 +123,17 @@ fragment Digit: [0-9];
 
 fragment HexDigit: [0-9a-fA-F];
 
-fragment SingleLineInputCharacter: ~[\r\n\u0085\u2028\u2029];
+    // Directive-style comments for the generator. Syntax: --@directive ...
+    // Allow optional spaces between the dashes and the '@' so `-- @label` works too.
+    DIRECTIVE_COMMENT: '--' [ \t]* '@' ~[\r\n]* -> channel(HIDDEN);
 
-COMMENT: '--' { this.HandleComment(); } ~[\r\n]* -> channel(HIDDEN);
+    COMMENT: '--' ~'@' { this.HandleComment(); } ~[\r\n]* -> channel(HIDDEN);
 
-LONGCOMMENT: '--' '[[' .+? ']]' '--' -> channel(HIDDEN);
+    LONGCOMMENT: '--' '[[' .+? ']]' '--' -> channel(HIDDEN);
 
-WS: [ \t\u000C\r]+ -> channel(HIDDEN);
+    WS: [ \t\u000C\r]+ -> channel(HIDDEN);
+
+fragment SingleLineInputCharacter: ~[\r\n];
 
 NL: [\n] -> channel(2);
 

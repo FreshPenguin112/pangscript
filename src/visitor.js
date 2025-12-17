@@ -2,26 +2,67 @@
 // ^(?!\s*\/\/).*console\.log\([^)]*\);?
 const LuaParserVisitor = require("../lib/LuaParserVisitor").default;
 const _generator = require("../utils/generator");
-const CompilerError = require("../utils/CompilerError");
-
+const CompilerError = require("../utils/CompilerError.js");
 const { processedBlocks } = require("./blocks.js");
+const { parseComments } = require('./commentProcessor');
 
-//console.log(Object.getOwnPropertyNames(v))
 class visitor extends LuaParserVisitor {
     constructor(source) {
         super();
         this.idCounter = 0;
         this.blocks = {};
-        this.source = source.toString(); // Store the full source for error reporting
+        this.source = source.toString();
+    this._sourceLines = this.source.split(/\r?\n/);
+        // parse comment directives from source
+        const { lineComments, inlineComments, blockComments } = parseComments(this.source);
+        this._lineComments = lineComments;
+        this._inlineComments = inlineComments;
+        this._blockComments = blockComments;
         this.generator = new _generator();
         this.customBlocks = {};
         this.mainBodyBlockIds = [];
-        this.variableScopes = {}; // { varName: "local" | "global" }
+        this.variableScopes = {};
+        this.types = {};
+        this.variableGetters = {};
+    }
+
+    // NOTE: reparsing raw text into parse nodes is brittle and removed.
+    // Always use the existing parse nodes provided by the AST (PrefixexpContext
+    // children) when possible. Fallbacks to textual heuristics were causing
+    // inconsistent handling and variables named like `arr[2]`.
+
+    // Helper to extract type annotation from context
+    getTypeAnnotation(ctx) {
+        if (!ctx) return null;
+        try {
+            if (typeof ctx.typeAnnotation === 'function') {
+                const ta = ctx.typeAnnotation(0);
+                if (ta && typeof ta.NAME === 'function' && ta.NAME().length > 0) {
+                    return ta.NAME(0).getText();
+                }
+                if (ta && ta.NAME && typeof ta.NAME.getText === 'function') {
+                    return ta.NAME.getText();
+                }
+            } else if (ctx.typeAnnotation && ctx.typeAnnotation.NAME) {
+                return ctx.typeAnnotation.NAME.getText();
+            }
+        } catch (e) {
+            return null;
+        }
+        return null;
+    }
+
+    // Helper to extract base variable name and type from "name:type"
+    extractVarNameAndType(varString) {
+        if (typeof varString !== "string") return [varString, null];
+        // Match the base identifier at the start, allowing trailing dots/brackets/type annotations.
+        const match = /^([a-zA-Z_][a-zA-Z0-9_]*)(?::([a-zA-Z_][a-zA-Z0-9_]*))?/.exec(varString);
+        if (match) return [match[1], match[2] || null];
+        return [varString, null];
     }
 
     // Helper to add variable to the correct place in the project template
-    addVariableToProject(varName, initialValue, scope = "global") {
-        // Get the generator's template object
+    addVariableToProject(varName, initialValue, scope = "global", type = null) {
         const project = this.generator.template;
         let target;
         if (scope === "local") {
@@ -30,48 +71,46 @@ class visitor extends LuaParserVisitor {
             target = project.targets.find(t => t.isStage);
         }
         if (!target.variables) target.variables = {};
-        // Only add if not already present
-        if (!Object.prototype.hasOwnProperty.call(target.variables, varName)) {
-            target.variables[varName] = [varName, initialValue];
+        const [baseName, typeFromName] = this.extractVarNameAndType(varName);
+        // Always update type if provided (for reassignment)
+        if (type || typeFromName) this.types[baseName] = type || typeFromName;
+        if (!Object.prototype.hasOwnProperty.call(target.variables, baseName)) {
+            // When automatically creating a project variable, use 0 as the
+            // canonical initial value and let emitted runtime blocks perform
+            // the actual assignment. This avoids storing intermediate
+            // structured table literals or other inferred values that should
+            // be produced by runtime assignment logic.
+            target.variables[baseName] = [baseName, 0];
         }
-    }
-
-    // isType and getText methods are just ripped straight from fplus
-    /*
-    might not even need isType because the you can just define
-    visit methods for each type you need.
-    fplus would've been way easier to make if i knew this lmao
-    */
-    isType(ctx, type) {
-        return (() => {
+        // Ensure a reporter block exists for the variable so inputs can reference it
+        if (!this.variableGetters[baseName]) {
+            const reporterId = this.generator.addBlock({
+                opcode: "data_variable",
+                parent: null,
+                next: null,
+                fields: { VARIABLE: [baseName, baseName, ""] },
+                shadow: false,
+                topLevel: false,
+            });
+            this.variableGetters[baseName] = reporterId;
+            // If we already know the type for this variable, attach it to the reporter
             try {
-                return !!ctx[type]();
-            } catch (e) {
-                return false;
+                const t = this.types[baseName] || type || typeFromName || null;
+                if (t && this.generator.blocks && this.generator.blocks[reporterId]) this.generator.blocks[reporterId]._inferredType = t;
+            } catch (e) { }
+        }
+        // If a type is known for this variable, ensure the existing reporter is tagged
+        try {
+            const known = this.types[baseName] || type || typeFromName || null;
+            if (known && this.variableGetters[baseName] && this.generator.blocks && this.generator.blocks[this.variableGetters[baseName]]) {
+                this.generator.blocks[this.variableGetters[baseName]]._inferredType = known;
             }
-        })();
-    }
-    getText(ctx, parse = false) {
-        return (() => {
-            try {
-                return parse ? JSON.parse(ctx.getText()) : ctx.getText();
-            } catch (e) {
-                return "";
-            }
-        })();
+        } catch (e) {}
     }
     getName(ctx) {
         return (() => {
             try {
                 return (
-                    /*
-                    shitty precedence order(based on what name you would most likely be looking for) 
-                    to try and get token name lol
-                    for example a statement would have the following precedence order,
-                    statement ||
-                    BREAK(the lexer token that equals the literal word "break") ||
-                    break(what BREAK equals, matches the literal word "break" anywhere in the input)
-                    */
                     ctx.parser.ruleNames[ctx.ruleIndex] ||
                     ctx.parser.symbolicNames[ctx.start.type] ||
                     ctx.parser.literalNames[ctx.start.type]
@@ -81,6 +120,91 @@ class visitor extends LuaParserVisitor {
             }
         })();
     }
+    // Infer a simple type from a visited value expression.
+    // Accepts numbers, strings, arrays/objects, reporter shapes ([3, id, ...]) and variable placeholders ([12, name, name]).
+    inferTypeFromValue(val) {
+        if (val == null) return null;
+        if (typeof val === 'string') return 'string';
+        if (typeof val === 'number') return 'number';
+        if (Array.isArray(val)) {
+            // Reporter shape: [3, blockId, shape]
+            if (val[0] === 3 && typeof val[1] === 'string' && this.generator.blocks && this.generator.blocks[val[1]]) {
+                const blk = this.generator.blocks[val[1]];
+                if (blk && blk._inferredType) return blk._inferredType;
+                const opcode = blk && blk.opcode ? blk.opcode : '';
+                // conservative list of opcodes that produce strings
+                const stringProducers = new Set([
+                    'operator_join',
+                    'operator_getLettersFromIndexToIndexInTextFixed',
+                    'operator_getLettersFromIndexToIndexInText',
+                    'operator_stringify',
+                    'operator_code_to_character',
+                    'operator_toUpperLowerCase',
+                    'operator_tabCharacter',
+                    'operator_newLine',
+                    'operator_javascript_output',
+                    'jgJSON_json_array_join'
+                ]);
+                if (stringProducers.has(opcode)) return 'string';
+                // numeric result producers
+                const numberProducers = new Set([
+                    'operator_length',
+                    'operator_add',
+                    'operator_subtract',
+                    'operator_multiply',
+                    'operator_divide',
+                    'operator_mod',
+                    'operator_power',
+                    'operator_lt',
+                    'operator_gt',
+                    'operator_ltorequal',
+                    'operator_gtorequal',
+                    'operator_equals',
+                ]);
+                if (numberProducers.has(opcode)) return 'number';
+                // If block is a data_variable reporter, check its variable type
+                if (opcode === 'data_variable' && blk.fields && Array.isArray(blk.fields.VARIABLE)) {
+                    const varName = blk.fields.VARIABLE[0];
+                    const [base] = this.extractVarNameAndType(varName);
+                    if (this.types[base]) return this.types[base];
+                }
+                return null;
+            }
+            // array literal
+            if (!isNaN(Number(val.length))) return 'array';
+        }
+        // Variable placeholder shape: [12, name, name]
+        if (Array.isArray(val) && val[0] === 12) {
+            const [base] = this.extractVarNameAndType(val[1]);
+            if (this.types[base]) return this.types[base];
+        }
+        if (val != null && typeof val === 'object') return 'object';
+        return null;
+    }
+    // Helper to attach an inferred type to a block entry in the generator
+    setBlockType(blockId, type) {
+        try {
+            if (!blockId || !type) return;
+            const bid = typeof blockId === 'string' ? blockId : (Array.isArray(blockId) && blockId[0] === 3 ? blockId[1] : null);
+            if (!bid) return;
+            if (!this.generator.blocks[bid]) return;
+            // store a synthetic property `_inferredType` on block metadata
+            this.generator.blocks[bid]._inferredType = type;
+        } catch (e) { }
+    }
+    // Safe text extractor for parse-tree nodes/contexts
+    getText(ctx, preferRaw = false) {
+        try {
+            if (!ctx) return "";
+            if (typeof ctx === 'string') return ctx;
+            if (typeof ctx.getText === 'function') return ctx.getText();
+            // Some contexts expose .getText as a property on child nodes
+            if (ctx && ctx.children && ctx.children.length === 1 && typeof ctx.children[0].getText === 'function') return ctx.children[0].getText();
+            return String(ctx);
+        } catch (e) {
+            return "";
+        }
+    }
     sendText(ctx, name = false) {
         return `${name || this.getName(ctx)}: ${this.getText(ctx)}`;
     }
@@ -89,7 +213,342 @@ class visitor extends LuaParserVisitor {
         this.blocks = {};
         return blocksCopy;
     }
+
+    // Helper to wrap block references for input arrays
+    wrapInput(val) {
+        // Lightweight tracing: if the current expression line contains 'nested.x',
+        // emit a concise trace to stderr so we can follow how that expression
+        // is converted (literal vs reporter). This is intentionally minimal
+        // and guarded to avoid noisy logs.
+        try {
+        } catch (e) { }
+        // (no-op) wrapInput runs on expression results and will normalize them
+        // If it's already a block reference, ensure it points to a reporter-like block.
+        if (Array.isArray(val) && val[0] === 3) {
+            const refId = val[1];
+            if (typeof refId === 'string' && this.generator.blocks[refId]) {
+                const blk = this.generator.blocks[refId];
+                const opcode = blk && blk.opcode ? blk.opcode : '';
+                // If an inline comment exists for this expression's line, wrap the existing reporter
+                try {
+                    if (this._lastExpLine && this._inlineComments && this._inlineComments[this._lastExpLine]) {
+                        // inlineComments may be either a raw string (legacy) or an object {byIndex, raw}
+                        const inlineMeta = this._inlineComments[this._lastExpLine];
+                        let text = '';
+                        if (typeof inlineMeta === 'string') {
+                            text = inlineMeta;
+                        } else if (inlineMeta && typeof inlineMeta === 'object') {
+                            // If inlineMeta provides per-argument labels, only use those.
+                            if (inlineMeta.byIndex) {
+                                if (this._currentArgIndex && inlineMeta.byIndex[this._currentArgIndex]) {
+                                    text = inlineMeta.byIndex[this._currentArgIndex];
+                                } else {
+                                    // No per-arg label for this argument: do not fall back to raw (ambiguous).
+                                    text = '';
+                                }
+                            } else if (inlineMeta.raw) {
+                                // Legacy single-string inline meta (no @valN usage) — strip tokens
+                                text = inlineMeta.raw.replace(/@val\d+\s*/g, '').trim();
+                            }
+                        }
+                        // Optional debug logging for inline label resolution
+                        try {
+                            const dbg = require('./debug');
+                            if (dbg.enabled()) dbg.debug(`[PANG_INLINE] reporter line=${this._lastExpLine} arg=${this._currentArgIndex || 'null'} opcode=${opcode} inlineMeta=${JSON.stringify(inlineMeta)} text=${JSON.stringify(text)}`);
+                        } catch (e) { }
+                        // Only create a wrapper if we actually have label text
+                            if (text && text.length > 0) {
+                            // if the reporter returns boolean-like value, create labelBoolean wrapper
+                            const repWrapId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            const isBoolCandidate = opcode && (opcode.startsWith('operator_') && opcode.includes('true') === false);
+                            // Choose label type conservatively: use labelReporter unless value looks boolean
+                            const wrapOpcode = isBoolCandidate ? 'jwProto_labelBoolean' : 'jwProto_labelReporter';
+                            // Add wrapper block that accepts the reporter as VALUE input and label text as LABEL input
+                            this.generator.addBlock({
+                                opcode: wrapOpcode,
+                                id: repWrapId,
+                                parent: null,
+                                next: null,
+                                shadow: false,
+                                topLevel: false,
+                                inputs: { VALUE: [3, refId, [10, '']], LABEL: [1, [10, text]] }
+                            });
+                            // Re-parent the original reporter under the wrapper
+                            try { this.generator.blocks[refId].parent = repWrapId; } catch (e) { }
+                            return [3, repWrapId, [10, '']];
+                        }
+                    }
+                } catch (e) { }
+                // Treat all jgJSON_ opcodes as reporter blocks (they return modified data)
+                if (typeof opcode === 'string' && opcode.startsWith('jgJSON_')) return val;
+                // Use processedBlocks to determine if the opcode is a value-reporting block
+                let isReporter = false;
+                try {
+                    const pb = processedBlocks[opcode];
+                    if (pb && Array.isArray(pb)) {
+                        // processedBlocks entries exist for value-reporting blocks; assume reporter
+                        isReporter = true;
+                    }
+                } catch (e) {
+                    // conservative fallback
+                    isReporter = opcode.startsWith('operator_') || opcode === 'data_variable';
+                }
+                if (isReporter) return val;
+
+                // If it's a setter statement with a VARIABLE field, try to map to the variable getter reporter
+                if (blk.fields && blk.fields.VARIABLE && Array.isArray(blk.fields.VARIABLE)) {
+                    const varName = blk.fields.VARIABLE[0];
+                    const getter = this.variableGetters[varName];
+                    if (getter) return [3, getter, [10, '']];
+                }
+
+                // Try to find a reporter child inside its inputs
+                const inputs = blk.inputs || (blk.inputs === 0 ? blk.inputs : null);
+                if (inputs) {
+                    const candidates = Array.isArray(inputs) ? inputs : Object.values(inputs);
+                    for (const inp of candidates) {
+                        if (Array.isArray(inp) && inp[0] === 3 && typeof inp[1] === 'string' && this.generator.blocks[inp[1]]) {
+                            return inp; // use the reporter child instead
+                        }
+                    }
+                }
+            }
+            // Fallback: do not propagate statement block references into inputs
+            return [1, [10, '']];
+        }
+        // If it's a variable reference (from visitExp): [12, varName, varName]
+        if (Array.isArray(val) && val[0] === 12) {
+            const varName = val[1];
+            const [baseName] = this.extractVarNameAndType(varName);
+            const getterId = this.variableGetters[baseName];
+            if (getterId) {
+                // Use the canonical getter reporter for this variable.
+                // Parenting will be handled by the caller when the getter is used as an input.
+                return [3, getterId, [10, ""]];
+            }
+            // fallback to previous behavior if no getter exists
+            return [3, val, [10, ""]];
+        }
+        // If it's a block id string, prefer to use it only when it is a reporter-like block.
+        if (typeof val === "string" && this.generator.blocks[val]) {
+            const blk = this.generator.blocks[val];
+            const opcode = blk && blk.opcode ? blk.opcode : "";
+            // Determine if the referenced block is a reporter.
+            // Prefer processedBlocks metadata (covers sensing_answer and similar reporters),
+            // otherwise fall back to known opcode prefixes.
+            let isReporter = false;
+            try {
+                const pb = processedBlocks[opcode];
+                if (pb && Array.isArray(pb)) {
+                    isReporter = true;
+                }
+            } catch (e) {
+                // conservative fallback to prefix-based detection
+                const reporterPrefixes = [
+                    "operator_",
+                    "jgJSON_",
+                    "argument_reporter",
+                    "procedures_call",
+                    "pmOperatorsExpansion_",
+                    "operator_trueBoolean",
+                    "operator_falseBoolean",
+                    "data_variable"
+                ];
+                isReporter = reporterPrefixes.some(p => opcode === p || opcode.startsWith(p));
+            }
+            if (isReporter) {
+                return [3, val, [10, ""]];
+            }
+            // If the referenced block is a statement, try to find a reporter child inside its inputs
+            const inputs = blk.inputs || blk.inputs === 0 ? blk.inputs : null;
+            if (inputs) {
+                const candidates = Array.isArray(inputs) ? inputs : Object.values(inputs);
+                for (const inp of candidates) {
+                    if (Array.isArray(inp) && inp[0] === 3 && typeof inp[1] === 'string' && this.generator.blocks[inp[1]]) {
+                        return inp; // use the reporter child instead
+                    }
+                }
+            }
+            // Fallback: return empty string literal instead of referencing a statement block
+            return [1, [10, ""]];
+        }
+        // Otherwise, treat as direct value and return in the input-value shape
+        if (typeof val === "number") {
+            return [1, [4, String(val)]];
+        }
+        // For objects/arrays, prefer JSON.stringify so arrays don't become comma-joined strings
+        let literalText;
+        if (val != null && typeof val === 'object') {
+            // Keep object/array literals as serialized text (JSON) when used in inputs.
+            // Avoid heuristics that map any identifier on the same source line to a
+            // variable getter — that behavior can incorrectly substitute an
+            // unrelated variable (for example, `x`) when compiling expressions like
+            // `obj.nested.x`. Variable placeholders and reporter blocks are
+            // already handled above; here we only need a safe serialized form.
+            try {
+                literalText = JSON.stringify(val);
+            } catch (e) {
+                literalText = String(val);
+            }
+            try {
+                // silent when serializing object/array to literal
+            } catch (e) { }
+        } else {
+            literalText = val == null ? "" : String(val);
+        }
+        if (/^".*"$/.test(literalText) || /^'.*'$/.test(literalText)) {
+            literalText = literalText.slice(1, -1);
+        }
+        const out = [1, [10, literalText]];
+        try {
+            if (this._lastExpLine && this._inlineComments && this._inlineComments[this._lastExpLine]) {
+                const inlineMeta = this._inlineComments[this._lastExpLine];
+                let text = '';
+                if (typeof inlineMeta === 'string') {
+                    text = inlineMeta;
+                } else if (inlineMeta && typeof inlineMeta === 'object') {
+                    if (inlineMeta.byIndex) {
+                        if (this._currentArgIndex && inlineMeta.byIndex[this._currentArgIndex]) {
+                            text = inlineMeta.byIndex[this._currentArgIndex];
+                        } else {
+                            // Explicit byIndex exists but no entry for this arg: do not fallback to raw.
+                            text = '';
+                        }
+                    } else if (inlineMeta.raw) {
+                        // Legacy single-string inline meta (no @valN usage) — strip tokens
+                        text = inlineMeta.raw.replace(/@val\d+\s*/g, '').trim();
+                    }
+                }
+                // Optional debug logging for inline label resolution
+                try {
+                    const dbg = require('./debug');
+                    if (dbg.enabled()) dbg.debug(`[PANG_INLINE] literal line=${this._lastExpLine} arg=${this._currentArgIndex || 'null'} inlineMeta=${JSON.stringify(inlineMeta)} text=${JSON.stringify(text)}`);
+                } catch (e) { }
+                // If the literal is a boolean-like value, emit a labelBoolean
+                const valStr = String(val == null ? '' : val).trim();
+                if (valStr === 'true' || valStr === 'false' || typeof val === 'boolean') {
+                    if (text && text.length > 0) {
+                        const repId = this.generator.addBlock({
+                            opcode: 'jwProto_labelBoolean',
+                            parent: null,
+                            next: null,
+                            shadow: false,
+                            topLevel: false,
+                            inputs: { VALUE: [], LABEL: [1, [10, text]] }
+                        });
+                        return [3, repId, [10, '']];
+                    }
+                }
+                // Otherwise create a label reporter block and return its reporter id as wrapper
+                if (text && text.length > 0) {
+                    const repId = this.generator.addBlock({
+                        opcode: 'jwProto_labelReporter',
+                        parent: null,
+                        next: null,
+                        shadow: false,
+                        topLevel: false,
+                        inputs: { VALUE: out, LABEL: [1, [10, text]] },
+                    });
+                    // parent the original value into the reporter block
+                    if (Array.isArray(out) && out[0] === 3 && typeof out[1] === 'string' && this.generator.blocks[out[1]]) {
+                        this.generator.blocks[out[1]].parent = repId;
+                    }
+                    return [3, repId, [10, '']];
+                }
+            }
+        } catch (e) { }
+        return out;
+    }
+
+    // Helper: emit a line label block before the next top-level statement
+    emitLineLabelFor(lineNumber, beforeBlockId) {
+        if (!lineNumber) return null;
+        const text = this._lineComments && this._lineComments[lineNumber];
+        if (!text) return null;
+        const id = this.generator.letterCount(this.generator.blockIdCounter++);
+        this.generator.addBlock({
+            opcode: 'jwProto_labelCommand',
+            id,
+            parent: null,
+            next: null,
+            shadow: false,
+            topLevel: false,
+            inputs: { LABEL: [1, [10, text]] }
+        });
+        // If beforeBlockId exists, chain label -> beforeBlockId
+        if (beforeBlockId && this.generator.blocks[beforeBlockId]) {
+            this.generator.blocks[id].next = beforeBlockId;
+            this.generator.blocks[beforeBlockId].parent = id;
+        }
+        return id;
+    }
+
+    // --- Variable declaration/assignment support ---
     visitStatement(ctx) {
+        // Emit any line label comment that appears on this statement's starting line
+        try {
+            const line = ctx.start && ctx.start.line;
+            // Prefer a label comment on the same line as the statement.
+            if (line && this._lineComments && this._lineComments[line]) {
+                this._pendingLineLabel = { line, text: this._lineComments[line], type: 'command' };
+            } else if (line) {
+                // If no same-line label, search backwards for the nearest non-blank
+                // line and attach a single-line label comment that appears there.
+                try {
+                    let searchLine = line - 1;
+                    while (searchLine > 0) {
+                        const content = (this._sourceLines && this._sourceLines[searchLine - 1]) || '';
+                        if (content.trim() === '') {
+                            searchLine -= 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (searchLine > 0 && this._lineComments && this._lineComments[searchLine]) {
+                        this._pendingLineLabel = { line: searchLine, text: this._lineComments[searchLine], type: 'command' };
+                    }
+                } catch (e) { }
+            }
+            // If a block-style label was used, prefer to attach it in two ways:
+            // 1) If the block *contains* this statement (e.g. start... <statement> ...end),
+            //    attach the block text directly as a command label for the statement.
+            // 2) Otherwise, if a block ended immediately before this statement, attach
+            //    it as a function-style label (used for labeling function bodies).
+            if (line && this._blockComments && Array.isArray(this._blockComments)) {
+                // Prefer blocks that contain the statement line (innermost first)
+                let bestIdx = -1;
+                let bestSize = Infinity;
+                for (let i = 0; i < this._blockComments.length; i++) {
+                    const bc = this._blockComments[i];
+                    if (typeof bc.startLine === 'number' && typeof bc.endLine === 'number') {
+                        if (bc.startLine <= line && bc.endLine >= line) {
+                            const size = bc.endLine - bc.startLine;
+                            if (size < bestSize) {
+                                bestSize = size;
+                                bestIdx = i;
+                            }
+                        }
+                    }
+                }
+                if (bestIdx !== -1) {
+                    // Consume this blockComment and attach as a *function*-style label
+                    // so the block text becomes a labelFunction whose SUBSTACK is the statement.
+                    const bc = this._blockComments.splice(bestIdx, 1)[0];
+                    this._pendingLineLabel = { line, text: bc.text || '', type: 'function' };
+                } else {
+                    // Fallback: check for a block comment that ended immediately before this statement
+                    for (let i = 0; i < this._blockComments.length; i++) {
+                        const bc = this._blockComments[i];
+                        if (typeof bc.endLine === 'number' && bc.endLine === line - 1) {
+                            this._pendingLineLabel = { line, text: bc.text || '', type: 'function' };
+                            // remove consumed blockComment
+                            this._blockComments.splice(i, 1);
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (e) { }
         //console.log("visiting statement", this.getText(ctx));
         //console.log(ctx.children.length);
         //console.log("Statement children:", ctx.children.map(c => c.getText()));
@@ -102,7 +561,7 @@ class visitor extends LuaParserVisitor {
         ) {
             const funcnameCtx = ctx.children[1];
             const funcbodyCtx = ctx.children[2];
-            const funcName = funcnameCtx.getText();
+            const funcName = this.getText(funcnameCtx);
 
             // Special handling for main
             if (funcName === "main") {
@@ -138,12 +597,33 @@ class visitor extends LuaParserVisitor {
                             this.generator.blocks[currentExit].next == null
                         ) {
                             this.generator.blocks[currentExit].next = nextEntry;
+                            // Ensure the next block's parent matches the current block's parent
+                            try {
+                                const prevParent = this.generator.blocks[currentExit].parent ?? null;
+                                this.generator.blocks[nextEntry].parent = prevParent;
+                            } catch (e) {
+                                // ignore if something unexpected
+                            }
                         }
+                    }
+                }
+                // Post-process: ensure parent links along the chain are consistent
+                for (let i = 0; i < bodyBlockIds.length - 1; i++) {
+                    const current = bodyBlockIds[i];
+                    const next = bodyBlockIds[i + 1];
+                    const currentExit = current.exit ?? current;
+                    const nextEntry = next.entry ?? next;
+                    if (this.generator.blocks[currentExit] && this.generator.blocks[nextEntry]) {
+                        // set the next entry's parent to currentExit if not already set
+                        try {
+                            this.generator.blocks[nextEntry].parent = this.generator.blocks[nextEntry].parent || currentExit;
+                        } catch (e) { }
                     }
                 }
                 // Save for index.js to chain under flag
                 this.mainBodyBlockIds = bodyBlockIds;
                 // Do NOT emit any blocks for main itself
+                if (this._pendingLineLabel) this._pendingLineLabel = null;
                 return null;
             }
 
@@ -548,6 +1028,7 @@ class visitor extends LuaParserVisitor {
             // Handles both: for i = 1, 5 do ... end
             //           and for i = 1, 5, 2 do ... end
             const varName = ctx.children[1].getText();
+            const [baseName] = this.extractVarNameAndType(varName);
             const startExp = this.visitExp(ctx.children[3]);
             const endExp = this.visitExp(ctx.children[5]);
             let stepExp = 1;
@@ -560,9 +1041,9 @@ class visitor extends LuaParserVisitor {
             const bodyIds = this.visitBlock(ctx.children[bodyIdx]) || [];
 
             // --- Variable declaration for for-loop variable ---
-            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
-                this.variableScopes[varName] = "global";
-                this.addVariableToProject(varName, typeof startExp === "number" ? startExp : 0, "global");
+            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, baseName)) {
+                this.variableScopes[baseName] = "global";
+                this.addVariableToProject(baseName, typeof startExp === "number" ? startExp : 0, "global");
             }
 
             // Generate block IDs
@@ -572,7 +1053,7 @@ class visitor extends LuaParserVisitor {
             const changeId = this.generator.letterCount(this.generator.blockIdCounter++);
 
             // 1. Set variable to start
-            this.generator.addBlock({
+                this.generator.addBlock({
                 opcode: "data_setvariableto",
                 id: setVarId,
                 parent: null,
@@ -581,24 +1062,24 @@ class visitor extends LuaParserVisitor {
                     VALUE: [1, [10, typeof startExp === "number" ? String(startExp) : String(startExp)]]
                 },
                 fields: {
-                    VARIABLE: [varName, varName, ""]
+                    VARIABLE: [baseName, baseName, ""]
                 }
             });
 
             // 2. operator_gt (loop exit condition)
-            this.generator.addBlock({
+                this.generator.addBlock({
                 opcode: "operator_gt",
                 id: eqId,
                 parent: repeatId,
                 next: null,
                 inputs: {
-                    OPERAND1: [3, [12, varName, varName], [10, ""]],
+                    OPERAND1: [3, [12, baseName, baseName], [10, ""]],
                     OPERAND2: [1, [10, typeof endExp === "number" ? String(endExp) : String(endExp)]]
                 }
             });
 
             // 3. data_changevariableby (increment, supports custom step)
-            this.generator.addBlock({
+                this.generator.addBlock({
                 opcode: "data_changevariableby",
                 id: changeId,
                 parent: null,
@@ -607,7 +1088,7 @@ class visitor extends LuaParserVisitor {
                     VALUE: [1, [4, typeof stepExp === "number" ? String(stepExp) : String(stepExp)]]
                 },
                 fields: {
-                    VARIABLE: [varName, varName, ""]
+                    VARIABLE: [baseName, baseName, ""]
                 }
             });
 
@@ -663,6 +1144,160 @@ class visitor extends LuaParserVisitor {
                 expChild = ctx.children[3];
             } else {
                 varName = ctx.children[0].getText();
+                // Fallback: if the LHS text looks like a bracketed access (e.g. arr[2]) and
+                // earlier prefixexp-based handling didn't catch it, treat as a table-set
+                // operation instead of creating a variable named with brackets.
+                try {
+                    const brMatch = /^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$/.exec(varName);
+                    if (brMatch) {
+                        const base = brMatch[1];
+                        const keyRaw = brMatch[2];
+                        const valueExp = this.visitExp(ctx.children[2]);
+                        const keyNum = Number(keyRaw);
+                        if (!isNaN(keyNum)) {
+                            const zeroIndex = keyNum - 1;
+                            const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: "jgJSON_json_array_set",
+                                id: repId,
+                                parent: setId,
+                                next: null,
+                                inputs: [
+                                    this.wrapInput([12, base, base]),
+                                    this.wrapInput(zeroIndex),
+                                    this.wrapInput(valueExp)
+                                ]
+                            });
+                            this.generator.addBlock({
+                                opcode: "data_setvariableto",
+                                id: setId,
+                                parent: null,
+                                next: null,
+                                inputs: { VALUE: [3, repId, [10, ""]] },
+                                fields: { VARIABLE: [base, base, ""] }
+                            });
+                            return setId;
+                        } else {
+                            const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: "jgJSON_setValueToKeyInJSON",
+                                id: repId,
+                                parent: setId,
+                                next: null,
+                                inputs: [
+                                    this.wrapInput(valueExp),
+                                    this.wrapInput(keyRaw),
+                                    this.wrapInput([12, base, base])
+                                ]
+                            });
+                            this.generator.addBlock({
+                                opcode: "data_setvariableto",
+                                id: setId,
+                                parent: null,
+                                next: null,
+                                inputs: { VALUE: [3, repId, [10, ""]] },
+                                fields: { VARIABLE: [base, base, ""] }
+                            });
+                            return setId;
+                        }
+                    }
+                } catch (e) { }
+                // If the LHS text looks like a dotted or bracketed access (e.g. obj.c or arr[2])
+                // treat it as a setter rather than as a plain variable name.
+                try {
+                    if (typeof varName === 'string') {
+                        // dotted form: obj.c
+                        const dotMatch = /^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(varName);
+                        if (dotMatch) {
+                            const base = dotMatch[1];
+                            const key = dotMatch[2];
+                            const tableArg = this.wrapInput([12, base, base]);
+                            const literalKey = [1, [10, String(key)]];
+                            const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: "jgJSON_setValueToKeyInJSON",
+                                id: repId,
+                                parent: null,
+                                next: null,
+                                inputs: [
+                                    this.wrapInput(ctx.children[2] ? this.visitExp(ctx.children[2]) : ""),
+                                    literalKey,
+                                    tableArg
+                                ]
+                            });
+                            if (Array.isArray(tableArg) && tableArg[0] === 3 && typeof tableArg[1] === 'string' && this.generator.blocks[tableArg[1]]) this.generator.blocks[tableArg[1]].parent = repId;
+                            const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: 'data_setvariableto',
+                                id: setId,
+                                parent: null,
+                                next: null,
+                                inputs: { VALUE: [3, repId, [10, '']] },
+                                fields: { VARIABLE: [base, base, ''] }
+                            });
+                            try { this.generator.blocks[repId].parent = setId; } catch (e) { }
+                            return setId;
+                        }
+                        // bracketed form in string: arr[2]
+                        const brMatch = /^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$/.exec(varName);
+                        if (brMatch) {
+                            const base = brMatch[1];
+                            const keyRaw = brMatch[2];
+                            const keyNum = Number(keyRaw);
+                            const valueExpForLhs = this.visitExp(ctx.children[2]);
+                            if (!isNaN(keyNum)) {
+                                const zeroIndex = keyNum - 1;
+                                const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                this.generator.addBlock({
+                                    opcode: "jgJSON_json_array_set",
+                                    id: repId,
+                                    parent: setId,
+                                    next: null,
+                                    inputs: [
+                                        this.wrapInput([12, base, base]),
+                                        this.wrapInput(zeroIndex),
+                                        this.wrapInput(valueExpForLhs)
+                                    ]
+                                });
+                                this.generator.addBlock({
+                                    opcode: "data_setvariableto",
+                                    id: setId,
+                                    parent: null,
+                                    next: null,
+                                    inputs: { VALUE: [3, repId, [10, ""]] },
+                                    fields: { VARIABLE: [base, base, ""] }
+                                });
+                                return setId;
+                            } else {
+                                const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                this.generator.addBlock({
+                                    opcode: "jgJSON_setValueToKeyInJSON",
+                                    id: repId,
+                                    parent: setId,
+                                    next: null,
+                                    inputs: [
+                                        this.wrapInput(this.visitExp(ctx.children[2])),
+                                        this.wrapInput(keyRaw),
+                                        this.wrapInput([12, base, base])
+                                    ]
+                                });
+                                this.generator.addBlock({
+                                    opcode: "data_setvariableto",
+                                    id: setId,
+                                    parent: null,
+                                    next: null,
+                                    inputs: { VALUE: [3, repId, [10, ""]] },
+                                    fields: { VARIABLE: [base, base, ""] }
+                                });
+                                return setId;
+                            }
+                        }
+                    }
+                } catch (e) { }
                 op = ctx.children[1].getText();
                 expChild = ctx.children[2];
             }
@@ -676,24 +1311,28 @@ class visitor extends LuaParserVisitor {
                 case "^=": opcode = "operator_power"; break;
                 default: throw new CompilerError(`Unsupported compound assignment: ${op}`, ctx, this.source);
             }
-            // Variable declaration if needed
-            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
-                this.variableScopes[varName] = isLocal ? "local" : "global";
-                this.addVariableToProject(varName, 0, isLocal ? "local" : "global");
+            // Ensure we operate on the canonical base variable name
+            const [baseNameForCompound] = this.extractVarNameAndType(varName);
+            // Variable declaration if needed (use base name)
+            if (!Object.prototype.hasOwnProperty.call(this.variableScopes, baseNameForCompound)) {
+                this.variableScopes[baseNameForCompound] = isLocal ? "local" : "global";
+                this.addVariableToProject(baseNameForCompound, 0, isLocal ? "local" : "global");
             }
-            // Build the operator block
+            // Build the operator block. Use wrapInput so operands become proper input-shapes
             const opBlockId = this.generator.letterCount(this.generator.blockIdCounter++);
             const setBlockId = this.generator.letterCount(this.generator.blockIdCounter++);
-            //console.log(this.wrapInput(expResult));
+            const leftPlaceholder = [12, baseNameForCompound, baseNameForCompound];
+            const leftInput = this.wrapInput(leftPlaceholder);
+            const rightInput = this.wrapInput(expResult);
             this.generator.addBlock({
                 opcode,
                 id: opBlockId,
-                parent: setBlockId, // <-- Set parent to set block
+                parent: setBlockId,
                 next: null,
-                inputs: {
-                    NUM1: [3, [12, varName, varName], [10, ""]],
-                    NUM2: [1, [10, String(this.wrapInput(expResult))]]
-                }
+                inputs: [
+                    leftInput,
+                    rightInput
+                ],
             });
             // Set variable to result
             this.generator.addBlock({
@@ -705,7 +1344,7 @@ class visitor extends LuaParserVisitor {
                     VALUE: [3, opBlockId, [10, ""]]
                 },
                 fields: {
-                    VARIABLE: [varName, varName, ""]
+                    VARIABLE: [baseNameForCompound, baseNameForCompound, ""]
                 }
             });
             return setBlockId; // <-- Return the set block as the entry
@@ -717,100 +1356,1222 @@ class visitor extends LuaParserVisitor {
             ctx.children &&
             (
                 (ctx.children.length === 4 && ctx.children[0].getText() === "local") || // local x = ...
-                (ctx.children.length === 3 && ctx.children[1].getText() === "=") // x = ...
+                (ctx.children.length === 3 && ctx.children[1].getText() === "=" && !(ctx.children[0] && ctx.children[0].constructor && typeof ctx.children[0].constructor.name === 'string' && ctx.children[0].constructor.name.endsWith('PrefixexpContext'))) // x = ... but not prefixexp (so t[exp] = ... falls through)
             )
         ) {
             let isLocal = false;
-            let varName, valueExp;
+            let varName, valueExp, type = null;
             if (ctx.children.length === 4) {
                 // local x = ...
                 isLocal = true;
                 varName = ctx.children[1].getText();
+                if (ctx.children[1].typeAnnotation) {
+                    type = this.getTypeAnnotation(ctx.children[1]);
+                }
+                const [baseName, typeFromName] = this.extractVarNameAndType(varName);
                 const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
-                const expResult = this.visitExp(ctx.children[3], blockId); // <-- pass blockId
-                valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
+                const expResult = this.visitExp(ctx.children[3], blockId);
+                valueExp = expResult; // <--- use expResult directly!
 
-                // Check for redeclaration with different scope
-                if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
-                    if (
-                        (isLocal && this.variableScopes[varName] !== "local") ||
-                        (!isLocal && this.variableScopes[varName] !== "global")
-                    ) {
-                        throw new CompilerError(
-                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
-                        ctx,
-                        this.source
-                    );
-                    }
-                } else {
-                    // First declaration: add to project
-                    this.variableScopes[varName] = isLocal ? "local" : "global";
-                    this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
+                this.variableScopes[baseName] = isLocal ? "local" : "global";
+                // If the RHS is a numeric literal, use that as the initial value.
+                // If it's a table constructor, keep it as a real JS array/object so
+                // the project template stores it as structured data (not a JSON string).
+                const initialValue = (typeof valueExp === 'number') ? valueExp : (typeof valueExp === 'object' ? valueExp : 0);
+                // Infer type from the visited RHS when possible (including reporter blocks)
+                const inferredType = this.inferTypeFromValue(valueExp);
+                const effectiveType = type || typeFromName || inferredType;
+                this.addVariableToProject(baseName, initialValue, isLocal ? "local" : "global", effectiveType);
+
+                // If the valueExp is an object/array (table constructor), create a
+                // runtime setter so the assignment statement appears in the
+                // generated blocks. The project's variable entry was created with
+                // initial value 0 earlier; runtime code will perform the real
+                // assignment. Use `wrapInput` to safely serialize the literal.
+                if (typeof valueExp === 'object') {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: this.wrapInput(valueExp)
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
                 }
 
+                // If it's a block reference
+                if (Array.isArray(valueExp) && valueExp[0] === 3) {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: valueExp
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
+                }
+
+                // Otherwise, treat as direct value (number or string)
                 this.generator.addBlock({
                     opcode: "data_setvariableto",
                     id: blockId,
                     parent: null,
                     next: null,
-                    inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                    inputs: {
+                        VALUE: this.wrapInput(valueExp)
+                    },
                     fields: {
-                        VARIABLE: [varName, varName, ""]
+                        VARIABLE: [baseName, baseName, ""]
                     }
                 });
                 return blockId;
             } else {
                 // x = ...
-                varName = ctx.children[0].getText();
-                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
-                const expResult = this.visitExp(ctx.children[2], blockId); // <-- pass blockId
-                valueExp = Array.isArray(expResult) ? expResult[1] : expResult;
+                // Early textual check: if LHS looks like a literal bracketed or dotted access
+                // (e.g. arr[2] or obj.c) then handle as a setter immediately so we don't
+                // accidentally treat it as a plain variable assignment.
+                try {
+                    const lhsText = ctx.children[0] && ctx.children[0].getText ? ctx.children[0].getText() : '';
+                    if (lhsText && typeof lhsText === 'string') {
+                        // dotted form: obj.key
+                        const dotMatch = /^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(lhsText);
+                        if (dotMatch) {
+                            const base = dotMatch[1];
+                            const key = dotMatch[2];
+                            const valueExp = this.visitExp(ctx.children[2]);
+                            const tableArg = this.wrapInput([12, base, base]);
+                            const literalKey = [1, [10, String(key)]];
+                            const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: "jgJSON_setValueToKeyInJSON",
+                                id: repId,
+                                parent: null,
+                                next: null,
+                                inputs: [
+                                    this.wrapInput(valueExp),
+                                    literalKey,
+                                    tableArg
+                                ]
+                            });
+                            if (Array.isArray(tableArg) && tableArg[0] === 3 && typeof tableArg[1] === 'string' && this.generator.blocks[tableArg[1]]) this.generator.blocks[tableArg[1]].parent = repId;
+                            const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: "data_setvariableto",
+                                id: setId,
+                                parent: null,
+                                next: null,
+                                inputs: { VALUE: [3, repId, [10, ""]] },
+                                fields: { VARIABLE: [base, base, ""] }
+                            });
+                            try { this.generator.blocks[repId].parent = setId; } catch (e) { }
+                            return setId;
+                        }
+                        // bracketed form: arr[2] or arr[expr]
+                        const brMatch = /^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$/.exec(lhsText);
+                        if (brMatch) {
+                            const base = brMatch[1];
+                            const indexText = brMatch[2];
+                            const valueExp = this.visitExp(ctx.children[2]);
+                            let indexInput;
+                            const numericLiteral = /^\s*(\d+)\s*$/.exec(indexText);
+                            if (numericLiteral) {
+                                // literal numeric index: convert to zero-based immediately
+                                const idx = Number(numericLiteral[1]);
+                                indexInput = this.wrapInput(idx - 1);
+                            } else {
+                                // non-literal: try to obtain the index expression AST node
+                                // from the LHS prefix if available (safer than reparsing text).
+                                let indexExp = null;
+                                try {
+                                    const lhsNode = ctx.children[0];
+                                    // If LHS is a PrefixexpContext, find the bracket child and its exp
+                                    if (lhsNode && lhsNode.constructor && lhsNode.constructor.name && lhsNode.constructor.name.endsWith('PrefixexpContext') && lhsNode.children) {
+                                        const bracketIdx = lhsNode.children.findIndex(c => c && c.getText && c.getText() === '[');
+                                        if (bracketIdx !== -1 && lhsNode.children.length > bracketIdx + 1) {
+                                            const keyNode = lhsNode.children[bracketIdx + 1];
+                                            indexExp = this.visitExp(keyNode);
+                                        }
+                                    }
+                                } catch (e) {
+                                    indexExp = null;
+                                }
+                                // If we have an index expression reporter/value, subtract 1 at runtime
+                                if (indexExp) {
+                                    const subId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                    this.generator.addBlock({
+                                        opcode: "operator_subtract",
+                                        id: subId,
+                                        parent: null,
+                                        next: null,
+                                        inputs: {
+                                            NUM1: this.wrapInput(indexExp),
+                                            NUM2: this.wrapInput(1)
+                                        },
+                                        fields: {}
+                                    });
+                                    indexInput = [3, subId, [10, ""]];
+                                } else {
+                                    // No AST index expression was found here. Treat this as a hard
+                                    // failure instead of silently using a wrong index (0).
+                                    // The calling code should provide a proper PrefixexpContext
+                                    // so the index expression can be visited. Surface a clear
+                                    // compiler error instead of a silent heuristic.
+                                    throw new CompilerError(`Unable to resolve bracket index expression for LHS ${JSON.stringify(lhsText || '')}; ensure the LHS parses as a prefix expression`, ctx, this.source);
+                                }
+                            }
 
-                // Check for redeclaration with different scope
-                if (Object.prototype.hasOwnProperty.call(this.variableScopes, varName)) {
-                    if (
-                        (isLocal && this.variableScopes[varName] !== "local") ||
-                        (!isLocal && this.variableScopes[varName] !== "global")
-                    ) {
-                        throw new CompilerError(
-                        `Variable '${varName}' already declared as ${this.variableScopes[varName]}, cannot redeclare as ${isLocal ? "local" : "global"}`,
-                        ctx,
-                        this.source
-                    );
+                            const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: "jgJSON_json_array_set",
+                                id: repId,
+                                parent: setId,
+                                next: null,
+                                inputs: [
+                                    this.wrapInput([12, base, base]),
+                                    indexInput,
+                                    this.wrapInput(valueExp)
+                                ]
+                            });
+                            this.generator.addBlock({
+                                opcode: "data_setvariableto",
+                                id: setId,
+                                parent: null,
+                                next: null,
+                                inputs: { VALUE: [3, repId, [10, ""]] },
+                                fields: { VARIABLE: [base, base, ""] }
+                            });
+                            return setId;
+                        }
                     }
-                } else {
-                    // First declaration: add to project
-                    this.variableScopes[varName] = isLocal ? "local" : "global";
-                    this.addVariableToProject(varName, typeof valueExp === "number" ? valueExp : 0, isLocal ? "local" : "global");
+                } catch (e) { }
+                // If LHS is a prefixexp containing bracket-notation (e.g. arr[2] = ...),
+                // handle it as a table/set operation instead of creating a variable named "arr[2]".
+                const lhsNode = ctx.children[0];
+                // Accept either a PrefixexpContext or an ExpContext wrapping a PrefixexpContext
+                let prefixCandidate = null;
+                if (lhsNode && lhsNode.constructor && lhsNode.constructor.name) {
+                    if (lhsNode.constructor.name.endsWith("PrefixexpContext")) prefixCandidate = lhsNode;
+                    else if (lhsNode.constructor.name.endsWith("ExpContext") && lhsNode.children && lhsNode.children[0] && lhsNode.children[0].constructor && lhsNode.children[0].constructor.name && lhsNode.children[0].constructor.name.endsWith("PrefixexpContext")) {
+                        prefixCandidate = lhsNode.children[0];
+                    }
+                }
+                if (prefixCandidate) {
+                    // Robustly find a '[' child anywhere in the prefixexp children
+                    if (prefixCandidate.children) {
+                        const bracketIndex = prefixCandidate.children.findIndex(c => c && c.getText && c.getText() === '[');
+                        if (bracketIndex !== -1 && prefixCandidate.children.length > bracketIndex + 1) {
+                            const tableVarNode = prefixCandidate.children[0];
+                            const keyNode = prefixCandidate.children[bracketIndex + 1];
+                            const tableVar = (tableVarNode && tableVarNode.constructor && tableVarNode.constructor.name && tableVarNode.constructor.name.endsWith("PrefixexpContext")) ?
+                                this.visitPrefixexp(tableVarNode, null) :
+                                this.visitExp(tableVarNode, null);
+                            const valueExp = this.visitExp(ctx.children[2]);
+                            const key = this.visitExp(keyNode);
+
+                            if (!isNaN(Number(key))) {
+                                const zeroIndex = Number(key) - 1;
+                                const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                this.generator.addBlock({
+                                    opcode: "jgJSON_json_array_set",
+                                    id: repId,
+                                    parent: setId,
+                                    next: null,
+                                    inputs: [
+                                        this.wrapInput(tableVar),
+                                        this.wrapInput(zeroIndex),
+                                        this.wrapInput(valueExp)
+                                    ]
+                                });
+                                if (Array.isArray(tableVar) && tableVar[0] === 3 && typeof tableVar[1] === 'string' && this.generator.blocks[tableVar[1]]) this.generator.blocks[tableVar[1]].parent = repId;
+                                if (Array.isArray(valueExp) && valueExp[0] === 3 && typeof valueExp[1] === 'string' && this.generator.blocks[valueExp[1]]) this.generator.blocks[valueExp[1]].parent = repId;
+                                // Resolve base variable from tableVar for wrapping
+                                let baseVar = null;
+                                try {
+                                    if (Array.isArray(tableVar) && tableVar[0] === 12) baseVar = tableVar[1];
+                                    else if (Array.isArray(tableVar) && tableVar[0] === 3) {
+                                        const bid = tableVar[1];
+                                        const blk = this.generator.blocks[bid];
+                                        if (blk && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseVar = blk.fields.VARIABLE[0];
+                                    }
+                                } catch (e) { baseVar = null; }
+                                if (!baseVar) throw new CompilerError('Cannot determine base variable for array set operation', ctx, this.source);
+                                this.generator.addBlock({
+                                    opcode: 'data_setvariableto',
+                                    id: setId,
+                                    parent: null,
+                                    next: null,
+                                    inputs: { VALUE: [3, repId, [10, '']] },
+                                    fields: { VARIABLE: [baseVar, baseVar, ''] }
+                                });
+                                return setId;
+                            } else {
+                                const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                this.generator.addBlock({
+                                    opcode: "jgJSON_setValueToKeyInJSON",
+                                    id: repId,
+                                    parent: setId,
+                                    next: null,
+                                    inputs: [
+                                        this.wrapInput(valueExp),
+                                        this.wrapInput(key),
+                                        this.wrapInput(tableVar)
+                                    ]
+                                });
+                                if (Array.isArray(tableVar) && tableVar[0] === 3 && typeof tableVar[1] === 'string' && this.generator.blocks[tableVar[1]]) this.generator.blocks[tableVar[1]].parent = repId;
+                                if (Array.isArray(valueExp) && valueExp[0] === 3 && typeof valueExp[1] === 'string' && this.generator.blocks[valueExp[1]]) this.generator.blocks[valueExp[1]].parent = repId;
+                                // Attempt to find a base variable name for wrapping; if not found, surface error
+                                let baseVar = null;
+                                try {
+                                    if (Array.isArray(tableVar) && tableVar[0] === 12) baseVar = tableVar[1];
+                                    else if (Array.isArray(tableVar) && tableVar[0] === 3) {
+                                        const bid = tableVar[1];
+                                        const blk = this.generator.blocks[bid];
+                                        if (blk && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseVar = blk.fields.VARIABLE[0];
+                                    } else if (typeof tableVar === 'string') {
+                                        // string placeholder may be a var name
+                                        const m = /^([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(tableVar);
+                                        if (m) baseVar = m[1];
+                                    }
+                                } catch (e) { baseVar = null; }
+                                if (!baseVar) throw new CompilerError('Cannot determine base variable for table set operation', ctx, this.source);
+                                this.generator.addBlock({
+                                    opcode: 'data_setvariableto',
+                                    id: setId,
+                                    parent: null,
+                                    next: null,
+                                    inputs: { VALUE: [3, repId, [10, '']] },
+                                    fields: { VARIABLE: [baseVar, baseVar, ''] }
+                                });
+                                return setId;
+                            }
+                        }
+                    }
+                }
+                varName = ctx.children[0].getText();
+                if (ctx.children[0].typeAnnotation) {
+                    type = this.getTypeAnnotation(ctx.children[0]);
+                }
+                const [baseName, typeFromName] = this.extractVarNameAndType(varName);
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const expResult = this.visitExp(ctx.children[2], blockId);
+                valueExp = expResult; // <--- use expResult directly!
+
+                this.variableScopes[baseName] = isLocal ? "local" : "global";
+                const initialValue = (typeof valueExp === 'number') ? valueExp : (typeof valueExp === 'object' ? valueExp : 0);
+                const inferredType = this.inferTypeFromValue(valueExp);
+                const effectiveType = type || typeFromName || inferredType;
+                this.addVariableToProject(baseName, initialValue, isLocal ? "local" : "global", effectiveType);
+
+                // If the valueExp is an object/array (table constructor), emit a
+                // runtime setter so the statement is visible in the blocks.
+                if (typeof valueExp === 'object') {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: this.wrapInput(valueExp)
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
                 }
 
+                // If it's a block reference
+                if (Array.isArray(valueExp) && valueExp[0] === 3) {
+                    this.generator.addBlock({
+                        opcode: "data_setvariableto",
+                        id: blockId,
+                        parent: null,
+                        next: null,
+                        inputs: {
+                            VALUE: valueExp
+                        },
+                        fields: {
+                            VARIABLE: [baseName, baseName, ""]
+                        }
+                    });
+                    return blockId;
+                }
+
+                // Otherwise, treat as direct value (number or string)
                 this.generator.addBlock({
                     opcode: "data_setvariableto",
                     id: blockId,
                     parent: null,
                     next: null,
-                    inputs: [null, this.wrapInput(typeof valueExp === "number" ? valueExp : [String(valueExp)])],
+                    inputs: {
+                        VALUE: this.wrapInput(valueExp)
+                    },
                     fields: {
-                        VARIABLE: [varName, varName, ""]
+                        VARIABLE: [baseName, baseName, ""]
                     }
                 });
                 return blockId;
             }
         }
+        // Handle assignments where LHS is a Varlist containing a var that is a prefixexp
+        // Example AST: (statement (varlist (var (prefixexp arr) [ (exp (number 2)) ])) = (explist ...))
+        // Normalize this case to the Prefixexp handling below so bracket/dot LHS produce setter blocks.
+        if (
+            ctx.children &&
+            ctx.children.length === 3 &&
+            ctx.children[1] && ctx.children[1].getText && ctx.children[1].getText() === '=' &&
+            ctx.children[0] && ctx.children[0].children
+        ) {
+            try {
+                // Look for a 'var' child inside the varlist whose first child is a PrefixexpContext
+                const varlistNode = ctx.children[0];
+                const varChild = varlistNode.children.find(c => c && c.constructor && c.constructor.name && c.constructor.name.endsWith('VarContext')) || null;
+                if (varChild && varChild.children && varChild.children.length > 0) {
+                    const possiblePrefix = varChild.children[0];
+                    if (possiblePrefix && possiblePrefix.constructor && possiblePrefix.constructor.name && possiblePrefix.constructor.name.endsWith('PrefixexpContext')) {
+                        // Reuse the same logic as the PrefixexpContext branch below by treating
+                        // this var's prefix node as the prefixexp for assignment.
+                        const prefixexp = possiblePrefix;
+                        if (prefixexp.children) {
+                            const bracketIndex = prefixexp.children.findIndex(c => c && c.getText && c.getText() === '[');
+                            if (bracketIndex !== -1 && prefixexp.children.length > bracketIndex + 1) {
+                                const tableVarNode = prefixexp.children[0];
+                                const keyNode = prefixexp.children[bracketIndex + 1];
+                                const tableVar = (tableVarNode && tableVarNode.constructor && tableVarNode.constructor.name && tableVarNode.constructor.name.endsWith("PrefixexpContext")) ?
+                                    this.visitPrefixexp(tableVarNode, null) : this.visitExp(tableVarNode, null);
+                                const valueExp = this.visitExp(ctx.children[2]);
+                                const key = this.visitExp(keyNode);
+
+                                if (!isNaN(Number(key))) {
+                                    const zeroIndex = Number(key) - 1;
+                                    // Resolve base variable from tableVar for wrapping
+                                    let baseVar = null;
+                                    try {
+                                        if (Array.isArray(tableVar) && tableVar[0] === 12) baseVar = tableVar[1];
+                                        else if (Array.isArray(tableVar) && tableVar[0] === 3) {
+                                            const bid = tableVar[1];
+                                            const blk = this.generator.blocks[bid];
+                                            if (blk && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseVar = blk.fields.VARIABLE[0];
+                                        }
+                                    } catch (e) { baseVar = null; }
+                                    if (!baseVar) throw new CompilerError('Cannot determine base variable for array set operation', ctx, this.source);
+                                    const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                    const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                    this.generator.addBlock({
+                                        opcode: "jgJSON_json_array_set",
+                                        id: repId,
+                                        parent: setId,
+                                        next: null,
+                                        inputs: [
+                                            this.wrapInput(tableVar),
+                                            this.wrapInput(zeroIndex),
+                                            this.wrapInput(valueExp)
+                                        ]
+                                    });
+                                    if (Array.isArray(tableVar) && tableVar[0] === 3 && typeof tableVar[1] === 'string' && this.generator.blocks[tableVar[1]]) this.generator.blocks[tableVar[1]].parent = repId;
+                                    if (Array.isArray(valueExp) && valueExp[0] === 3 && typeof valueExp[1] === 'string' && this.generator.blocks[valueExp[1]]) this.generator.blocks[valueExp[1]].parent = repId;
+                                    this.generator.addBlock({
+                                        opcode: 'data_setvariableto',
+                                        id: setId,
+                                        parent: null,
+                                        next: null,
+                                        inputs: { VALUE: [3, repId, [10, '']] },
+                                        fields: { VARIABLE: [baseVar, baseVar, ''] }
+                                    });
+                                    return setId;
+                                } else {
+                                    // Attempt to find a base variable name for wrapping; if not found, surface error
+                                    let baseVar = null;
+                                    try {
+                                        if (Array.isArray(tableVar) && tableVar[0] === 12) baseVar = tableVar[1];
+                                        else if (Array.isArray(tableVar) && tableVar[0] === 3) {
+                                            const bid = tableVar[1];
+                                            const blk = this.generator.blocks[bid];
+                                            if (blk && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseVar = blk.fields.VARIABLE[0];
+                                        } else if (typeof tableVar === 'string') {
+                                            const m = /^([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(tableVar);
+                                            if (m) baseVar = m[1];
+                                        }
+                                    } catch (e) { baseVar = null; }
+                                    if (!baseVar) throw new CompilerError('Cannot determine base variable for table set operation', ctx, this.source);
+                                    const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                    const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                    this.generator.addBlock({
+                                        opcode: "jgJSON_setValueToKeyInJSON",
+                                        id: repId,
+                                        parent: setId,
+                                        next: null,
+                                        inputs: [
+                                            this.wrapInput(valueExp),
+                                            this.wrapInput(key),
+                                            this.wrapInput(tableVar)
+                                        ]
+                                    });
+                                    if (Array.isArray(tableVar) && tableVar[0] === 3 && typeof tableVar[1] === 'string' && this.generator.blocks[tableVar[1]]) this.generator.blocks[tableVar[1]].parent = repId;
+                                    if (Array.isArray(valueExp) && valueExp[0] === 3 && typeof valueExp[1] === 'string' && this.generator.blocks[valueExp[1]]) this.generator.blocks[valueExp[1]].parent = repId;
+                                    this.generator.addBlock({
+                                        opcode: 'data_setvariableto',
+                                        id: setId,
+                                        parent: null,
+                                        next: null,
+                                        inputs: { VALUE: [3, repId, [10, '']] },
+                                        fields: { VARIABLE: [baseVar, baseVar, ''] }
+                                    });
+                                    return setId;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e) { }
+        }
+
+        // Handle t[exp] = value (array/object set)
+        if (
+            ctx.children &&
+            ctx.children.length === 3 &&
+            ctx.children[0].constructor &&
+            ctx.children[0].constructor.name === "PrefixexpContext" &&
+            ctx.children[1].getText() === '='
+        ) {
+            const prefixexp = ctx.children[0];
+            // Robustly find a '[' child anywhere in the prefixexp children
+            if (prefixexp.children) {
+                const bracketIndex = prefixexp.children.findIndex(c => c && c.getText && c.getText() === '[');
+                if (bracketIndex !== -1 && prefixexp.children.length > bracketIndex + 1) {
+                    const tableVarNode = prefixexp.children[0];
+                    const keyNode = prefixexp.children[bracketIndex + 1];
+                    const tableVar = (tableVarNode && tableVarNode.constructor && tableVarNode.constructor.name && tableVarNode.constructor.name.endsWith("PrefixexpContext")) ?
+                        this.visitPrefixexp(tableVarNode, null) :
+                        this.visitExp(tableVarNode, null);
+                    const valueExp = this.visitExp(ctx.children[2]);
+                    const key = this.visitExp(keyNode);
+
+                    if (!isNaN(Number(key))) {
+                        const zeroIndex = Number(key) - 1;
+                        // Resolve base variable from tableVar for wrapping
+                        let baseVar = null;
+                        try {
+                            if (Array.isArray(tableVar) && tableVar[0] === 12) baseVar = tableVar[1];
+                            else if (Array.isArray(tableVar) && tableVar[0] === 3) {
+                                const bid = tableVar[1];
+                                const blk = this.generator.blocks[bid];
+                                if (blk && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseVar = blk.fields.VARIABLE[0];
+                            }
+                        } catch (e) { baseVar = null; }
+                        if (!baseVar) throw new CompilerError('Cannot determine base variable for array set operation', ctx, this.source);
+                        const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: "jgJSON_json_array_set",
+                            id: repId,
+                            parent: setId,
+                            next: null,
+                            inputs: [
+                                this.wrapInput(tableVar),
+                                this.wrapInput(zeroIndex),
+                                this.wrapInput(valueExp)
+                            ]
+                        });
+                        // parent any referenced reporter inputs
+                        if (Array.isArray(tableVar) && tableVar[0] === 3 && typeof tableVar[1] === 'string' && this.generator.blocks[tableVar[1]]) this.generator.blocks[tableVar[1]].parent = repId;
+                        if (Array.isArray(valueExp) && valueExp[0] === 3 && typeof valueExp[1] === 'string' && this.generator.blocks[valueExp[1]]) this.generator.blocks[valueExp[1]].parent = repId;
+                        this.generator.addBlock({
+                            opcode: 'data_setvariableto',
+                            id: setId,
+                            parent: null,
+                            next: null,
+                            inputs: { VALUE: [3, repId, [10, '']] },
+                            fields: { VARIABLE: [baseVar, baseVar, ''] }
+                        });
+                        return setId;
+                    } else {
+                        // Attempt to find a base variable name for wrapping; if not found, surface error
+                        let baseVar = null;
+                        try {
+                            if (Array.isArray(tableVar) && tableVar[0] === 12) baseVar = tableVar[1];
+                            else if (Array.isArray(tableVar) && tableVar[0] === 3) {
+                                const bid = tableVar[1];
+                                const blk = this.generator.blocks[bid];
+                                if (blk && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseVar = blk.fields.VARIABLE[0];
+                            } else if (typeof tableVar === 'string') {
+                                const m = /^([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(tableVar);
+                                if (m) baseVar = m[1];
+                            }
+                        } catch (e) { baseVar = null; }
+                        if (!baseVar) throw new CompilerError('Cannot determine base variable for table set operation', ctx, this.source);
+                        const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        const repId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: "jgJSON_setValueToKeyInJSON",
+                            id: repId,
+                            parent: setId,
+                            next: null,
+                            inputs: [
+                                this.wrapInput(valueExp),
+                                this.wrapInput(key),
+                                this.wrapInput(tableVar)
+                            ]
+                        });
+                        if (Array.isArray(tableVar) && tableVar[0] === 3 && typeof tableVar[1] === 'string' && this.generator.blocks[tableVar[1]]) this.generator.blocks[tableVar[1]].parent = repId;
+                        if (Array.isArray(valueExp) && valueExp[0] === 3 && typeof valueExp[1] === 'string' && this.generator.blocks[valueExp[1]]) this.generator.blocks[valueExp[1]].parent = repId;
+                        this.generator.addBlock({
+                            opcode: 'data_setvariableto',
+                            id: setId,
+                            parent: null,
+                            next: null,
+                            inputs: { VALUE: [3, repId, [10, '']] },
+                            fields: { VARIABLE: [baseVar, baseVar, ''] }
+                        });
+                        return setId;
+                    }
+                }
+            }
+        }
 
         // fallback to default
         let x = this.visitChildren(ctx);
+        // If a pending line label was set for this statement, attach it before returned block
+        try {
+            if (this._pendingLineLabel && x) {
+                const pending = this._pendingLineLabel;
+                this._pendingLineLabel = null;
+                const retId = x instanceof Array ? x[0] : x;
+                    if (retId && this.generator.blocks[retId]) {
+                    const labId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    if (pending.type === 'function') {
+                        // emit a labelFunction and set its SUBSTACK to the returned block
+                        this.generator.addBlock({
+                            opcode: 'jwProto_labelFunction',
+                            id: labId,
+                            parent: null,
+                            next: null,
+                            shadow: false,
+                            topLevel: false,
+                            inputs: { LABEL: [1, [10, pending.text]] },
+                        });
+                        this.generator.blocks[labId].inputs = this.generator.blocks[labId].inputs || {};
+                        this.generator.blocks[labId].inputs.SUBSTACK = [2, retId];
+                        this.generator.blocks[retId].parent = labId;
+                    } else {
+                        // Attach labelCommand directly to the statement, not to the function definition
+                        this.generator.addBlock({
+                            opcode: 'jwProto_labelCommand',
+                            id: labId,
+                            parent: null,
+                            next: null,
+                            shadow: false,
+                            topLevel: false,
+                            inputs: { LABEL: [1, [10, pending.text]] }
+                        });
+                        // Parent the statement to the label block
+                        this.generator.blocks[retId].parent = labId;
+                        // Do not chain labelCommand to function definition; let function body chain start at label block
+                    }
+                    return labId;
+                }
+            }
+        } catch (e) { }
         return x instanceof Array ? x[0] : x;
     }
-    visitConcatenation(ctx) {}
-    // Helper to wrap block references for input arrays
-    wrapInput(val) {
-        if (Array.isArray(val) && val[0] === 3) return [val[1]];
-        if (typeof val === "string" && this.generator.blocks[val]) return [val];
-        return val;
-    }
+    visitConcatenation(ctx) { }
     visitFunctioncall(ctx, asReporter = false) {
-        const funcName = this.getText(ctx.NAME ? ctx.NAME(0) : ctx);
+        let funcName = null;
+        try {
+            if (ctx && ctx.NAME && typeof ctx.NAME === 'function' && ctx.NAME(0) && typeof ctx.NAME(0).getText === 'function') {
+                funcName = ctx.NAME(0).getText();
+            } else {
+                funcName = this.getText ? this.getText(ctx) : (ctx && ctx.getText ? ctx.getText() : null);
+            }
+        } catch (e) {
+            funcName = this.getText(ctx);
+        }
+        // If this call corresponds to a hat block and is used as a statement with
+        // an inline function argument, emit a top-level hat block whose SUBSTACK
+        // is the function body. This allows Lua to register event handlers like
+        // `event_whenkeypressed('a', function() ... end)`.
+        try {
+            const pb = processedBlocks[funcName];
+            if (pb && pb[1] === 'hat') {
+                // Only handle in statement context (not as reporter)
+                if (!asReporter && ctx.args && ctx.args(0) && ctx.args(0).explist) {
+                    const explist = ctx.args(0).explist(0);
+                    const exps = explist && explist.exp ? explist.exp() : [];
+                    if (exps.length > 0) {
+                        const lastExp = exps[exps.length - 1];
+                        // Check if lastExp is a function definition
+                        if (lastExp && typeof lastExp.functiondef === 'function' && lastExp.functiondef()) {
+                            // Build the hat block inputs/fields from earlier args (excluding last)
+                            const inputMeta = pb[0] || [];
+                            const inputArr = [];
+                            const fieldsObj = {};
+                            for (let i = 0; i < inputMeta.length; i++) {
+                                const meta = inputMeta[i] || {};
+                                const expNode = exps[i];
+                                // set current argument index so wrapInput can pick up inline labels
+                                this._currentArgIndex = i + 1;
+                                const val = expNode ? this.visitExp(expNode, null, true) : "";
+                                if (meta.field) {
+                                    // put into fields (strip surrounding quotes if present)
+                                    const fieldName = meta.field;
+                                    let fieldVal = typeof val === 'string' ? val : (Array.isArray(val) && val[0] === 1 ? (val[1] && val[1][1]) : '');
+                                    if (typeof fieldVal === 'string' && (/^".*"$/.test(fieldVal) || /^'.*'$/.test(fieldVal))) {
+                                        fieldVal = fieldVal.slice(1, -1);
+                                    }
+                                    fieldsObj[fieldName] = [fieldVal, fieldVal, ""];
+                                    this._currentArgIndex = null;
+                                } else {
+                                    // wrapInput while currentArgIndex is still set
+                                    const wrapped = this.wrapInput(val);
+                                    this._currentArgIndex = null;
+                                    inputArr.push(wrapped);
+                                }
+                            }
+
+                            // Visit the function body to collect statements
+                            const funcDef = lastExp.functiondef();
+                            const funcBodyBlock = funcDef.funcbody ? funcDef.funcbody() : null;
+                            let bodyBlockIds = [];
+                            let firstStmtNode = null;
+                            if (funcBodyBlock && funcBodyBlock.block) {
+                                const blk = funcBodyBlock.block();
+                                if (blk && blk.children) {
+                                    for (const child of blk.children) {
+                                        if (child.constructor && child.constructor.name.endsWith('StatementContext')) {
+                                            if (!firstStmtNode) firstStmtNode = child;
+                                            const stmtId = this.visit(child);
+                                            if (stmtId) bodyBlockIds.push(stmtId);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Add the hat block as top-level
+                            const hatId = this.generator.letterCount(this.generator.blockIdCounter++);
+                            this.generator.addBlock({
+                                opcode: funcName,
+                                id: hatId,
+                                parent: null,
+                                next: null,
+                                inputs: inputArr,
+                                fields: fieldsObj,
+                                shadow: false,
+                                topLevel: true,
+                            });
+
+                            // Detect inline/block labels that sit immediately before the first statement of the function body
+                            let labelFunctionId = null;
+                            let pendingLabelCommandText = null;
+                            // Prefer explicit pending label (set earlier on the outer statement), otherwise inspect parsed comments
+                            if (this._pendingLineLabel && this._pendingLineLabel.type === 'function') {
+                                const pendingText = this._pendingLineLabel.text;
+                                labelFunctionId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                this.generator.addBlock({
+                                    opcode: 'jwProto_labelFunction',
+                                    id: labelFunctionId,
+                                    parent: hatId,
+                                    next: null,
+                                    shadow: false,
+                                    topLevel: false,
+                                    inputs: { LABEL: [1, [10, pendingText]] },
+                                });
+                                this._pendingLineLabel = null;
+                            } else if (!labelFunctionId && firstStmtNode) {
+                                try {
+                                    const firstLine = firstStmtNode.start && firstStmtNode.start.line;
+                                    // Check for a multiline block comment that contains the first statement line
+                                    if (firstLine && this._blockComments && Array.isArray(this._blockComments)) {
+                                        // Prefer the innermost block (smallest range) that contains firstLine
+                                        let bestIdx = -1;
+                                        let bestSize = Infinity;
+                                        for (let i = 0; i < this._blockComments.length; i++) {
+                                            const bc = this._blockComments[i];
+                                            if (bc && typeof bc.startLine === 'number' && typeof bc.endLine === 'number') {
+                                                if (bc.startLine <= firstLine && bc.endLine >= firstLine) {
+                                                    const size = bc.endLine - bc.startLine;
+                                                    if (size < bestSize) {
+                                                        bestSize = size;
+                                                        bestIdx = i;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (bestIdx !== -1) {
+                                            const bc = this._blockComments[bestIdx];
+                                            const pendingText = bc.text || '';
+                                            labelFunctionId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                            this.generator.addBlock({
+                                                opcode: 'jwProto_labelFunction',
+                                                id: labelFunctionId,
+                                                parent: hatId,
+                                                next: null,
+                                                shadow: false,
+                                                topLevel: false,
+                                                inputs: { LABEL: [1, [10, pendingText]] },
+                                            });
+                                            // remove this blockComment so it is not reused
+                                            this._blockComments.splice(bestIdx, 1);
+                                        }
+                                    }
+                                    // If no block comment matched, check for a single-line label preceding the first statement
+                                    // Search backwards from firstLine-1 skipping blank lines so a label with an intervening blank line still attaches.
+                                    if (!labelFunctionId && firstLine && this._lineComments) {
+                                        let searchLine = firstLine - 1;
+                                        while (searchLine > 0) {
+                                            const content = (this._sourceLines && this._sourceLines[searchLine - 1]) || '';
+                                            if (content.trim() === '') {
+                                                // skip blank lines
+                                                searchLine -= 1;
+                                                continue;
+                                            }
+                                            // stop at the first non-blank line (it may or may not be a label comment)
+                                            break;
+                                        }
+                                        if (searchLine > 0 && this._lineComments[searchLine]) {
+                                            // Defer creating the labelCommand until chaining so its placement
+                                            // does not depend on creation order of the body blocks.
+                                            pendingLabelCommandText = this._lineComments[searchLine];
+                                            // remove the consumed line comment so it isn't reused
+                                            delete this._lineComments[searchLine];
+                                        }
+                                    }
+                                } catch (e) { }
+                            }
+
+                            // Chain and parent the child's blocks under the hat: set hat.next to either the labelFunction (if created)
+                            // or to the first entry in the body. Also set the SUBSTACK input of the labelFunction to the first entry.
+                            if (bodyBlockIds.length > 0) {
+                                const firstEntry = bodyBlockIds[0].entry ?? bodyBlockIds[0];
+                                if (labelFunctionId) {
+                                    // hat -> labelFunction -> SUBSTACK -> firstEntry
+                                    if (this.generator.blocks[hatId]) this.generator.blocks[hatId].next = labelFunctionId;
+                                    if (this.generator.blocks[labelFunctionId]) {
+                                        this.generator.blocks[labelFunctionId].parent = hatId;
+                                        // set SUBSTACK input to point to firstEntry
+                                        this.generator.blocks[labelFunctionId].inputs = this.generator.blocks[labelFunctionId].inputs || {};
+                                        this.generator.blocks[labelFunctionId].inputs.SUBSTACK = [2, firstEntry];
+                                    }
+                                    // Parent the first statement to the labelFunction
+                                    if (this.generator.blocks[firstEntry]) this.generator.blocks[firstEntry].parent = labelFunctionId;
+                                } else if (pendingLabelCommandText) {
+                                    // Create the jwProto_labelCommand now (after body has been created)
+                                    const labId = this.generator.letterCount(this.generator.blockIdCounter++);
+                                    this.generator.addBlock({
+                                        opcode: 'jwProto_labelCommand',
+                                        id: labId,
+                                        parent: hatId,
+                                        next: null,
+                                        shadow: false,
+                                        topLevel: false,
+                                        inputs: { LABEL: [1, [10, pendingLabelCommandText]] }
+                                    });
+                                    // link into chain: hat -> labId -> SUBSTACK -> firstEntry
+                                    if (this.generator.blocks[hatId]) this.generator.blocks[hatId].next = labId;
+                                    if (this.generator.blocks[labId]) {
+                                        this.generator.blocks[labId].parent = hatId;
+                                        this.generator.blocks[labId].inputs = this.generator.blocks[labId].inputs || {};
+                                        this.generator.blocks[labId].inputs.SUBSTACK = [2, firstEntry];
+                                        // Ensure the labelCommand chains into the first entry so it visually wraps the substack
+                                        this.generator.blocks[labId].next = firstEntry;
+                                    }
+                                    if (this.generator.blocks[firstEntry]) this.generator.blocks[firstEntry].parent = labId;
+                                    // clear the pending text
+                                    pendingLabelCommandText = null;
+                                } else {
+                                    // No labelFunction: hat -> firstEntry
+                                    if (this.generator.blocks[hatId]) this.generator.blocks[hatId].next = firstEntry;
+                                    if (this.generator.blocks[firstEntry]) this.generator.blocks[firstEntry].parent = hatId;
+                                }
+
+                                // Chain subsequent statements
+                                for (let i = 0; i < bodyBlockIds.length - 1; i++) {
+                                    const cur = bodyBlockIds[i];
+                                    const nxt = bodyBlockIds[i + 1];
+                                    const curExit = cur.exit ?? cur;
+                                    const nextEntry = nxt.entry ?? nxt;
+                                    if (this.generator.blocks[curExit]) this.generator.blocks[curExit].next = nextEntry;
+                                    // Keep parent of nextEntry as the previous block's exit (so nesting is regular)
+                                    if (this.generator.blocks[nextEntry]) this.generator.blocks[nextEntry].parent = curExit;
+                                }
+                            }
+                            return hatId;
+                        }
+                    }
+                }
+            }
+        } catch (e) { }
+        // Detect method-style calls like table.insert / table.remove / table.concat
+        let methodFullName = null;
+        try {
+            // Prefer explicit NAME tokens if present (e.g. simple calls)
+            if (ctx.NAME && typeof ctx.NAME === 'function' && ctx.NAME(0)) {
+                const firstName = ctx.NAME(0).getText();
+                // If there's a dot in the NAME token, use it
+                if (firstName && firstName.includes('.')) methodFullName = firstName;
+            }
+            // Otherwise, inspect the callee prefixexp (covers method-style prefixes)
+            if (!methodFullName && ctx && ctx.children && ctx.children.length > 0) {
+                const calleeNode = ctx.children[0];
+                // If calleeNode is a PrefixexpContext, try to extract a dotted name
+                if (calleeNode && calleeNode.constructor && calleeNode.constructor.name === 'PrefixexpContext') {
+                    // calleeNode.getText() may include the args; strip trailing args if present
+                    const txt = calleeNode.getText ? calleeNode.getText() : null;
+                    if (txt && txt.includes('.')) {
+                        // The prefixexp text can be like "table.concat" or "table.concat(args)"; strip parentheses
+                        const match = /^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)/.exec(txt);
+                        if (match) methodFullName = match[1];
+                    }
+                } else if (calleeNode && calleeNode.getText && typeof calleeNode.getText === 'function') {
+                    const txt = calleeNode.getText();
+                    if (txt && txt.includes('.')) {
+                        const match = /^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)/.exec(txt);
+                        if (match) methodFullName = match[1];
+                    }
+                }
+            }
+        } catch (e) {
+            methodFullName = null;
+        }
+        // Final fallback: scan the full ctx text for a dotted callee (covers nested/parenthesized forms)
+        if (!methodFullName) {
+            try {
+                const fullTxt = this.getText(ctx);
+                if (fullTxt) {
+                    const match = /^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)/.exec(fullTxt);
+                    if (match) methodFullName = match[1];
+                }
+            } catch (e) {
+                /* ignore */
+            }
+        }
+
+        // Handle table.* helpers (array operations) and method-style calls (a:insert)
+        if (methodFullName && (methodFullName === 'table.insert' || methodFullName === 'table.remove' || methodFullName === 'table.concat' || /[:\.]/.test(methodFullName))) {
+            // collect args
+            const argsCtx = ctx.args && ctx.args() ? ctx.args() : null;
+            const explist = argsCtx && argsCtx.explist ? argsCtx.explist(0) : null;
+            const exps = explist && explist.exp ? explist.exp() : [];
+
+            // Helper to get visited exp value
+            const getVal = (expNode) => this.visitExp(expNode, null, true);
+            // Determine whether this is a static table.* call or a method-style call (a:insert or a.insert)
+            // Extract a possible method name and base expression
+            let calleeTxt = null;
+            try {
+                calleeTxt = ctx.children && ctx.children[0] && typeof ctx.children[0].getText === 'function' ? ctx.children[0].getText() : methodFullName;
+            } catch (e) {
+                calleeTxt = methodFullName;
+            }
+            // Normalize: strip trailing parens if present
+            if (typeof calleeTxt === 'string' && calleeTxt.includes('(')) calleeTxt = calleeTxt.split('(')[0];
+            let isStaticTableCall = false;
+            let isMethodCall = false;
+            let methodName = null;
+            let baseText = null;
+            let separator = null;
+            const m = /^(?<base>[a-zA-Z_][a-zA-Z0-9_]*(?:[\.:[a-zA-Z_][a-zA-Z0-9_]*)*)([\.:])(?<method>[a-zA-Z_][a-zA-Z0-9_]*)$/.exec(calleeTxt);
+            if (m && m.groups) {
+                baseText = m.groups.base;
+                methodName = m.groups.method;
+                separator = calleeTxt.charAt(baseText.length);
+                isMethodCall = true;
+                if (baseText === 'table') isStaticTableCall = true;
+            } else if (methodFullName && methodFullName.startsWith('table.')) {
+                isStaticTableCall = true;
+                methodName = methodFullName.split('.')[1];
+            }
+
+            const effectiveMethod = methodName || (methodFullName && methodFullName.split('.').pop());
+
+            // Helper to extract a variable name from a visited expression (if possible)
+            const extractVariableName = (expr) => {
+                if (!expr) return null;
+                // [12, varName, varName]
+                if (Array.isArray(expr) && expr[0] === 12) {
+                    return expr[1];
+                }
+                // reporter reference to a data_variable block: [3, id, ...]
+                if (Array.isArray(expr) && expr[0] === 3 && typeof expr[1] === 'string') {
+                    const bid = expr[1];
+                    const blk = this.generator.blocks[bid];
+                    if (blk && blk.opcode === 'data_variable' && blk.fields && Array.isArray(blk.fields.VARIABLE)) {
+                        return blk.fields.VARIABLE[0];
+                    }
+                }
+                // string literal or other expression -> not a variable
+                return null;
+            };
+
+            // For method calls like a:insert, derive arrVal expression from baseText when possible
+            const getArrayExprForMethod = () => {
+                // Prefer parsing via visitExp on the prefix if available
+                try {
+                    const calleeNode = ctx.children && ctx.children[0] ? ctx.children[0] : null;
+                    if (calleeNode && calleeNode.constructor && calleeNode.constructor.name === 'PrefixexpContext') {
+                        // The prefixexp text includes the method; try to get the child that represents the receiver
+                        // Fallback: use the textual baseText as a variable placeholder
+                        if (baseText && typeof baseText === 'string') return [12, baseText, baseText];
+                    }
+                } catch (e) { }
+                if (baseText) return [12, baseText, baseText];
+                return null;
+            };
+
+            // Now handle methods by their effective name
+            if (effectiveMethod === 'insert') {
+                // table.insert(t, value) or table.insert(t, pos, value)
+                // Build helper to create push/insert reporter block
+                const buildInsertReporter = (arrVal, indexInput, valueVal) => {
+                    const op = indexInput ? 'jgJSON_json_array_insert' : 'jgJSON_json_array_push';
+                    const inputsArr = indexInput ? [this.wrapInput(arrVal), indexInput, this.wrapInput(valueVal)] : [this.wrapInput(arrVal), this.wrapInput(valueVal)];
+                    const repId = this.generator.addBlock({
+                        opcode: op,
+                        inputs: inputsArr,
+                        parent: null,
+                        next: null,
+                        shadow: false,
+                        topLevel: false,
+                    });
+                    // parent any reporter inputs to reporter block
+                    try {
+                        const arrRef = Array.isArray(arrVal) ? arrVal : null;
+                        if (arrRef && arrRef[0] === 3 && typeof arrRef[1] === 'string' && this.generator.blocks[arrRef[1]]) this.generator.blocks[arrRef[1]].parent = repId;
+                        if (Array.isArray(valueVal) && valueVal[0] === 3 && typeof valueVal[1] === 'string' && this.generator.blocks[valueVal[1]]) this.generator.blocks[valueVal[1]].parent = repId;
+                        if (Array.isArray(indexInput) && indexInput[0] === 3 && typeof indexInput[1] === 'string' && this.generator.blocks[indexInput[1]]) this.generator.blocks[indexInput[1]].parent = repId;
+                    } catch (e) { }
+                    return repId;
+                };
+
+                if (exps.length === 2) {
+                    const arrVal = getVal(exps[0]);
+                    const valueVal = getVal(exps[1]);
+                    if (!asReporter) {
+                        // statement context: must modify a variable in-place
+                        const varName = extractVariableName(arrVal);
+                        if (!varName) throw new CompilerError('table.insert used in statement context requires a variable as first argument', ctx, this.source);
+                        const repId = buildInsertReporter(arrVal, null, valueVal);
+                        // set variable to result of reporter
+                        const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: 'data_setvariableto',
+                            id: setId,
+                            parent: null,
+                            next: null,
+                            inputs: { VALUE: [3, repId, [10, '']] },
+                            fields: { VARIABLE: [varName, varName, ''] }
+                        });
+                        // parent rep to setter
+                        this.generator.blocks[repId].parent = setId;
+                        return setId;
+                    } else {
+                        // expression context: return reporter
+                        return buildInsertReporter(arrVal, null, valueVal);
+                    }
+                } else if (exps.length === 3) {
+                    const arrVal = getVal(exps[0]);
+                    const posVal = getVal(exps[1]);
+                    const valueVal = getVal(exps[2]);
+                    // compute zero-based index from Lua 1-based pos
+                    let indexInput;
+                    if (!isNaN(Number(posVal))) {
+                        indexInput = this.wrapInput(Number(posVal) - 1);
+                    } else if (Array.isArray(posVal) && posVal[0] === 3) {
+                        // build subtract node: (pos - 1)
+                        const subId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: 'operator_subtract',
+                            id: subId,
+                            parent: null,
+                            next: null,
+                            inputs: [posVal, [1, [4, '1']]]
+                        });
+                        indexInput = [3, subId, [10, '']];
+                        if (Array.isArray(posVal) && posVal[0] === 3 && typeof posVal[1] === 'string' && this.generator.blocks[posVal[1]]) {
+                            this.generator.blocks[posVal[1]].parent = subId;
+                        }
+                    } else if (typeof posVal === 'string' && posVal.match(/^\d+$/)) {
+                        indexInput = this.wrapInput(Number(posVal) - 1);
+                    } else {
+                        indexInput = this.wrapInput(posVal);
+                    }
+                    if (!asReporter) {
+                        const varName = extractVariableName(arrVal);
+                        if (!varName) throw new CompilerError('table.insert used in statement context requires a variable as first argument', ctx, this.source);
+                        const repId = buildInsertReporter(arrVal, indexInput, valueVal);
+                        const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: 'data_setvariableto',
+                            id: setId,
+                            parent: null,
+                            next: null,
+                            inputs: { VALUE: [3, repId, [10, '']] },
+                            fields: { VARIABLE: [varName, varName, ''] }
+                        });
+                        this.generator.blocks[repId].parent = setId;
+                        return setId;
+                    } else {
+                        return buildInsertReporter(arrVal, indexInput, valueVal);
+                    }
+                }
+            }
+
+            if (effectiveMethod === 'remove') {
+                // table.remove(t) or table.remove(t, pos)
+                const arrVal = exps[0] ? getVal(exps[0]) : '';
+                const buildDeleteReporter = (arrayExpr, indexInput) => {
+                    const delId = this.generator.addBlock({
+                        opcode: 'jgJSON_json_array_delete',
+                        inputs: [this.wrapInput(arrayExpr), indexInput],
+                        parent: null,
+                        next: null,
+                        shadow: false,
+                        topLevel: false,
+                    });
+                    // parent referenced reporters
+                    try {
+                        if (Array.isArray(indexInput) && indexInput[0] === 3 && typeof indexInput[1] === 'string' && this.generator.blocks[indexInput[1]]) this.generator.blocks[indexInput[1]].parent = delId;
+                        if (Array.isArray(arrayExpr) && arrayExpr[0] === 3 && typeof arrayExpr[1] === 'string' && this.generator.blocks[arrayExpr[1]]) this.generator.blocks[arrayExpr[1]].parent = delId;
+                    } catch (e) { }
+                    return delId;
+                };
+
+                if (exps.length === 1) {
+                    // need to delete last element: compute length-1
+                    const keysLengthId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    this.generator.addBlock({
+                        opcode: 'jgJSON_json_array_length',
+                        id: keysLengthId,
+                        parent: null,
+                        next: null,
+                        inputs: [this.wrapInput(arrVal)]
+                    });
+                    const subId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    this.generator.addBlock({
+                        opcode: 'operator_subtract',
+                        id: subId,
+                        parent: null,
+                        next: null,
+                        inputs: [[3, keysLengthId, [10, '']], [1, [4, '1']]]
+                    });
+                    if (this.generator.blocks[keysLengthId]) this.generator.blocks[keysLengthId].parent = subId;
+                    if (!asReporter) {
+                        const varName = extractVariableName(arrVal);
+                        if (!varName) throw new CompilerError('table.remove used in statement context requires a variable as first argument', ctx, this.source);
+                        const repId = buildDeleteReporter(arrVal, [3, subId, [10, '']]);
+                        const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: 'data_setvariableto',
+                            id: setId,
+                            parent: null,
+                            next: null,
+                            inputs: { VALUE: [3, repId, [10, '']] },
+                            fields: { VARIABLE: [varName, varName, ''] }
+                        });
+                        this.generator.blocks[repId].parent = setId;
+                        if (this.generator.blocks[subId]) this.generator.blocks[subId].parent = repId;
+                        return setId;
+                    } else {
+                        const delId = buildDeleteReporter(arrVal, [3, subId, [10, '']]);
+                        if (this.generator.blocks[subId]) this.generator.blocks[subId].parent = delId;
+                        return delId;
+                    }
+                } else if (exps.length >= 2) {
+                    const posVal = getVal(exps[1]);
+                    let indexInput;
+                    if (!isNaN(Number(posVal))) {
+                        indexInput = this.wrapInput(Number(posVal) - 1);
+                    } else if (Array.isArray(posVal) && posVal[0] === 3) {
+                        const subId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: 'operator_subtract',
+                            id: subId,
+                            parent: null,
+                            next: null,
+                            inputs: [posVal, [1, [4, '1']]]
+                        });
+                        indexInput = [3, subId, [10, '']];
+                        if (Array.isArray(posVal) && posVal[0] === 3 && typeof posVal[1] === 'string' && this.generator.blocks[posVal[1]]) {
+                            this.generator.blocks[posVal[1]].parent = subId;
+                        }
+                    } else if (typeof posVal === 'string' && posVal.match(/^\d+$/)) {
+                        indexInput = this.wrapInput(Number(posVal) - 1);
+                    } else {
+                        indexInput = this.wrapInput(posVal);
+                    }
+                    if (!asReporter) {
+                        const varName = extractVariableName(arrVal);
+                        if (!varName) throw new CompilerError('table.remove used in statement context requires a variable as first argument', ctx, this.source);
+                        const repId = buildDeleteReporter(arrVal, indexInput);
+                        const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                        this.generator.addBlock({
+                            opcode: 'data_setvariableto',
+                            id: setId,
+                            parent: null,
+                            next: null,
+                            inputs: { VALUE: [3, repId, [10, '']] },
+                            fields: { VARIABLE: [varName, varName, ''] }
+                        });
+                        this.generator.blocks[repId].parent = setId;
+                        return setId;
+                    } else {
+                        return buildDeleteReporter(arrVal, indexInput);
+                    }
+                }
+            }
+
+            if (effectiveMethod === 'concat') {
+                // table.concat(t, delim?)
+                const arrValNode = exps[0];
+                const delimNode = exps[1];
+                const arrVal = arrValNode ? this.visitExp(arrValNode, null, true) : '';
+                const delimVal = delimNode ? this.visitExp(delimNode, null, true) : '';
+                // For statement context, require variable receiver and set it to the join result
+                const buildJoinReporter = (arrayExpr, delimiterExpr) => {
+                    const id = this.generator.addBlock({
+                        opcode: 'jgJSON_json_array_join',
+                        inputs: [this.wrapInput(arrayExpr), this.wrapInput(delimiterExpr === '' ? '' : delimiterExpr)],
+                        parent: null,
+                        next: null,
+                        shadow: false,
+                        topLevel: false,
+                    });
+                    try {
+                        if (Array.isArray(arrayExpr) && arrayExpr[0] === 3 && typeof arrayExpr[1] === 'string' && this.generator.blocks[arrayExpr[1]]) this.generator.blocks[arrayExpr[1]].parent = id;
+                    } catch (e) { }
+                    return id;
+                };
+                if (!asReporter) {
+                    const varName = extractVariableName(arrVal);
+                    if (!varName) throw new CompilerError('table.concat used in statement context requires a variable as first argument', ctx, this.source);
+                    const repId = buildJoinReporter(arrVal, delimVal);
+                    const setId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    this.generator.addBlock({
+                        opcode: 'data_setvariableto',
+                        id: setId,
+                        parent: null,
+                        next: null,
+                        inputs: { VALUE: [3, repId, [10, '']] },
+                        fields: { VARIABLE: [varName, varName, ''] }
+                    });
+                    this.generator.blocks[repId].parent = setId;
+                    return setId;
+                }
+                return buildJoinReporter(arrVal, delimVal);
+            }
+        }
 
         // Handle built-in print
         if (funcName === "print") {
@@ -818,16 +2579,47 @@ class visitor extends LuaParserVisitor {
             const exps = explist.exp ? explist.exp() : [];
             let messageInput;
             let joinBlockIds = [];
+            let lastIsSecs = false;
+            let secsVal = null;
 
             // Build the message input (join chain if needed)
             if (exps.length > 0) {
+                // Visit first argument with arg index 1
+                this._currentArgIndex = 1;
                 let left = this.visitExp(exps[0], null, true);
-                for (
-                    let i = 1;
-                    i < exps.length - (exps.length > 1 ? 1 : 0);
-                    i++
-                ) {
+                // wrap the left while index is set
+                left = this.wrapInput(left);
+                // clear the index after wrapping
+                this._currentArgIndex = null;
+                // Determine whether the final argument should be treated as seconds.
+                // Evaluate the last argument early so we can decide whether to emit
+                // `looks_sayforsecs` and reuse the visited value when building the
+                // final block. Accept numeric literals, numeric strings, and
+                // expression/reporters as valid seconds values.
+                if (exps.length > 1) {
+                    this._currentArgIndex = exps.length;
+                    try {
+                        secsVal = this.visitExp(exps[exps.length - 1], null, true);
+                    } finally {
+                        this._currentArgIndex = null;
+                    }
+                    if (typeof secsVal === 'number') lastIsSecs = true;
+                    else if (typeof secsVal === 'string' && /^\s*-?\d+(?:\.\d+)?\s*$/.test(secsVal)) lastIsSecs = true;
+                    else if (Array.isArray(secsVal) && secsVal[0] === 3) lastIsSecs = true; // reporter/expression
+                }
+
+                const joinUntil = lastIsSecs ? exps.length - 1 : exps.length;
+
+                for (let i = 1; i < joinUntil; i++) {
+                    // arguments in print: index = i+1
+                    this._currentArgIndex = i + 1;
                     const rightVal = this.visitExp(exps[i], null, true);
+                    try {
+                        // silent check for literal rightVal
+                    } catch (e) { }
+                    // wrap right while index is set
+                    const wrappedRight = this.wrapInput(rightVal);
+                    this._currentArgIndex = null;
                     const joinId = this.generator.letterCount(this.generator.blockIdCounter++);
                     this.generator.addBlock({
                         opcode: "operator_join",
@@ -835,10 +2627,11 @@ class visitor extends LuaParserVisitor {
                         parent: null,
                         next: null,
                         inputs: [
-                            this.wrapInput(left),
-                            this.wrapInput(rightVal)
+                            Array.isArray(left) ? left : left,
+                            wrappedRight
                         ],
                     });
+                    try { this.setBlockType(joinId, 'string'); } catch (e) {}
                     joinBlockIds.push(joinId);
                     left = [3, joinId, [10, ""]];
                 }
@@ -859,15 +2652,17 @@ class visitor extends LuaParserVisitor {
                 this.generator.blocks[messageInput[1]].parent = sayBlockId;
             }
 
-            // If there is a second argument, use sayforsecs
+            // If there is a second argument that looks numeric, use sayforsecs
             let blockId;
-            if (exps.length > 1) {
-                const secs = this.visitExp(exps[exps.length - 1], null, true);
+            if (exps.length > 1 && lastIsSecs) {
+                // Use the previously visited secsVal when possible.
+                const wrappedMessage = Array.isArray(messageInput) ? messageInput : this.wrapInput(messageInput);
+                const wrappedSecs = this.wrapInput(secsVal);
                 blockId = this.generator.addBlock({
                     opcode: "looks_sayforsecs",
                     inputs: [
-                        this.wrapInput(messageInput),
-                        this.wrapInput(secs)
+                        wrappedMessage,
+                        wrappedSecs
                     ],
                     parent: null,
                     next: null,
@@ -875,10 +2670,11 @@ class visitor extends LuaParserVisitor {
                     topLevel: false,
                 });
             } else {
+                const wrapped = Array.isArray(messageInput) ? messageInput : this.wrapInput(messageInput);
                 blockId = this.generator.addBlock({
                     opcode: "looks_say",
                     inputs: [
-                        this.wrapInput(messageInput)
+                        wrapped
                     ],
                     parent: null,
                     next: null,
@@ -905,8 +2701,12 @@ class visitor extends LuaParserVisitor {
             // Build array of inputs in order
             const inputArr = [];
             for (let i = 0; i < inputsMeta.length; i++) {
+                this._currentArgIndex = i + 1;
                 let val = exps[i] ? this.visitExp(exps[i], null, true) : "";
-                inputArr.push(this.wrapInput(val));
+                // Wrap while _currentArgIndex is set
+                const wrapped = this.wrapInput(val);
+                this._currentArgIndex = null;
+                inputArr.push(wrapped);
             }
             let blockId = this.generator.addBlock({
                 opcode: funcName,
@@ -916,6 +2716,10 @@ class visitor extends LuaParserVisitor {
                 shadow: false,
                 topLevel: false,
             });
+            try {
+                const inferred = this.inferTypeFromValue([3, blockId, [10, '']]);
+                if (inferred) this.setBlockType(blockId, inferred);
+            } catch (e) { }
             return blockId;
         }
         // User-defined function call
@@ -963,10 +2767,448 @@ class visitor extends LuaParserVisitor {
         });
         return callId;
     }
+    // Helper for table/array access: t[2] or t["key"]
+    handleTableAccess(tableVar, keyExp, parentId) {
+        try {
+            // removed debug logging
+        } catch (e) { }
+    const key = this.visitExp(keyExp);
+        // Normalize tableVar into a reporter/reference input when possible
+        let tableArg;
+        try {
+            // If caller passed a raw identifier string (e.g. "arr"), normalize
+            // it to the variable placeholder shape so downstream logic can
+            // consistently prefer the canonical getter reporter.
+            if (typeof tableVar === 'string') {
+                const m = /^([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(tableVar);
+                if (m) tableVar = [12, m[1], m[1]];
+            }
+
+            if (Array.isArray(tableVar) && tableVar[0] === 12) {
+                // Variable placeholder -> prefer canonical getter reporter
+                const varName = tableVar[1];
+                const [baseName] = this.extractVarNameAndType(varName);
+                const getter = this.variableGetters[baseName];
+                if (getter) {
+                    tableArg = [3, getter, [10, ""]];
+                } else {
+                    tableArg = this.wrapInput(tableVar);
+                }
+            } else if (typeof tableVar === 'string' && this.generator.blocks[tableVar]) {
+                // If it's a block id (maybe the set-variable statement), try to map to the variable getter
+                const blk = this.generator.blocks[tableVar];
+                if (blk && blk.fields && Array.isArray(blk.fields.VARIABLE)) {
+                    const varName = blk.fields.VARIABLE[0];
+                    const getter = this.variableGetters[varName];
+                    if (getter) tableArg = [3, getter, [10, ""]];
+                    else tableArg = this.wrapInput(tableVar);
+                } else {
+                    tableArg = this.wrapInput(tableVar);
+                }
+            } else {
+                tableArg = this.wrapInput(tableVar);
+            }
+        } catch (e) {
+            tableArg = this.wrapInput(tableVar);
+        }
+
+    // If key is a number, prefer to use string-substring when the tableArg
+        // is known to be a string. Detect string-typed variables or literal
+        // string expressions and emit the substring operator which is
+        // one-indexed (operator_getLettersFromIndexToIndexInTextFixed).
+        // Detect literal range like `1..3` in the raw parse node text. Some
+        // source forms (e.g. `s[1..3]`) are parsed such that visitExp will
+        // produce a reporter/expression; however we can cheaply detect the
+        // textual form here and treat it as a literal start/end pair.
+        let literalRange = null;
+        try {
+            if (keyExp && typeof keyExp.getText === 'function') {
+                const txt = keyExp.getText();
+                const m = txt.match(/^\s*([0-9]+)\.\.([0-9]+)\s*$/);
+                if (m) literalRange = { start: Number(m[1]), end: Number(m[2]) };
+            }
+        } catch (e) { }
+
+        if (literalRange) {
+            // Determine whether tableArg is string-typed using inference
+            let tableIsString = false;
+            try {
+                const ttype = this.inferTypeFromValue(tableVar) || this.inferTypeFromValue(tableArg) || null;
+                if (ttype === 'string') tableIsString = true;
+            } catch (e) { }
+            try {
+                if (!tableIsString) {
+                    let baseName = null;
+                    if (Array.isArray(tableVar) && tableVar[0] === 12) baseName = tableVar[1];
+                    else if (typeof tableVar === 'string') {
+                        const m = /^([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(tableVar);
+                        if (m) baseName = m[1];
+                    }
+                    if (!baseName && Array.isArray(tableArg) && tableArg[0] === 3) {
+                        const bid = tableArg[1];
+                        const blk = this.generator.blocks && this.generator.blocks[bid];
+                        if (blk && blk.opcode === 'data_variable' && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseName = blk.fields.VARIABLE[0];
+                    }
+                    if (baseName && this.types && this.types[baseName] === 'string') tableIsString = true;
+                }
+            } catch (e) { }
+
+            if (tableIsString) {
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const idxInput = this.wrapInput(literalRange.start);
+                const idx2Input = this.wrapInput(literalRange.end);
+                const textInput = this.wrapInput(tableVar);
+                this.generator.addBlock({
+                    opcode: 'operator_getLettersFromIndexToIndexInTextFixed',
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [idxInput, idx2Input, textInput]
+                });
+                try { if (Array.isArray(textInput) && textInput[0] === 3 && typeof textInput[1] === 'string' && this.generator.blocks[textInput[1]]) this.generator.blocks[textInput[1]].parent = blockId; } catch (e) { }
+                return blockId;
+            }
+        }
+
+        if (!isNaN(Number(key))) {
+            // numeric literal index: convert from 1-based Lua to 0-based jgJSON
+            const indexNum = Number(key);
+            // Helper to determine if tableArg is string-typed. Use inference helper
+            // which understands reporter blocks and variable placeholders.
+            // As a fallback, also check the declared/inferred type of the base
+            // variable name directly from `this.types` when present.
+            let tableIsString = false;
+            try {
+                const ttype = this.inferTypeFromValue(tableVar) || this.inferTypeFromValue(tableArg) || null;
+                if (ttype === 'string') tableIsString = true;
+            } catch (e) { }
+            try {
+                if (!tableIsString) {
+                    // Try to resolve a base variable name from tableVar or tableArg
+                    let baseName = null;
+                    if (Array.isArray(tableVar) && tableVar[0] === 12) baseName = tableVar[1];
+                    else if (typeof tableVar === 'string') {
+                        const m = /^([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(tableVar);
+                        if (m) baseName = m[1];
+                    }
+                    if (!baseName && Array.isArray(tableArg) && tableArg[0] === 3) {
+                        const bid = tableArg[1];
+                        const blk = this.generator.blocks && this.generator.blocks[bid];
+                        if (blk && blk.opcode === 'data_variable' && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseName = blk.fields.VARIABLE[0];
+                    }
+                    if (baseName && this.types && this.types[baseName] === 'string') tableIsString = true;
+                }
+            } catch (e) { }
+
+            if (tableIsString) {
+                // Single-index access on a string should use the letter-of block
+                // (LETTER, STRING) rather than repeating the index twice.
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const idxInput = this.wrapInput(indexNum);
+                const textInput = this.wrapInput(tableVar);
+                this.generator.addBlock({
+                    opcode: 'operator_letter_of',
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [
+                        idxInput,
+                        textInput
+                    ]
+                });
+                // Parent any reporter inputs
+                try {
+                    if (Array.isArray(textInput) && textInput[0] === 3 && typeof textInput[1] === 'string' && this.generator.blocks[textInput[1]]) this.generator.blocks[textInput[1]].parent = blockId;
+                } catch (e) { }
+                return blockId;
+            }
+            const zeroIndex = Number(key) - 1;
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "jgJSON_json_array_get",
+                id: blockId,
+                parent: parentId,
+                next: null,
+                inputs: [
+                    tableArg,
+                    this.wrapInput(zeroIndex)
+                ]
+            });
+            if (Array.isArray(tableArg) && tableArg[0] === 3 && typeof tableArg[1] === 'string' && this.generator.blocks[tableArg[1]]) {
+                this.generator.blocks[tableArg[1]].parent = blockId;
+            }
+            return blockId;
+        } else {
+            // jgJSON_getValueFromJSON for string keys
+            // If key is an expression (not a plain number), visit it — if it yields
+            // a numeric expression and the table is string-typed, emit the
+            // substring operator with expression indices (one-indexed). Otherwise
+            // convert numeric expressions to zero-based indices for JSON access.
+            let numericKey = this.visitExp(keyExp);
+            // If the index expression is a variable placeholder ([12, name, name]),
+            // prefer the canonical getter reporter so downstream logic treats it
+            // as an expression-producing reporter (shape [3, id, ...]). This
+            // allows the substring-emission branch to detect expression indices
+            // like `s[i]` and emit the correct operator when `s` is a string.
+            try {
+                if (Array.isArray(numericKey) && numericKey[0] === 12) {
+                    const varName = numericKey[1];
+                    const [baseName] = this.extractVarNameAndType(varName);
+                    const getter = this.variableGetters && this.variableGetters[baseName];
+                    if (getter) numericKey = [3, getter, [10, ""]];
+                }
+            } catch (e) { }
+            let keyInput;
+            // detect whether tableVar is string-typed using inference
+            let tableIsString = false;
+            try {
+                const ttype = this.inferTypeFromValue(tableVar) || this.inferTypeFromValue(tableArg) || null;
+                if (ttype === 'string') tableIsString = true;
+            } catch (e) { }
+            try {
+                if (!tableIsString) {
+                    // Try to resolve a base variable name from tableVar or tableArg
+                    let baseName = null;
+                    if (Array.isArray(tableVar) && tableVar[0] === 12) baseName = tableVar[1];
+                    else if (typeof tableVar === 'string') {
+                        const m = /^([a-zA-Z_][a-zA-Z0-9_]*)$/.exec(tableVar);
+                        if (m) baseName = m[1];
+                    }
+                    if (!baseName && Array.isArray(tableArg) && tableArg[0] === 3) {
+                        const bid = tableArg[1];
+                        const blk = this.generator.blocks && this.generator.blocks[bid];
+                        if (blk && blk.opcode === 'data_variable' && blk.fields && Array.isArray(blk.fields.VARIABLE)) baseName = blk.fields.VARIABLE[0];
+                    }
+                    if (baseName && this.types && this.types[baseName] === 'string') tableIsString = true;
+                }
+            } catch (e) { }
+
+            if (!isNaN(Number(numericKey))) {
+                // numeric literal inside bracket
+                const num = Number(numericKey);
+                if (tableIsString) {
+                    // Single-index literal inside bracket: emit letter-of
+                    const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    const idxInput = this.wrapInput(num);
+                    const textInput = this.wrapInput(tableVar);
+                    this.generator.addBlock({
+                        opcode: 'operator_letter_of',
+                        id: blockId,
+                        parent: parentId,
+                        next: null,
+                        inputs: [idxInput, textInput]
+                    });
+                    try { if (Array.isArray(textInput) && textInput[0] === 3 && typeof textInput[1] === 'string' && this.generator.blocks[textInput[1]]) this.generator.blocks[textInput[1]].parent = blockId; } catch (e) { }
+                    return blockId;
+                }
+                keyInput = this.wrapInput(num - 1);
+            } else if (Array.isArray(numericKey) && numericKey[0] === 3) {
+                // expression producing a reporter
+                if (tableIsString) {
+                    // Expression index (e.g. s[i]) on a string: use letter-of
+                    const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    const idxInputExpr = this.wrapInput(numericKey);
+                    const textInput = this.wrapInput(tableVar);
+                    this.generator.addBlock({
+                        opcode: 'operator_letter_of',
+                        id: blockId,
+                        parent: parentId,
+                        next: null,
+                        inputs: [idxInputExpr, textInput]
+                    });
+                    try { if (Array.isArray(textInput) && textInput[0] === 3 && typeof textInput[1] === 'string' && this.generator.blocks[textInput[1]]) this.generator.blocks[textInput[1]].parent = blockId; } catch (e) { }
+                    return blockId;
+                }
+                // expression numeric: subtract 1 at runtime
+                const subId = this.generator.letterCount(this.generator.blockIdCounter++);
+                this.generator.addBlock({
+                    opcode: "operator_subtract",
+                    id: subId,
+                    parent: null,
+                    next: null,
+                    inputs: [
+                        numericKey,
+                        [1, [4, "1"]]
+                    ]
+                });
+                keyInput = [3, subId, [10, ""]];
+            } else if (typeof numericKey === 'string' && numericKey.match(/^\d+$/)) {
+                const num = Number(numericKey);
+                if (tableIsString) {
+                    const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    const idxInput = this.wrapInput(num);
+                    const idx2Input = this.wrapInput(num);
+                    const textInput = this.wrapInput(tableVar);
+                    this.generator.addBlock({
+                        opcode: 'operator_getLettersFromIndexToIndexInTextFixed',
+                        id: blockId,
+                        parent: parentId,
+                        next: null,
+                        inputs: [idxInput, idx2Input, textInput]
+                    });
+                    try { if (Array.isArray(textInput) && textInput[0] === 3 && typeof textInput[1] === 'string' && this.generator.blocks[textInput[1]]) this.generator.blocks[textInput[1]].parent = blockId; } catch (e) { }
+                    return blockId;
+                }
+                keyInput = this.wrapInput(num - 1);
+            } else {
+                // treat as string key (non-numeric)
+                keyInput = this.wrapInput(key);
+            }
+
+            const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+            this.generator.addBlock({
+                opcode: "jgJSON_getValueFromJSON",
+                id: blockId,
+                parent: parentId,
+                next: null,
+                inputs: [
+                    keyInput,
+                    tableArg
+                ]
+            });
+            // Parent the tableArg reporter to the new block if present
+            if (Array.isArray(tableArg) && tableArg[0] === 3 && typeof tableArg[1] === 'string' && this.generator.blocks[tableArg[1]]) {
+                this.generator.blocks[tableArg[1]].parent = blockId;
+            }
+            return blockId;
+        }
+    }
+
+    // Detect and handle dot-notation like t.key and prefixexp indexing
+    visitPrefixexp(ctx, parentId = null) {
+        // Trace prefixexp handling for nested.x occurrences
+        try {
+        } catch (e) { }
+        // If the prefixexp is simple (a variable), return a variable placeholder
+        if (ctx.children && ctx.children.length === 1) {
+            const varName = this.getText(ctx);
+            return [12, varName, varName];
+        }
+
+        // Handle dot-notation and multi-segment dotted chains like `obj.nested.x`.
+        // We operate on the textual form to be robust against nested prefixexp
+        // child structures that may not present as exactly three children.
+        try {
+            const txt = ctx && typeof ctx.getText === 'function' ? ctx.getText() : '';
+            if (txt && txt.indexOf('.') !== -1) {
+                // leftmost base (e.g. `obj`) and final key (e.g. `x`)
+                const parts = txt.split('.');
+                const base = parts[0];
+                const key = parts[parts.length - 1];
+                if (base && key && /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(base) && /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key)) {
+                    // Prefer using the canonical getter for the base variable so runtime
+                    // JSON access blocks are produced.
+                    const tableVar = [12, base, base];
+                    const tableArg = this.wrapInput(tableVar);
+                    const literalKey = [1, [10, String(key)]];
+                    const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    this.generator.addBlock({
+                        opcode: 'jgJSON_getValueFromJSON',
+                        id: blockId,
+                        parent: parentId,
+                        next: null,
+                        inputs: [literalKey, tableArg]
+                    });
+                    if (Array.isArray(tableArg) && tableArg[0] === 3 && typeof tableArg[1] === 'string' && this.generator.blocks[tableArg[1]]) {
+                        this.generator.blocks[tableArg[1]].parent = blockId;
+                    }
+                    return [3, blockId, [10, '']];
+                }
+            }
+        } catch (e) { }
+        // Handle bracket-notation like t[exp] (array/table access)
+        try {
+            // Find a '[' child anywhere in the prefixexp children so we
+            // handle more shapes (e.g. nested prefixes) robustly.
+            if (ctx.children) {
+                const bracketIndex = ctx.children.findIndex(c => c && c.getText && c.getText() === '[');
+                if (bracketIndex !== -1 && ctx.children.length > bracketIndex + 1) {
+                    const tableVarNode = ctx.children[0];
+                    const keyNode = ctx.children[bracketIndex + 1];
+                let tableVar = (tableVarNode && tableVarNode.constructor && tableVarNode.constructor.name && tableVarNode.constructor.name.endsWith("PrefixexpContext")) ?
+                    this.visitPrefixexp(tableVarNode, parentId) :
+                    this.visitExp(tableVarNode, parentId);
+                // If visitExp returned nothing, fall back to a variable placeholder
+                if (tableVar === "" || tableVar === null || tableVar === undefined) {
+                    const vn = tableVarNode && tableVarNode.getText ? tableVarNode.getText() : null;
+                    if (vn) tableVar = [12, vn, vn];
+                }
+                const accessId = this.handleTableAccess(tableVar, keyNode, parentId);
+                    return [3, accessId, [10, ""]];
+                }
+            }
+        } catch (e) { }
+        if (ctx.children && ctx.children.length === 3 && ctx.children[1].getText() === '.') {
+            const tableVarNode = ctx.children[0];
+            const nameNode = ctx.children[2];
+            let tableVar = (tableVarNode && tableVarNode.constructor && tableVarNode.constructor.name && tableVarNode.constructor.name.endsWith("PrefixexpContext")) ?
+                this.visitPrefixexp(tableVarNode, parentId) :
+                this.visitExp(tableVarNode, parentId);
+            // If visitExp returned empty (e.g. raw NAME), treat as variable placeholder
+            if (tableVar === "" || tableVar === null || tableVar === undefined) {
+                const vn = tableVarNode && tableVarNode.getText ? tableVarNode.getText() : null;
+                if (vn) tableVar = [12, vn, vn];
+            }
+            try { } catch (e) { }
+            // If visitExp returned a literal JS object/array, try to map it back to
+            // the original base variable (leftmost identifier of the prefix). For
+            // example `obj.nested.x` should map to reporter for `obj` so that
+            // runtime access is generated rather than embedding the literal.
+            try {
+                // As above: always prefer referencing the base variable getter
+                // for dotted access so runtime lookup blocks are generated.
+                if (tableVarNode && tableVarNode.getText) {
+                    const txt = tableVarNode.getText();
+                    const m = txt.match(/^([a-zA-Z_][a-zA-Z0-9_]*)/);
+                    if (m) {
+                        const base = m[1];
+                        if (this.variableGetters && this.variableGetters[base]) {
+                            tableVar = [12, base, base];
+                        }
+                    }
+                }
+            } catch (e) { }
+            const key = nameNode && nameNode.getText ? nameNode.getText() : "";
+            // Ensure key is a valid identifier (doesn't start with a number)
+            if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key)) {
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const tableArg = this.wrapInput(tableVar);
+                const literalKey = [1, [10, key == null ? "" : String(key)]];
+                this.generator.addBlock({
+                    opcode: "jgJSON_getValueFromJSON",
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [
+                        literalKey,
+                        tableArg
+                    ]
+                });
+                // Parent the tableArg reporter to the new block if it's a reporter reference
+                if (Array.isArray(tableArg) && tableArg[0] === 3 && typeof tableArg[1] === 'string' && this.generator.blocks[tableArg[1]]) {
+                    this.generator.blocks[tableArg[1]].parent = blockId;
+                }
+                return [3, blockId, [10, ""]];
+            }
+        }
+
+        // Fallback: default handling
+        return this.visitChildren(ctx);
+    }
+
     visitExp(ctx, parentId = null, forceStringFallback = false) {
+        if (!ctx) return "";
+        try {
+            if (ctx.start && typeof ctx.start.line === 'number') this._lastExpLine = ctx.start.line;
+        } catch (e) { }
         // If it's a string literal
         if (ctx.STRING) {
-            return ctx.getText().slice(1, -1); // Remove quotes
+            return this.getText(ctx).slice(1, -1); // Remove quotes
+        }
+
+        // If it's a table constructor (Lua table), delegate to visitTableconstructor
+        if (typeof ctx.tableconstructor === 'function' && ctx.tableconstructor()) {
+            return this.visitTableconstructor(ctx.tableconstructor());
         }
 
         // If it's a function call (reporter or user-defined)
@@ -1026,6 +3268,7 @@ class visitor extends LuaParserVisitor {
                         this.wrapInput(rightVal)
                     ],
                 });
+                try { this.setBlockType(joinId, 'string'); } catch (e) {}
                 currentInput = [3, joinId, [10, ""]];
             }
             return currentInput;
@@ -1098,11 +3341,11 @@ class visitor extends LuaParserVisitor {
                     left: "OPERAND1",
                     right: "OPERAND2",
                 },
-                "&": {opcode: "pmOperatorsExpansion_binnaryAnd", left: "num1", right: "num2"},
-                "|": {opcode: "pmOperatorsExpansion_binnaryOr", left: "num1", right: "num2"},
-                "~": {opcode: "pmOperatorsExpansion_binnaryXor", left: "num1", right: "num2"},
-                "<<": {opcode: "pmOperatorsExpansion_shiftLeft", left: "num1", right: "num2"},
-                ">>": {opcode: "pmOperatorsExpansion_shiftRight", left: "num1", right: "num2"},
+                "&": { opcode: "pmOperatorsExpansion_binnaryAnd", left: "num1", right: "num2" },
+                "|": { opcode: "pmOperatorsExpansion_binnaryOr", left: "num1", right: "num2" },
+                "~": { opcode: "pmOperatorsExpansion_binnaryXor", left: "num1", right: "num2" },
+                "<<": { opcode: "pmOperatorsExpansion_shiftLeft", left: "num1", right: "num2" },
+                ">>": { opcode: "pmOperatorsExpansion_shiftRight", left: "num1", right: "num2" },
             };
 
             if (opMap[op]) {
@@ -1155,7 +3398,7 @@ class visitor extends LuaParserVisitor {
         if (
             ctx.children &&
             ctx.children.length === 2 &&
-            this.getText(ctx.children[0]) === "not" || this.getText(ctx.children[0]) === "~"
+            (this.getText(ctx.children[0]) === "not" || this.getText(ctx.children[0]) === "~")
         ) {
             const op = this.getText(ctx.children[0]);
             const rightCtx = ctx.children[1];
@@ -1197,13 +3440,13 @@ class visitor extends LuaParserVisitor {
         }
 
         // Lua booleans
-        if (ctx.getText() === "true" || ctx.getText() === "false") {
+        if (this.getText(ctx) === "true" || this.getText(ctx) === "false") {
             const blockId = this.generator.letterCount(
                 this.generator.blockIdCounter++
             );
             this.generator.addBlock({
                 opcode:
-                    ctx.getText() === "true"
+                    this.getText(ctx) === "true"
                         ? "operator_trueBoolean"
                         : "operator_falseBoolean",
                 id: blockId,
@@ -1214,6 +3457,18 @@ class visitor extends LuaParserVisitor {
             return forceStringFallback ? [3, blockId, [10, ""]] : [3, blockId];
         }
         //console.log(Object.hasOwn(ctx.children[1] || {}, "children") ? ctx.children[1].children : ctx.children[1]);
+        // Numeric literal (positive)
+        if (
+            ctx.children &&
+            ctx.children.length === 1 &&
+            ctx.children[0].constructor &&
+            String(ctx.children[0].constructor.name).endsWith("NumberContext")
+        ) {
+            const txt = this.getText(ctx);
+            const n = Number(txt);
+            if (!isNaN(n)) return n;
+        }
+
         if (
             ctx.children &&
             ctx.children.length === 2 &&
@@ -1222,8 +3477,11 @@ class visitor extends LuaParserVisitor {
                 "NumberContext"
             )
         ) {
-            // Compile as negative number string
-            return "-" + ctx.children[1].getText();
+            // Compile as negative number
+            const txt = "-" + ctx.children[1].getText();
+            const n = Number(txt);
+            if (!isNaN(n)) return n;
+            return txt;
         }
         // If it's a variable
         //console.log(this.getText(ctx.children[0]));
@@ -1233,17 +3491,114 @@ class visitor extends LuaParserVisitor {
             ctx.children.length === 1 &&
             ctx.children[0].constructor.name.endsWith("PrefixexpContext")
         ) {
-            const varName = ctx.children[0].getText();
-            return [3, [12, varName, varName], [10, ""]];
+            const prefix = ctx.children[0];
+            // If the prefixexp contains indexing or dot-notation, delegate to visitPrefixexp
+            if (prefix.children && prefix.children.length > 1) {
+                return this.visitPrefixexp(prefix);
+            }
+            const varName = prefix.getText();
+            return [12, varName, varName];
+        }
+
+        // Table or string length: #t or #str
+        if (
+            ctx.children &&
+            ctx.children.length === 2 &&
+            ctx.children[0].getText() === "#"
+        ) {
+            const operand = this.visitExp(ctx.children[1]);
+            let varName = null;
+            if (Array.isArray(operand) && operand[1] && typeof operand[1] === "string") {
+                [varName] = this.extractVarNameAndType(operand[1]);
+            }
+            let isString = false;
+            if (typeof operand === "string" && operand[0] !== "[") isString = true;
+            if (varName && this.types[varName] === "string") isString = true;
+            if (isString) {
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const inputVal = this.wrapInput(operand);
+                this.generator.addBlock({
+                    opcode: "operator_length",
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [
+                        inputVal
+                    ]
+                });
+                // If the input is a reporter/block reference, set its parent to this length block
+                if (Array.isArray(inputVal) && inputVal[0] === 3 && typeof inputVal[1] === 'string' && this.generator.blocks[inputVal[1]]) {
+                    this.generator.blocks[inputVal[1]].parent = blockId;
+                }
+                return blockId;
+            } else {
+                // Determine if operand is an object (JSON object string or annotated variable)
+                let isObject = false;
+                if (typeof operand === "string" && operand.trim().startsWith("{")) isObject = true;
+                if (varName && this.types[varName] && this.types[varName].toLowerCase() === "object") isObject = true;
+
+                if (isObject) {
+                    // 1) Create a jgJSON_json_keys block that returns an array of keys
+                    const keysId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    const keysInput = this.wrapInput(operand);
+                    this.generator.addBlock({
+                        opcode: "jgJSON_json_keys",
+                        id: keysId,
+                        parent: null,
+                        next: null,
+                        inputs: [
+                            keysInput
+                        ],
+                        shadow: false,
+                        topLevel: false,
+                    });
+
+                    // 2) Create an array-length block that takes the keys array as reporter input
+                    const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                    const keysRef = [3, keysId, [10, ""]];
+                    this.generator.addBlock({
+                        opcode: "jgJSON_json_array_length",
+                        id: blockId,
+                        parent: parentId,
+                        next: null,
+                        inputs: [
+                            keysRef
+                        ]
+                    });
+
+                    // Parent the keys reporter to the length block so it renders nested
+                    if (this.generator.blocks[keysId]) {
+                        this.generator.blocks[keysId].parent = blockId;
+                    }
+                    return blockId;
+                }
+
+                // Default: treat as array and always use reporter/reference for the input
+                const blockId = this.generator.letterCount(this.generator.blockIdCounter++);
+                const inputVal = this.wrapInput(operand);
+                this.generator.addBlock({
+                    opcode: "jgJSON_json_array_length",
+                    id: blockId,
+                    parent: parentId,
+                    next: null,
+                    inputs: [
+                        inputVal
+                    ]
+                });
+                // If the input is a reporter/block reference, set its parent to this length block
+                if (Array.isArray(inputVal) && inputVal[0] === 3 && typeof inputVal[1] === 'string' && this.generator.blocks[inputVal[1]]) {
+                    this.generator.blocks[inputVal[1]].parent = blockId;
+                }
+                return blockId;
+            }
         }
 
         // Not a concat or arithmetic, fallback to child or text
-        if (
-            ctx.exp &&
-            typeof ctx.exp === "function" &&
-            ctx.exp().length === 1
-        ) {
-            return this.visitExp(ctx.exp(0), parentId);
+        if (ctx.exp && typeof ctx.exp === "function") {
+            const exps = ctx.exp();
+            if (exps && exps.length === 1) {
+                return this.visitExp(exps[0], parentId);
+            }
         }
         return this.getText(ctx, true);
     }
@@ -1251,6 +3606,7 @@ class visitor extends LuaParserVisitor {
         // Get function name and body
         const funcbody = ctx.funcbody();
         const parlist = funcbody.parlist();
+        const returnType = this.getTypeAnnotation(funcbody.typeReturnAnnotation ? funcbody.typeReturnAnnotation() : null);
         const block = funcbody.block();
 
         // Generate a unique id for the prototype and definition
@@ -1326,5 +3682,108 @@ class visitor extends LuaParserVisitor {
 
         return;
     }
+    visitTableconstructor(ctx) {
+        // Handle bracket-only field lists (explicit [key]=value or [key] entries)
+        if (ctx.bracketfieldlist && ctx.bracketfieldlist()) {
+            const bracketFields = ctx.bracketfieldlist().bracketfield();
+            // We'll only accept numeric indices and treat this as an array
+            let arrayValues = [];
+            for (const bf of bracketFields) {
+                // bf: '[' exp ']' '=' exp   OR '[' exp ']'
+                if (bf.children && bf.children.length >= 3) {
+                    const keyExp = bf.children[1];
+                    const keyVal = this.visitExp(keyExp);
+                    if (isNaN(Number(keyVal))) {
+                        throw new CompilerError('Bracket-style table constructors must use numeric indices only', bf, this.source);
+                    }
+                    const idx = Number(keyVal);
+                    // value might be missing (e.g. [1]), in which case it's nil -> treat as null
+                    let value = null;
+                    if (bf.children.length === 5 && bf.children[3]) {
+                        value = this.visitExp(bf.children[3]);
+                    }
+                    // Only disallow block-reference wrapper shapes like [3, id, ...]
+                    if (Array.isArray(value) && value.length >= 2 && typeof value[1] === 'string' && this.generator && this.generator.blocks && this.generator.blocks[value[1]]) {
+                        throw new CompilerError('Cannot use block reference in table constructor', bf, this.source);
+                    }
+                    arrayValues[idx - 1] = value; // Lua is 1-based
+                }
+            }
+            // Fill undefined holes with null to preserve indices
+            for (let i = 0; i < arrayValues.length; i++) if (arrayValues[i] === undefined) arrayValues[i] = null;
+            return arrayValues;
+        }
+
+        // Empty table
+        if (!ctx.fieldlist || !ctx.fieldlist()) return [];
+        const fields = ctx.fieldlist().field();
+        let isArray = true;
+        let arrayValues = [];
+        let objectValues = {};
+
+        for (const field of fields) {
+            // [exp] = exp
+            if (field.children.length === 5 && field.children[1].getText() === '[' && field.children[3].getText() === '=') {
+                const key = this.visitExp(field.children[2]);
+                let value = this.visitExp(field.children[4]);
+                // Convert primitives to string for JSON
+                // Allow nested table/array literals (they will be plain objects/arrays),
+                // but disallow block-reference wrappers like [3, id, ...]
+                if (Array.isArray(value) && value.length >= 2 && typeof value[1] === 'string' && this.generator && this.generator.blocks && this.generator.blocks[value[1]]) {
+                    throw new CompilerError("Cannot use block reference as table value", field, this.source);
+                }
+                objectValues[key] = value;
+                isArray = false;
+            }
+            // name = exp
+            else if (field.children.length === 3 && field.children[1].getText() === '=') {
+                const key = field.children[0].getText();
+                let value = this.visitExp(field.children[2]);
+                // Allow nested objects/arrays; only reject block-reference wrappers
+                if (Array.isArray(value) && value.length >= 2 && typeof value[1] === 'string' && this.generator && this.generator.blocks && this.generator.blocks[value[1]]) {
+                    throw new CompilerError("Cannot use block reference as table value", field, this.source);
+                }
+                objectValues[key] = value;
+                isArray = false;
+            }
+            // exp (array element)
+            else if (field.children.length === 1) {
+                let value = this.visitExp(field.children[0]);
+                // Allow nested array/table literals; only reject block-reference wrappers
+                if (Array.isArray(value) && value.length >= 2 && typeof value[1] === 'string' && this.generator && this.generator.blocks && this.generator.blocks[value[1]]) {
+                    throw new CompilerError("Cannot use block reference as array value", field, this.source);
+                }
+                arrayValues.push(value);
+            }
+        }
+
+        // Return structured JS array or object
+        if (isArray && Object.keys(objectValues).length === 0) {
+            return arrayValues;
+        } else {
+            // Mixed: add array values as numeric keys (Lua is 1-based)
+            arrayValues.forEach((v, i) => {
+                objectValues[(i + 1).toString()] = v;
+            });
+            return objectValues;
+        }
+    }
+
+    visitArrayconstructor(ctx) {
+        // '[' explist? ']'
+        if (!ctx || !ctx.explist || !ctx.explist()) return "[]";
+        const exps = ctx.explist(0).exp ? ctx.explist(0).exp() : [];
+        const arr = [];
+        for (let i = 0; i < exps.length; i++) {
+            const v = this.visitExp(exps[i]);
+            // Allow nested arrays/objects; only reject block-reference wrappers like [3, id, ...]
+            if (Array.isArray(v) && v.length >= 2 && typeof v[1] === 'string' && this.generator && this.generator.blocks && this.generator.blocks[v[1]]) {
+                throw new CompilerError('Cannot use block reference as array value', ctx, this.source);
+            }
+            arr.push(v);
+        }
+        return arr;
+    }
 }
+
 module.exports = visitor;
