@@ -2,6 +2,11 @@ node_modules
 *.lock
 package-lock.json
 lib/*
+!lib/generator.js
+!lib/pseudocodeToProject.js
 .antlr
 *.jar
 pm-blocks
+*.pmp
+project.json
+vscode-pang

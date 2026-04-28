@@ -94,7 +94,26 @@ function validateText(text, uri) {
   }
 
   try {
-    const chars = new antlr4.InputStream(text);
+    // Prepare a parser-safe copy of the text by removing comments while
+    // preserving newlines and original offsets. This prevents the lexer from
+    // seeing raw comment markers (//, #) which cause mismatched-input errors.
+    // 1) Remove block comments across the whole text (preserve newlines)
+    const textNoBlock = text.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
+    // 2) Remove single-line comments per-line (// and #) by replacing
+    //    the comment span with spaces so columns remain stable.
+    const parsedLines = textNoBlock.split(/\r?\n/).map((ln) => {
+      // find earliest of // or # (if present) and blank out the rest
+      const idx1 = ln.indexOf('//');
+      const idx2 = ln.indexOf('#');
+      let cut = -1;
+      if (idx1 !== -1 && idx2 !== -1) cut = Math.min(idx1, idx2);
+      else if (idx1 !== -1) cut = idx1;
+      else if (idx2 !== -1) cut = idx2;
+      if (cut === -1) return ln;
+      return ln.slice(0, cut) + ' '.repeat(ln.length - cut);
+    });
+    const textForParser = parsedLines.join('\n');
+    const chars = new antlr4.InputStream(textForParser);
     const lexer = new PangLexer(chars);
     const tokens = new antlr4.CommonTokenStream(lexer);
 
@@ -128,15 +147,75 @@ function validateText(text, uri) {
     const keywords = new Set(["on", "let", "const", "if", "else", "print", "ask", "return", "true", "false"]);
     const builtins = new Set(["print", "ask", "on"]);
     const declared = new Map(); // name -> { line, start, end }
-    const lines = text.split(/\r?\n/);
+  // Use the parser-safe text previously prepared (block and single-line
+  // comments were removed into `textForParser`) for semantic scanning as
+  // well so both parser and semantic passes ignore comments.
+  const lines = textForParser.split(/\r?\n/);
 
-    // First pass: find explicit declarations and simple assignments (implicit let)
+    // Helper: remove string contents from a single line while preserving
+    // column indices. Handles escapes for double and single quotes.
+    function stripStringsLine(line) {
+      let out = '';
+      let inSingle = false;
+      let inDouble = false;
+      let inBacktick = false;
+      let escaped = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (escaped) {
+          escaped = false;
+          out += ' ';
+          continue;
+        }
+        if (ch === '\\') {
+          escaped = true;
+          out += ' ';
+          continue;
+        }
+        if (inSingle) {
+          if (ch === "'") { inSingle = false; out += ' '; } else out += ' ';
+          continue;
+        }
+        if (inDouble) {
+          if (ch === '"') { inDouble = false; out += ' '; } else out += ' ';
+          continue;
+        }
+        if (inBacktick) {
+          if (ch === '`') { inBacktick = false; out += ' '; } else out += ' ';
+          continue;
+        }
+        if (ch === "'") { inSingle = true; out += ' '; continue; }
+        if (ch === '"') { inDouble = true; out += ' '; continue; }
+        if (ch === '`') { inBacktick = true; out += ' '; continue; }
+        out += ch;
+      }
+      return out;
+    }
+
+    // Helper: strip single-line comments (// and #) from a processed line,
+    // replacing comment text with spaces so column indices remain valid.
+    function stripSingleLineComments(line) {
+      // Remove // comments
+      const idx = line.search(/\/\//);
+      const idxHash = line.search(/#/);
+      let cut = -1;
+      if (idx !== -1 && idxHash !== -1) cut = Math.min(idx, idxHash);
+      else if (idx !== -1) cut = idx;
+      else if (idxHash !== -1) cut = idxHash;
+      if (cut === -1) return line;
+      return line.slice(0, cut) + ' '.repeat(line.length - cut);
+    }
+
+    // First pass: find explicit declarations and simple assignments
+    // Use processed lines with strings and single-line comments removed so
+    // declarations inside strings/comments are ignored.
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
+      const rawLine = lines[i];
+      const processed = stripSingleLineComments(stripStringsLine(rawLine));
       // let/const declarations
       const declRe = /\b(?:let|const)\s+([a-zA-Z_][a-zA-Z0-9_]*)/g;
       let m;
-      while ((m = declRe.exec(line))) {
+      while ((m = declRe.exec(processed))) {
         const name = m[1];
         declared.set(name, {
           line: i,
@@ -146,10 +225,10 @@ function validateText(text, uri) {
       }
       // simple assignment at line start -> implicit var
       const assignRe = /^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=/;
-      const am = assignRe.exec(line);
+      const am = assignRe.exec(processed);
       if (am) {
         const name = am[1];
-        const idx = line.indexOf(name);
+        const idx = processed.indexOf(name);
         declared.set(name, { line: i, start: idx, end: idx + name.length });
       }
     }
@@ -157,44 +236,13 @@ function validateText(text, uri) {
     // Second pass: find identifier usages that are not declared
     const identRe = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
     for (let i = 0; i < lines.length; i++) {
-      let line = lines[i];
-
-      // First, strip out string contents by finding balanced quotes
-      let processed = "";
-      let inString = false;
-      let escaped = false;
-
-      // Process the line character by character to properly handle strings
-      for (let j = 0; j < line.length; j++) {
-        const char = line[j];
-        if (inString) {
-          if (escaped) {
-            escaped = false;
-            processed += " ";
-          } else if (char === "\\") {
-            escaped = true;
-            processed += " ";
-          } else if (char === '"') {
-            inString = false;
-            processed += '"';
-          } else {
-            processed += " ";
-          }
-        } else {
-          if (char === '"') {
-            inString = true;
-            processed += '"';
-          } else {
-            processed += char;
-          }
-        }
-      }
-      line = processed;
+      const rawLine = lines[i];
+      // Remove strings and single-line comments so comment text is ignored
+      const codeLine = stripSingleLineComments(stripStringsLine(rawLine));
 
       // Find and process each identifier
       let m2;
-      let lastEnd = 0;
-      while ((m2 = identRe.exec(line))) {
+      while ((m2 = identRe.exec(codeLine))) {
         const name = m2[1];
         const start = m2.index;
         const end = m2.index + name.length;
@@ -203,12 +251,11 @@ function validateText(text, uri) {
         if (keywords.has(name) || builtins.has(name)) continue;
 
         // Skip if it's followed by () or . (method/property access)
-        const nextChar = line[end];
+        const nextChar = codeLine[end];
         if (nextChar === "." || nextChar === "(") continue;
 
         // Skip if this is a key in a key:value pair
-        // Look ahead for a colon with only whitespace between identifier and colon
-        const afterIdent = line.slice(end).match(/^\s*:/);
+        const afterIdent = codeLine.slice(end).match(/^\s*:/);
         if (afterIdent) continue;
 
         // Only warn if it's not declared
@@ -221,7 +268,6 @@ function validateText(text, uri) {
           };
           diagnostics.push(diag);
         }
-        lastEnd = end;
       }
     }
 

@@ -4476,7 +4476,23 @@ function validateText(text) {
     return { diagnostics, _declared: /* @__PURE__ */ new Map() };
   }
   try {
-    const chars = new antlr4.InputStream(text);
+    const textNoBlock = text.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
+    const parsedLines = textNoBlock.split(/\r?\n/).map((ln) => {
+      const idx1 = ln.indexOf("//");
+      const idx2 = ln.indexOf("#");
+      let cut = -1;
+      if (idx1 !== -1 && idx2 !== -1)
+        cut = Math.min(idx1, idx2);
+      else if (idx1 !== -1)
+        cut = idx1;
+      else if (idx2 !== -1)
+        cut = idx2;
+      if (cut === -1)
+        return ln;
+      return ln.slice(0, cut) + " ".repeat(ln.length - cut);
+    });
+    const textForParser = parsedLines.join("\n");
+    const chars = new antlr4.InputStream(textForParser);
     const lexer = new PangLexer(chars);
     const tokens = new antlr4.CommonTokenStream(lexer);
     const errors = [];
@@ -4546,6 +4562,12 @@ function validateText(text) {
       (m) => " ".repeat(m.length)
     );
   }
+  function stripComments(s) {
+    s = s.replace(/\/\/.*$/g, (m) => " ".repeat(m.length));
+    s = s.replace(/#.*$/g, (m) => " ".repeat(m.length));
+    s = s.replace(/\/\*[\s\S]*?\*\//g, (m) => " ".repeat(m.length));
+    return s;
+  }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const declRe = /\b(?:let|const)\s+([a-zA-Z_][a-zA-Z0-9_]*)/g;
@@ -4568,8 +4590,8 @@ function validateText(text) {
   const identRe = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
-    const line = stripStrings(rawLine);
-    const codeLine = line.split("//")[0];
+    const noStrings = stripStrings(rawLine);
+    const codeLine = stripComments(noStrings);
     let m2;
     while (m2 = identRe.exec(codeLine)) {
       const name = m2[1];

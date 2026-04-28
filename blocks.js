@@ -102,49 +102,32 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
 
     const processedBlocks = Object.fromEntries(
         Object.entries(blocks).map(([opcode, block]) => {
-            const args = Object.keys(block)
-                .filter(a => a.startsWith('args'))
-                .map(n => block[n])
-                .filter(a => a && a[0]?.type != 'field_image');
+            //if (opcode === "control_inline_stack_output") console.log(block)
+            // Collect arg groups in numeric order (args0, args1, ...)
+            const argGroupKeys = Object.keys(block)
+                .filter(k => k.startsWith('args'))
+                .sort((a, b) => {
+                    const na = parseInt(a.slice(4));
+                    const nb = parseInt(b.slice(4));
+                    return (isNaN(na) ? 0 : na) - (isNaN(nb) ? 0 : nb);
+                });
+            const argGroups = argGroupKeys.map(k => block[k]).filter(Boolean);
 
-            // If the block has an input_statement argument, treat it as a branch-style block
-            if (args.find(k => k.type == 'input_statement')) {
-                const params = (args[0] ?? []).map((arg) => {
-                    if (arg.type == 'field_dropdown') {
-                        return {
-                            name: arg.name,
-                            type: 1,
-                            field: arg.name,
-                            options: arg.options,
-                            variableTypes: arg.variableTypes
-                        };
-                    } else if (arg.type == 'field_image') {
-                        return null;
-                    } else if (arg.type == 'field_variable') {
-                        return {
-                            name: arg.name,
-                            type: 1,
-                            options: arg.options,
-                            variableTypes: arg.variableTypes
-                        };
-                    } else if (arg.type == 'field_variable_getter') {
-                        return null;
-                    } else if (arg.type == 'field_numberdropdown') {
-                        return { name: arg.name, type: 1, variableTypes: arg.variableTypes };
-                    } else if (arg.type == 'input_statement') {
-                        return {};
-                    }
-                    return {
-                        name: arg.name,
-                        // treat input_value as value input (1); treat any field_* or unknown as field (1)
-                        type: arg.type == 'input_value' ? 1 : 1,
-                        variableTypes: arg.variableTypes
-                    };
-                }) ?? [];
-                return [opcode, [params, 'branch', args.filter(k => k.type == 'input_statement').map(i => i.name)]];
+            // Flatten args preserving order, skipping images/getters
+            const elements = [];
+            for (const group of argGroups) {
+                for (const arg of group) {
+                    if (!arg) continue;
+                    if (arg.type === 'field_image' || arg.type === 'field_variable_getter') continue;
+                    elements.push(arg);
+                }
             }
 
-            const params = ((args[0] ?? []).map((arg) => {
+            // Build params preserving original order; include substacks as args
+            const params = (elements.map((arg) => {
+                if (arg.type === 'input_statement') {
+                    return { name: arg.name, type: 'substack' };
+                }
                 if (arg.type == 'field_dropdown') {
                     return {
                         name: arg.name,
@@ -153,8 +136,6 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
                         options: arg.options,
                         variableTypes: arg.variableTypes
                     };
-                } else if (arg.type == 'field_image') {
-                    return null;
                 } else if (arg.type == 'field_variable') {
                     return {
                         name: arg.name,
@@ -162,12 +143,8 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
                         field: arg.name,
                         variableTypes: arg.variableTypes
                     };
-                } else if (arg.type == 'field_variable_getter') {
-                    return null;
                 } else if (arg.type == 'field_numberdropdown') {
-                    return { name: arg.name, type: 1 };
-                } else if (arg.type == 'input_statement') {
-                    return {};
+                    return { name: arg.name, type: 1, variableTypes: arg.variableTypes };
                 }
                 return {
                     name: arg.name,
@@ -176,7 +153,26 @@ function jsBlocksToJSON(jsblocks = globalThis.Blockly.Blocks) {
                 };
             }) ?? []);
 
-            const shape = (block.extensions ?? []).includes('shape_hat') ? 'hat' : 'reporter';
+            // Substack (input_statement) names in order (still provided for compatibility)
+            const substackNames = elements.filter(e => e.type === 'input_statement').map(e => e.name);
+            let name = 'branch'
+            // special case where a block returns a value but also has a substack (e.g. control_inline_stack_output) aka inline block
+            if (block.output === null) name = "reporter_with_substack";
+            if (substackNames.length > 0) {
+                return [opcode, [params, name, substackNames]];
+            }
+
+            // Determine shape for non-branch blocks
+            let shape;
+            if ((block.extensions ?? []).includes('shape_hat')) {
+                shape = 'hat';
+            } else if ((block.extensions ?? []).includes('output_boolean') || (block.extensions ?? []).includes('output_string') || (block.extensions ?? []).includes('output_number')) {
+                shape = 'reporter';
+            } else if ((block.extensions ?? []).includes('shape_statement')) {
+                shape = 'stack';
+            } else {
+                shape = 'stack';
+            }
             return [opcode, [params, shape]];
         })
     );
@@ -188,27 +184,135 @@ module.exports.processedBlocks = jsBlocksToJSON();
 
 // Hardcoded additional processed blocks for extensions and special cases
 Object.assign(module.exports.processedBlocks, {
+    pmOperatorsExpansion_exactlyEqual: [[
+        { name: 'ONE', type: 'number' },
+        { name: 'TWO', type: 'number' }
+    ], "reporter"],
     pmOperatorsExpansion_shiftLeft: [[
         { name: 'num1', type: 'number' },
         { name: 'num2', type: 'number' }
-    ]],
+    ], "reporter"],
     pmOperatorsExpansion_shiftRight: [[
         { name: 'num1', type: 'number' },
         { name: 'num2', type: 'number' }
-    ]],
+    ], "reporter"],
     pmOperatorsExpansion_binnaryAnd: [[
         { name: 'num1', type: 'number' },
         { name: 'num2', type: 'number' }
-    ]],
+    ], "reporter"],
     pmOperatorsExpansion_binnaryOr: [[
         { name: 'num1', type: 'number' },
         { name: 'num2', type: 'number' }
-    ]],
+    ], "reporter"],
     pmOperatorsExpansion_binnaryXor: [[
         { name: 'num1', type: 'number' },
         { name: 'num2', type: 'number' }
-    ]],
+    ], "reporter"],
     pmOperatorsExpansion_binnaryNot: [[
         { name: 'num1', type: 'number' }
-    ]]
+    ], "reporter"]
+});
+
+// Hardcode Temporary Variables (SPtempVars) block metadata so the generator
+// can map positional args to named inputs/fields. These match the extension
+// definition provided in the user's reference and always include the
+// VAR_TYPES dropdown options (global/sprite/thread).
+Object.assign(module.exports.processedBlocks, {
+    // set [TYPE] var [NAME] to [VALUE]
+    setVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], "stack"],
+    // namespaced variants used by extension loader/runtime
+    SPtempVars_setVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], "stack"],
+    // change [TYPE] var [NAME] by [VALUE]
+    changeVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], "stack"],
+    SPtempVars_changeVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], "stack"],
+    // swap [TYPE1] var [NAME1] with [TYPE2] var [NAME2]
+    swapVar: [[
+        { name: 'TYPE1', type: 1, field: 'TYPE1', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME1', type: 1 },
+        { name: 'TYPE2', type: 1, field: 'TYPE2', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME2', type: 1 }
+    ], "stack"],
+    SPtempVars_swapVar: [[
+        { name: 'TYPE1', type: 1, field: 'TYPE1', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME1', type: 1 },
+        { name: 'TYPE2', type: 1, field: 'TYPE2', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME2', type: 1 }
+    ], "stack"],
+    // for each [TYPE] var [NAME] from [START] to [END] increment by [INC_VALUE]
+    forVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 },
+        { name: 'START', type: 'number' },
+        { name: 'END', type: 'number' },
+        { name: 'INC_VALUE', type: 'number' }
+    ], "branch"],
+    SPtempVars_forVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 },
+        { name: 'START', type: 'number' },
+        { name: 'END', type: 'number' },
+        { name: 'INC_VALUE', type: 'number' }
+    ], "branch"],
+    // run thread vars in scope (no args)
+    scopeVar: [[
+    ], "branch"],
+    SPtempVars_scopeVar: [[
+    ], "branch"],
+    // [TYPE] var [NAME] exists?
+    varExists: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 }
+    ], "reporter"],
+    SPtempVars_varExists: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 }
+    ], "reporter"],
+    // get [TYPE] var [NAME]
+    getVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 }
+    ], "reporter"],
+    SPtempVars_getVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 }
+    ], "reporter"],
+    // all [TYPE] variables
+    allVars: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] }
+    ], "reporter"],
+    SPtempVars_allVars: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] }
+    ], "reporter"],
+    // delete all [TYPE] variables
+    deleteAllVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] }
+    ], "stack"],
+    SPtempVars_deleteAllVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] }
+    ], "stack"],
+    // delete [TYPE] var [NAME]
+    deleteVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 }
+    ], "stack"],
+    SPtempVars_deleteVar: [[
+        { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
+        { name: 'NAME', type: 1 }
+    ], "stack"]
 });

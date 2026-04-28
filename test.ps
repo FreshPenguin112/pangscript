@@ -1,9 +1,17 @@
 on("flag", *{
+    print(-9 >>> 2);
+    print(-1 + 2);
+    motion_movesteps(10);
+    print(!true);
+    const foo = "bar";
+    //foo = 5;
     let name = ask("What is your name?");
-    if (name == "Alice") {
+    if (name === "Alice") {
         print("Hello, Alice the Great!", {seconds: 2});
     } else if (name == "Bob") {
         print("Hello, Bob the Great!", {seconds: 2});
+    } else if (name == "John") {
+        print("Hello, John the Great!", {seconds: 2});
     } else {
         print("Hello, " .. (name != "Joe" ? name : "Evil Joe") .. "!", {seconds: 2});
     }

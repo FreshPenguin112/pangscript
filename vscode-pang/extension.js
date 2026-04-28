@@ -151,7 +151,22 @@ function validateText(text) {
     }
 
     try {
-        const chars = new antlr4.InputStream(text);
+        // Strip comments before parsing so the ANTLR lexer doesn't see raw
+        // comment markers which can produce syntax errors. Preserve newlines
+        // and columns by replacing comment text with spaces.
+        const textNoBlock = text.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
+        const parsedLines = textNoBlock.split(/\r?\n/).map((ln) => {
+            const idx1 = ln.indexOf('//');
+            const idx2 = ln.indexOf('#');
+            let cut = -1;
+            if (idx1 !== -1 && idx2 !== -1) cut = Math.min(idx1, idx2);
+            else if (idx1 !== -1) cut = idx1;
+            else if (idx2 !== -1) cut = idx2;
+            if (cut === -1) return ln;
+            return ln.slice(0, cut) + ' '.repeat(ln.length - cut);
+        });
+        const textForParser = parsedLines.join('\n');
+        const chars = new antlr4.InputStream(textForParser);
         const lexer = new PangLexer(chars);
         const tokens = new antlr4.CommonTokenStream(lexer);
         const errors = [];
@@ -229,6 +244,20 @@ function validateText(text) {
             " ".repeat(m.length)
         );
     }
+    
+        // Helper: remove comments (single-line // and #, and block /* */). We
+        // replace with spaces to preserve column indices so diagnostics map
+        // correctly to the original text.
+        function stripComments(s) {
+            // single-line // comments
+            s = s.replace(/\/\/.*$/g, (m) => ' '.repeat(m.length));
+            // hash-style comments (common in some scripts)
+            s = s.replace(/#.*$/g, (m) => ' '.repeat(m.length));
+            // block comments /* ... */ (may span multiple lines but here we run per-line,
+            // so this will only remove block comment fragments on the same line)
+            s = s.replace(/\/\*[\s\S]*?\*\//g, (m) => ' '.repeat(m.length));
+            return s;
+        }
 
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
@@ -253,9 +282,11 @@ function validateText(text) {
     const identRe = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
     for (let i = 0; i < lines.length; i++) {
         const rawLine = lines[i];
-        const line = stripStrings(rawLine);
-        // ignore single-line comments after // to avoid false positives
-        const codeLine = line.split("//")[0];
+            // remove string literals first, then strip comments so neither will
+            // produce identifier tokens; both helpers replace removed content with
+            // spaces to preserve original column indices.
+            const noStrings = stripStrings(rawLine);
+            const codeLine = stripComments(noStrings);
         let m2;
         while ((m2 = identRe.exec(codeLine))) {
             const name = m2[1];

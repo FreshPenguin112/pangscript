@@ -3,10 +3,11 @@
     "@babel/cli": "^7.28.3",
     "@babel/core": "^7.28.5",
     "@babel/plugin-transform-modules-commonjs": "^7.27.1",
-    "antlr4": "^4.13.2"
+    "antlr4": "^4.13.2",
+    "archiver": "^5.3.1"
   },
   "scripts": {
-    "build": " bunx antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && bunx babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs"
+    "build": "bunx antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && bunx babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs"
   },
   "devDependencies": {
     "antlr4ng-cli": "^2.0.0"

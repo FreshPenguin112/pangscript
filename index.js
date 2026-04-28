@@ -4,6 +4,19 @@
 
 const fs = require("fs");
 const path = require("path");
+let archiver;
+function ensureArchiver() {
+  if (archiver) return archiver;
+  try {
+    /* eslint-disable global-require */
+    archiver = require("archiver");
+    /* eslint-enable global-require */
+    return archiver;
+  } catch (e) {
+    console.error('Missing dependency "archiver". Run `npm install archiver` to enable .pmp packaging.');
+    process.exit(1);
+  }
+}
 /* -------------------------
   Template JSON (exact skeleton you provided)
 --------------------------*/
@@ -111,7 +124,12 @@ class AstBuilder extends PangVisitor {
     } catch (e) {
       event = str.replace(/^\"|\"$/g, "");
     }
-    const body = this.visit(ctx.inlineBlock());
+    // Accept either an inlineBlock() or a normal block() to be flexible with
+    // different parser/grammar shapes.
+    let body = null;
+    if (ctx.inlineBlock) body = this.visit(ctx.inlineBlock());
+    else if (ctx.block) body = this.visit(ctx.block());
+    else body = { type: "Block", body: [] };
     return { type: "On", event, body };
   }
 
@@ -120,19 +138,27 @@ class AstBuilder extends PangVisitor {
   visitInlineBlock(ctx) {
     const bodyCtx = ctx.inlineBlockBody();
     const stmts = [];
-    if (bodyCtx && bodyCtx.inlineStatement) {
-      for (let i = 0; i < bodyCtx.inlineStatement().length; i++) {
-        const st = bodyCtx.inlineStatement(i);
-        // inlineStatement may contain a statementItem() (which contains onCall/printCall)
-        if (st.statementItem && st.statementItem()) {
-          const si = st.statementItem();
-          if (si.onCall && si.onCall()) stmts.push(this.visit(si.onCall()));
-          else if (si.printCall && si.printCall()) stmts.push(this.visit(si.printCall()));
-          else if (si.functionCall && si.functionCall()) stmts.push(this.visit(si.functionCall()));
-          else if (si.varDecl && si.varDecl()) stmts.push(this.visit(si.varDecl()));
-          else if (si.assignStmt && si.assignStmt()) stmts.push(this.visit(si.assignStmt()));
-        } else if (st.ifStmt && st.ifStmt()) {
-          stmts.push(this.visit(st.ifStmt()));
+    // Support multiple possible inline block shapes: old `inlineStatement` list
+    // or a direct `statement` list. Be permissive so the grammar can evolve.
+    if (bodyCtx) {
+      if (bodyCtx.inlineStatement) {
+        for (let i = 0; i < bodyCtx.inlineStatement().length; i++) {
+          const st = bodyCtx.inlineStatement(i);
+          if (st.statementItem && st.statementItem()) {
+            const si = st.statementItem();
+            if (si.onCall && si.onCall()) stmts.push(this.visit(si.onCall()));
+            else if (si.printCall && si.printCall()) stmts.push(this.visit(si.printCall()));
+            else if (si.functionCall && si.functionCall()) stmts.push(this.visit(si.functionCall()));
+            else if (si.varDecl && si.varDecl()) stmts.push(this.visit(si.varDecl()));
+            else if (si.assignStmt && si.assignStmt()) stmts.push(this.visit(si.assignStmt()));
+          } else if (st.ifStmt && st.ifStmt()) {
+            stmts.push(this.visit(st.ifStmt()));
+          }
+        }
+      } else if (bodyCtx.statement) {
+        for (let i = 0; i < bodyCtx.statement().length; i++) {
+          const s = this.visit(bodyCtx.statement(i));
+          if (s) stmts.push(s);
         }
       }
     }
@@ -212,15 +238,16 @@ class AstBuilder extends PangVisitor {
   }
 
   visitExpr(ctx) {
-    let node = null;
-
-    // Handle unary NOT
-    if (ctx.children && ctx.children[0] && ctx.children[0].getText() === "!") {
-      node = { type: "Unary", op: "!", operand: this.visit(ctx.expr(0)) };
+    // Prefer explicit unary handling for leading unary operators
+    if (ctx.children && ctx.children[0] && ctx.children[0].getText) {
+      const firstTok = ctx.children[0].getText();
+      if (firstTok === "!" || firstTok === "~" || firstTok === "+" || firstTok === "-") {
+        return { type: "Unary", op: firstTok, operand: this.visit(ctx.expr(0)) };
+      }
     }
+
     // Ternary conditional: expr '?' expr ':' expr
-    else if (ctx.children && ctx.children.length === 5) {
-      // look for '?' token among children to detect ternary
+    if (ctx.children && ctx.children.length === 5) {
       const hasQuestion = ctx.children.some(
         (c) => c && typeof c.getText === "function" && c.getText() === "?"
       );
@@ -228,47 +255,108 @@ class AstBuilder extends PangVisitor {
         const cond = this.visit(ctx.expr(0));
         const thenExpr = this.visit(ctx.expr(1));
         const elseExpr = this.visit(ctx.expr(2));
-        node = { type: "Ternary", cond, thenExpr, elseExpr };
+        return { type: "Ternary", cond, thenExpr, elseExpr };
       }
     }
-    // Handle binary operators
-    else if (ctx.children && ctx.children.length === 3) {
-      const left = this.visit(ctx.expr(0));
-      const op = ctx.children[1].getText();
-      const right = this.visit(ctx.expr(1));
 
-      // All binary operators (math and logical)
-      if (
-        op === "**" ||
-        op === "*" ||
-        op === "/" ||
-        op === "+" ||
-        op === "-" ||
-        op === ".." ||
-        op === ">" ||
-        op === ">=" ||
-        op === "<" ||
-        op === "<=" ||
-        op === "==" ||
-        op === "===" ||
-        op === "!=" ||
-        op === "!==" ||
-        op === "&&" ||
-        op === "||"
-      ) {
-        node = { type: "Binary", op, left, right };
+    // Flatten left-recursive binary expression tree into operands and operators
+    const operands = [];
+    const operators = [];
+    const self = this;
+
+    function isBinaryNode(n) {
+      return (n && typeof n.expr === 'function' && n.expr(0) && n.expr(1) && n.children && n.children.length === 3 && n.children[1].getText() !== '?' );
+    }
+
+    function helper(n) {
+      if (!n) return;
+      if (isBinaryNode(n)) {
+        helper(n.expr(0));
+        operators.push(n.children[1].getText());
+        helper(n.expr(1));
+      } else {
+        // atomic node: handle primary/function/print/ident/number/string specially
+        if (typeof n.primary === 'function' && n.primary()) {
+          operands.push(self.visit(n.primary()));
+          return;
+        }
+        if (typeof n.functionCall === 'function' && n.functionCall()) {
+          operands.push(self.visit(n.functionCall()));
+          return;
+        }
+        if (typeof n.printCall === 'function' && n.printCall()) {
+          operands.push(self.visit(n.printCall()));
+          return;
+        }
+        if (n.NUMBER && typeof n.NUMBER === 'function' && n.NUMBER()) {
+          operands.push({ type: 'Literal', litType: 'number', value: Number(n.NUMBER().getText()) });
+          return;
+        }
+        if (n.STRING && typeof n.STRING === 'function' && n.STRING()) {
+          const s = n.STRING().getText();
+          try { operands.push({ type: 'Literal', litType: 'string', value: JSON.parse(s) }); return; } catch (e) { operands.push({ type: 'Literal', litType: 'string', value: s.replace(/^"|"$/g, "") }); return; }
+        }
+        if (n.getText && (n.getText() === 'true' || n.getText() === 'false')) { operands.push({ type: 'Literal', litType: 'boolean', value: n.getText() === 'true' }); return; }
+        if (n.IDENT && typeof n.IDENT === 'function' && n.IDENT()) { operands.push({ type: 'Var', name: n.IDENT().getText() }); return; }
+        // fallback to visiting the node
+        const val = self.visit(n);
+        operands.push(val);
       }
     }
-    // Handle primary
-    else if (ctx.primary()) {
-      node = this.visit(ctx.primary());
-    }
-    // Handle child expr
-    else if (ctx.expr(0)) {
-      node = this.visit(ctx.expr(0));
+
+    helper(ctx);
+
+    if (operators.length === 0) {
+      return operands[0] || null;
     }
 
-    return node;
+    // Precedence levels (high -> low). Matches JavaScript operator precedence order.
+    const PRECEDENCE_LEVELS = [
+      ["**"],
+      ["*", "/"],
+      // include string concat '..' alongside + and - so concatenation chains are combined
+      ["+", "-", ".."],
+      ["<<", ">>", ">>>"],
+      ["<", "<=", ">", ">="],
+      ["==", "!=", "===", "!=="],
+      ["&"],
+      ["^"],
+      ["|"],
+      ["&&"],
+      ["||"]
+    ];
+
+    let values = operands.slice();
+    let ops = operators.slice();
+
+    for (let level = 0; level < PRECEDENCE_LEVELS.length; level++) {
+      const levelOps = PRECEDENCE_LEVELS[level];
+      const rightAssoc = (level === 0); // `**` is right-associative
+      if (rightAssoc) {
+        for (let i = ops.length - 1; i >= 0; i--) {
+          if (levelOps.includes(ops[i])) {
+            const left = values[i];
+            const right = values[i + 1];
+            const combined = { type: "Binary", op: ops[i], left, right };
+            values.splice(i, 2, combined);
+            ops.splice(i, 1);
+          }
+        }
+      } else {
+        for (let i = 0; i < ops.length; i++) {
+          if (levelOps.includes(ops[i])) {
+            const left = values[i];
+            const right = values[i + 1];
+            const combined = { type: "Binary", op: ops[i], left, right };
+            values.splice(i, 2, combined);
+            ops.splice(i, 1);
+            i--;
+          }
+        }
+      }
+    }
+
+    return values[0] || null;
   }
   visitPrimary(ctx) {
     if (ctx.NUMBER()) return { type: "Literal", litType: "number", value: Number(ctx.NUMBER().getText()) };
@@ -374,602 +462,197 @@ function parseWithAntlr(source) {
 /* -------------------------
   Emitter: create blocks map (targets[1].blocks)
 --------------------------*/
-function emitProject(astStmts) {
-  const blocks = {};
-  const genId = makeLetterIdGenerator();
-  let askUsed = false;
+// Delegate block/project generation to lib/generator.js so index.js contains no
+// manual block generation logic.
+const generator = require("./lib/generator");
 
-  function emitSequence(stmts, containerParent = null) {
-    let firstId = null;
-    let lastId = null;
-    for (const st of stmts) {
-      const { first, last } = emitStmt(st);
-      if (!firstId) firstId = first;
-      if (lastId) {
-        blocks[lastId].next = first;
-        // following sample: set parent of new first to previous last
-        blocks[first].parent = lastId;
-      } else if (containerParent != null) {
-        blocks[first].parent = containerParent;
+/* -------------------------
+  CLI: glue
+--------------------------*/
+const input = process.argv[2]
+  ? fs.readFileSync(process.argv[2], "utf8")
+  : fs.readFileSync(path.join(__dirname, "test.ps"), "utf8");
+const outJSONLocation = process.argv[3] || path.join(__dirname, "project.json");
+
+// Do not strip comments here; ANTLR grammar handles both // and /* */ comments via lexer rules.
+const cleaned = input;
+
+// Decide whether input is nested JSON or source code. We must always use
+// nested JSON internally, so convert any parsed AST into nested JSON first.
+let nestedInput = null;
+// Try parse as JSON first (user may have provided nested JSON file)
+try {
+  const parsed = JSON.parse(cleaned);
+  if (Array.isArray(parsed) || (parsed && typeof parsed === "object")) {
+    nestedInput = parsed;
+  }
+} catch (e) {
+  // not JSON — fall back to parsing as source code below
+}
+
+if (!nestedInput) {
+  // Parse with ANTLR and build AST
+  let ast;
+  try {
+    ast = parseWithAntlr(cleaned);
+    //console.log('AST built (ANTLR)');
+  } catch (e) {
+    console.error("Parse/AST error:", (e && e.message) || e);
+    if (e && e.stack) console.error(e.stack);
+    process.exit(1);
+  }
+
+  // Debug: locate any Print statements that contain concat '..' expressions
+  function containsConcat(node) {
+    if (!node) return false;
+    if (node.type === 'Binary' && node.op === '..') return true;
+    if (node.type === 'Binary') return containsConcat(node.left) || containsConcat(node.right);
+    if (node.type === 'Ternary') return containsConcat(node.cond) || containsConcat(node.thenExpr) || containsConcat(node.elseExpr);
+    if (node.type === 'Unary') return containsConcat(node.operand);
+    if (node.type === 'Call' && Array.isArray(node.args)) return node.args.some(containsConcat);
+    return false;
+  }
+
+  // Enforce const immutability: scan AST in source order and error on assignments
+  // to variables previously declared with `const`.
+  function enforceConstImmutability(rootAst) {
+    const consts = new Set();
+
+    function walkStatement(stmt) {
+      if (!stmt) return;
+      if (Array.isArray(stmt)) {
+        for (const s of stmt) walkStatement(s);
+        return;
       }
-      lastId = last;
-    }
-    return { first: firstId, last: lastId };
-  }
-
-  function emitStmt(stmt) {
-    if (stmt.type === "Print") return emitPrint(stmt);
-    if (stmt.type === "If") return emitIf(stmt);
-    if (stmt.type === "Call") return emitCallStmt(stmt);
-    if (stmt.type === "Declare") return emitDeclare(stmt);
-    if (stmt.type === "Assign") return emitAssign(stmt);
-    throw new Error("emitStmt: unsupported stmt type " + stmt.type);
-  }
-
-  // Variable storage: varName -> { varKey, typeId, kind }
-  const varInfo = {};
-  const variables = {};
-
-  function ensureVariable(name, kind = "let", initExpr) {
-    if (varInfo[name]) return varInfo[name];
-    const varKey = genId() + "|" + name;
-    const typeId = Math.random().toString(36).slice(2, 10);
-    // Determine initial value for project variables mapping
-    let initial = 0;
-    if (initExpr && initExpr.type === "Literal" && initExpr.litType === "number")
-      initial = Number(initExpr.value);
-    variables[varKey] = [name, initial];
-    varInfo[name] = { varKey, typeId, kind };
-    return varInfo[name];
-  }
-
-  function emitSetVar(name, valueExpr, allowConstInit = false) {
-    // Create variable if necessary (implicit let)
-    const info =
-      varInfo[name] ||
-      ensureVariable(name, "let", valueExpr && valueExpr.type === "Literal" ? valueExpr : null);
-    if (info.kind === "const" && !allowConstInit) throw new Error("Cannot assign to const " + name);
-
-    const id = genId();
-    const inputs = {};
-    // NAME is literal string
-    inputs.NAME = [1, [InputTypes.text, String(name)]];
-    // VALUE may be a literal or reporter
-    if (!valueExpr) inputs.VALUE = [1, [InputTypes.text, ""]];
-    else if (valueExpr.type === "lit") inputs.VALUE = valueExpr.value;
-    else {
-      inputs.VALUE = [3, valueExpr.id, makeShadowForExpr(valueExpr.node || null)];
-      // attach child parent
-      blocks[valueExpr.id].parent = id;
-    }
-    const fields = { TYPE: ["global", info.typeId] };
-    blocks[id] = {
-      opcode: "SPtempVars_setVar",
-      next: null,
-      parent: null,
-      inputs,
-      fields,
-      shadow: false,
-      topLevel: false,
-    };
-    return { first: id, last: id };
-  }
-
-  function emitGetVar(name) {
-    const info = varInfo[name] || ensureVariable(name, "let", null);
-    const id = genId();
-    const inputs = { NAME: [1, [InputTypes.text, String(name)]] };
-    const fields = { TYPE: ["global", info.typeId] };
-    blocks[id] = {
-      opcode: "SPtempVars_getVar",
-      next: null,
-      parent: null,
-      inputs,
-      fields,
-      shadow: false,
-      topLevel: false,
-    };
-    return { type: "id", id, node: { type: "Var", name } };
-  }
-
-  function emitCallStmt(stmt) {
-    // statement-level call: create a block with opcode = stmt.name
-    const id = genId();
-    // Try to use metadata to map positional args -> real input names
-    let inputs = {};
-    const meta = blocksMeta[stmt.name];
-    if (meta && Array.isArray(meta)) {
-      const params = meta[0] || [];
-      if (stmt.args && stmt.args.length > 0) {
-        for (let i = 0; i < stmt.args.length; i++) {
-          const param = params[i] || { name: "INPUT" + (i + 1), type: null };
-          const inName = param.name || "INPUT" + (i + 1);
-          const a = stmt.args[i];
-          if (!a) {
-            inputs[inName] = [1, [InputTypes.text, ""]];
-          } else if (a.type === "Literal") {
-            // prefer param.type if available
-            if (param.type === "number" || a.litType === "number")
-              inputs[inName] = [1, [InputTypes.math_number, String(a.value)]];
-            else inputs[inName] = [1, [InputTypes.text, String(a.value)]];
-          } else {
-            const emitted = emitExpression(a);
-            if (!emitted) inputs[inName] = [1, [InputTypes.text, ""]];
-            else if (emitted.type === "lit") inputs[inName] = emitted.value;
-            else {
-              inputs[inName] = [3, emitted.id, makeShadowForExpr(a)];
-              blocks[emitted.id].parent = id;
-            }
+      switch (stmt.type) {
+        case 'Declare':
+          if (stmt.kind === 'const') {
+            consts.add(stmt.name);
           }
-        }
-      }
-    } else {
-      // fallback to generic INPUTn mapping
-      if (stmt.args && stmt.args.length > 0) {
-        for (let i = 0; i < stmt.args.length; i++) {
-          const a = stmt.args[i];
-          const inName = "INPUT" + (i + 1);
-          if (!a) {
-            inputs[inName] = [1, [InputTypes.text, ""]];
-          } else if (a.type === "Literal") {
-            if (a.litType === "number") inputs[inName] = [1, [InputTypes.math_number, String(a.value)]];
-            else inputs[inName] = [1, [InputTypes.text, String(a.value)]];
-          } else {
-            const emitted = emitExpression(a);
-            if (emitted.type === "lit") inputs[inName] = emitted.value;
-            else {
-              inputs[inName] = [3, emitted.id, makeShadowForExpr(a)];
-              blocks[emitted.id].parent = id;
-            }
+          break;
+        case 'Assign':
+          if (consts.has(stmt.name)) {
+            throw new Error(`Cannot reassign to const '${stmt.name}'`);
           }
-        }
-      }
-    }
-    blocks[id] = {
-      opcode: stmt.name,
-      next: null,
-      parent: null,
-      inputs,
-      fields: {},
-      shadow: false,
-      topLevel: false,
-    };
-    return { first: id, last: id };
-  }
-
-  function emitDeclare(stmt) {
-    // stmt: { type: 'Declare', kind, name, value }
-    if (varInfo[stmt.name]) throw new Error("Variable " + stmt.name + " already declared");
-    ensureVariable(stmt.name, stmt.kind, stmt.value);
-    if (stmt.value) {
-      // emit initial set
-      const val =
-        stmt.value.type === "Literal"
-          ? {
-              type: "lit",
-              value:
-                stmt.value.litType === "number"
-                  ? [1, [InputTypes.math_number, String(stmt.value.value)]]
-                  : [1, [InputTypes.text, String(stmt.value.value)]],
-            }
-          : emitExpression(stmt.value);
-      return emitSetVar(stmt.name, val, true);
-    }
-    return { first: null, last: null };
-  }
-
-  function emitAssign(stmt) {
-    // stmt: { type: 'Assign', name, value }
-    if (!stmt || !stmt.value) return { first: null, last: null };
-    const value =
-      stmt.value.type === "Literal"
-        ? {
-            type: "lit",
-            value:
-              stmt.value.litType === "number"
-                ? [1, [InputTypes.math_number, String(stmt.value.value)]]
-                : [1, [InputTypes.text, String(stmt.value.value)]],
+          break;
+        case 'If':
+          for (const c of stmt.cases) {
+            walkExpression(c.cond);
+            walkStatement(c.thenBlock && c.thenBlock.body);
           }
-        : emitExpression(stmt.value);
-    return emitSetVar(stmt.name, value);
-  }
-
-  function emitPrint(node) {
-    // MESSAGE should accept expressions. Emit expression first.
-    const exprRes = emitExpression(node.expr);
-    const hasSecs =
-      node.options &&
-      (typeof node.options.seconds === "number" ||
-        (node.options.seconds && typeof node.options.seconds === "object"));
-    const opcode = hasSecs ? "looks_sayforsecs" : "looks_say";
-
-    // create block id early so child reporter parents can be attached
-    const id = genId();
-
-    // Build MESSAGE input: either a literal ([1,[type,value]]) or reporter ref ([3, id, shadow])
-    let messageInput;
-    if (!exprRes) {
-      // fallback to empty text
-      messageInput = [1, [InputTypes.text, ""]];
-    } else if (exprRes.type === "lit") {
-      messageInput = exprRes.value;
-    } else {
-      // reporter: [3, childId, shadow]
-      const shadowLit = makeShadowForExpr(node.expr);
-      messageInput = [3, exprRes.id, shadowLit];
+          if (stmt.elseBlock) walkStatement(stmt.elseBlock.body);
+          break;
+        case 'Block':
+          for (const s of stmt.body || []) walkStatement(s);
+          break;
+        case 'On':
+          if (stmt.body && stmt.body.body) walkStatement(stmt.body.body);
+          break;
+        default:
+          if (stmt.body && Array.isArray(stmt.body)) walkStatement(stmt.body);
+          break;
+      }
     }
 
-    const inputs = { MESSAGE: messageInput };
+    function walkExpression(expr) {
+      if (!expr) return;
+      if (Array.isArray(expr)) {
+        for (const e of expr) walkExpression(e);
+        return;
+      }
+      switch (expr.type) {
+        case 'Binary':
+          walkExpression(expr.left);
+          walkExpression(expr.right);
+          break;
+        case 'Unary':
+          walkExpression(expr.operand);
+          break;
+        case 'Ternary':
+          walkExpression(expr.cond);
+          walkExpression(expr.thenExpr);
+          walkExpression(expr.elseExpr);
+          break;
+        case 'Call':
+          for (const a of expr.args || []) walkExpression(a);
+          break;
+        default:
+          break;
+      }
+    }
 
-    // Build SECS input (seconds) — accept numeric literal or expression
-    if (hasSecs) {
-      if (typeof node.options.seconds === "number") {
-        inputs.SECS = [1, [InputTypes.math_number, String(node.options.seconds)]];
+    for (const node of rootAst) {
+      if (node && node.type === 'On' && node.body && node.body.body) {
+        for (const st of node.body.body) walkStatement(st);
       } else {
-        const secsRes = emitExpression(node.options.seconds);
-        if (!secsRes) {
-          inputs.SECS = [1, [InputTypes.math_number, "0"]];
-        } else if (secsRes.type === "lit") {
-          inputs.SECS = secsRes.value;
-        } else {
-          inputs.SECS = [3, secsRes.id, makeShadowForExpr(node.options.seconds)];
-          // attach child parent to this print block
-          blocks[secsRes.id].parent = id;
-        }
+        walkStatement(node);
       }
-    }
-
-    blocks[id] = { opcode, next: null, parent: null, inputs, fields: {}, shadow: false, topLevel: false };
-
-    // If MESSAGE used a child reporter, set its parent to this print block
-    if (exprRes && exprRes.type === "id") {
-      blocks[exprRes.id].parent = id;
-    }
-
-    return { first: id, last: id };
-  }
-
-  // Helper: decide a sensible shadow literal for an expression AST node.
-  function makeShadowForExpr(exprNode) {
-    if (!exprNode) return [InputTypes.text, ""];
-    if (exprNode.type === "Literal") {
-      if (exprNode.litType === "number") return [InputTypes.math_number, String(exprNode.value)];
-      if (exprNode.litType === "string") return [InputTypes.text, String(exprNode.value)];
-      // booleans: use text form
-      return [InputTypes.text, String(exprNode.value)];
-    }
-    // For binary/unary expressions, prefer numeric shadow if it's a math op, otherwise text
-    if (exprNode.type === "Binary") {
-      if (["+", "-", "*", "/", "**"].includes(exprNode.op)) return [InputTypes.math_number, "0"];
-      return [InputTypes.text, ""];
-    }
-    if (exprNode.type === "Unary") {
-      if (exprNode.op === "!") return [InputTypes.text, "false"];
-      return [InputTypes.text, ""];
-    }
-    return [InputTypes.text, ""];
-  }
-  // Map an operator token to the Scratch opcode for that operator
-  function mapOpToOpcode(op) {
-    switch (op) {
-      case ">":
-        return "operator_gt";
-      case "<":
-        return "operator_lt";
-      case ">=":
-        return "operator_gtorequal";
-      case "<=":
-        return "operator_ltorequal";
-      case "==":
-      case "===":
-        return "operator_equals";
-      case "!=":
-      case "!==":
-        return "operator_notequal";
-      case "&&":
-        return "operator_and";
-      case "||":
-        return "operator_or";
-      case "!":
-        return "operator_not";
-      case "+":
-        return "operator_add";
-      case "-":
-        return "operator_subtract";
-      case "*":
-        return "operator_multiply";
-      case "/":
-        return "operator_divide";
-      case "**":
-        return "operator_power";
-      default:
-        throw new Error("emit: unsupported operator " + op);
     }
   }
 
-  // Emit an expression AST node into either a literal description or a reporter block id.
-  // Returns { type: 'lit', value: [1,[typeCode, stringValue]] } or { type: 'id', id }
-  function emitExpression(exprNode) {
-    if (!exprNode) return null;
-    if (exprNode.type === "Var") {
-      return emitGetVar(exprNode.name, exprNode);
+  try {
+    enforceConstImmutability(ast);
+  } catch (e) {
+    console.error('Const assignment error:', e.message);
+    process.exit(1);
+  }
+
+  // Convert AST to nested JSON form (canonical representation generator expects)
+  function exprToNested(expr) {
+    if (!expr) return "";
+    if (expr.type === "Literal") return expr.value;
+    if (expr.type === "Var") return { type: "Var", name: expr.name };
+    if (expr.type === "Call") {
+      const name = expr.name;
+      // Lookup block metadata to learn param ordering and shape
+      const meta = blocksMeta[name] || blocksMeta[name.replace(/^operator_/, "operator_")] || null;
+      const params = meta ? meta[0] : null;
+      const shape = meta ? meta[1] : null;
+
+      if (Array.isArray(params) && params.length > 0) {
+        const argsArr = [];
+        for (let i = 0; i < params.length; i++) {
+          const a = expr.args && expr.args[i] !== undefined ? expr.args[i] : undefined;
+          argsArr.push(a === undefined ? "" : exprToNested(a));
+        }
+        // append any extra positional args after declared params
+        if (expr.args && expr.args.length > params.length) {
+          for (let i = params.length; i < expr.args.length; i++) argsArr.push(exprToNested(expr.args[i]));
+        }
+        return { opcode: name, args: argsArr, __shape: shape };
+      }
+
+      return { opcode: name, args: (expr.args || []).map(exprToNested), __shape: shape };
     }
-    if (exprNode.type === "Ternary") {
-      // Emit conditional reporter: control_if_return_else_return
-      // cond ? thenExpr : elseExpr
-      const condRes = emitExpression(exprNode.cond);
-      if (!condRes) throw new Error("emitExpression: ternary condition missing");
-      // ensure condition is a reporter id; if it's a literal, coerce it by emitting a boolean shadow block
-      if (condRes.type !== "id") {
-        // create boolean shadow (use operator_equals comparing literal to literal false?) — instead use checkbox shadow and a simple boolean shadow
-        const boolId = genId();
-        // create a tiny boolean block (shadow true/false) depending on truthiness
-        const boolOpcode =
-          condRes.type === "lit" &&
-          condRes.value &&
-          condRes.value[1] &&
-          String(condRes.value[1][1]) === "true"
-            ? "operator_trueBoolean"
-            : "operator_falseBoolean";
-        blocks[boolId] = {
-          opcode: boolOpcode,
-          next: null,
-          parent: null,
-          inputs: {},
-          fields: {},
-          shadow: true,
-          topLevel: true,
-        };
-        // use that as the condition id
-        condRes.id = boolId;
-        condRes.type = "id";
-      }
-
-      // create a checkbox shadow as the boolean shadow input (like the if emitter)
-      const checkboxId = genId();
-      const checkboxUnique = Math.random().toString(36).slice(2, 10);
-      blocks[checkboxId] = {
-        opcode: "checkbox",
-        next: null,
-        parent: null,
-        inputs: {},
-        fields: { CHECKBOX: ["FALSE", checkboxUnique] },
-        shadow: true,
-        topLevel: true,
-        x: 329,
-        y: 425,
-      };
-
-      const id = genId();
-      const inputs = {};
-      // boolean input uses the cond reporter with the checkbox shadow
-      inputs.boolean = [3, condRes.id, checkboxId];
-
-      // Then and Else expressions: can be literals or reporters
-      // TEXT1: thenExpr
-      if (!exprNode.thenExpr) inputs.TEXT1 = [1, [InputTypes.text, ""]];
-      else if (exprNode.thenExpr.type === "Literal") {
-        const t = exprNode.thenExpr;
-        inputs.TEXT1 =
-          t.litType === "number"
-            ? [1, [InputTypes.math_number, String(t.value)]]
-            : [1, [InputTypes.text, String(t.value)]];
-      } else {
-        const thenRes = emitExpression(exprNode.thenExpr);
-        if (!thenRes) inputs.TEXT1 = [1, [InputTypes.text, ""]];
-        else if (thenRes.type === "lit") inputs.TEXT1 = thenRes.value;
-        else {
-          inputs.TEXT1 = [3, thenRes.id, makeShadowForExpr(exprNode.thenExpr)];
-          blocks[thenRes.id].parent = id;
-        }
-      }
-
-      // TEXT2: elseExpr
-      if (!exprNode.elseExpr) inputs.TEXT2 = [1, [InputTypes.text, ""]];
-      else if (exprNode.elseExpr.type === "Literal") {
-        const t = exprNode.elseExpr;
-        inputs.TEXT2 =
-          t.litType === "number"
-            ? [1, [InputTypes.math_number, String(t.value)]]
-            : [1, [InputTypes.text, String(t.value)]];
-      } else {
-        const elseRes = emitExpression(exprNode.elseExpr);
-        if (!elseRes) inputs.TEXT2 = [1, [InputTypes.text, ""]];
-        else if (elseRes.type === "lit") inputs.TEXT2 = elseRes.value;
-        else {
-          inputs.TEXT2 = [3, elseRes.id, makeShadowForExpr(exprNode.elseExpr)];
-          blocks[elseRes.id].parent = id;
-        }
-      }
-
-      blocks[id] = {
+    if (expr.type === "Ternary") {
+      // Represent ternary using positional args so nested objects are preserved
+      return {
         opcode: "control_if_return_else_return",
-        next: null,
-        parent: null,
-        inputs,
-        fields: {},
-        shadow: false,
-        topLevel: false,
+        args: [exprToNested(expr.cond), exprToNested(expr.thenExpr), exprToNested(expr.elseExpr)]
       };
-      // attach condition parent
-      blocks[condRes.id].parent = id;
-      return { type: "id", id, node: exprNode };
     }
-    if (exprNode.type === "Literal") {
-      if (exprNode.litType === "boolean") {
-        const boolOpcode = exprNode.value ? "operator_trueBoolean" : "operator_falseBoolean";
-        const id = genId();
-        blocks[id] = {
-          opcode: boolOpcode,
-          next: null,
-          parent: null,
-          inputs: {},
-          fields: {},
-          shadow: true,
-          topLevel: true,
-        };
-        return { type: "id", id, node: exprNode };
-      }
-      if (exprNode.litType === "number")
-        return { type: "lit", value: [1, [InputTypes.math_number, String(exprNode.value)]] };
-      return { type: "lit", value: [1, [InputTypes.text, String(exprNode.value)]] };
-    }
-    if (exprNode.type === "Call") {
-      // Special-case `ask(...)` to emit an inline-stack reporter that asks and returns the answer
-      if (exprNode.name === "ask") {
-        askUsed = true;
-        // create sensing_answer reporter
-        const answerId = genId();
-        blocks[answerId] = {
-          opcode: "sensing_answer",
-          next: null,
-          parent: null,
-          inputs: {},
-          fields: {},
-          shadow: false,
-          topLevel: false,
-        };
-
-        // create procedures_return block (returns the answer reporter)
-        const retId = genId();
-        blocks[retId] = {
-          opcode: "procedures_return",
-          next: null,
-          parent: null,
-          inputs: { return: [3, answerId, [InputTypes.text, "1"]] },
-          fields: {},
-          shadow: false,
-          topLevel: false,
-        };
-        blocks[answerId].parent = retId;
-
-        // create sensing_askandwait block with QUESTION argument
-        const askId = genId();
-        const arg = exprNode.args && exprNode.args[0];
-        let qInput = [1, [InputTypes.text, ""]];
-        if (arg && arg.type === "Literal") {
-          qInput =
-            arg.litType === "number"
-              ? [1, [InputTypes.math_number, String(arg.value)]]
-              : [1, [InputTypes.text, String(arg.value)]];
-        } else if (arg) {
-          const emitted = emitExpression(arg);
-          if (emitted && emitted.type === "lit") qInput = emitted.value;
-          else if (emitted && emitted.type === "id") {
-            qInput = [3, emitted.id, makeShadowForExpr(arg)];
-            blocks[emitted.id].parent = askId;
-          }
+    if (expr.type === "Unary") {
+      // Handle unary +/-. For +, just return the operand. For - with a numeric
+      // literal, return a negative literal so the converter emits a single
+      // numeric shadow (e.g. -9). For non-literal operands, emit a
+      // subtract call with a blank first arg so the converter produces a
+      // block with NUM1 blank and NUM2 referencing the operand block.
+      if (expr.op === "+") return exprToNested(expr.operand);
+      if (expr.op === "-") {
+        const opd = expr.operand;
+        if (opd && opd.type === "Literal" && opd.litType === "number") {
+          return -Number(opd.value);
         }
-        blocks[askId] = {
-          opcode: "sensing_askandwait",
-          next: retId,
-          parent: null,
-          inputs: { QUESTION: qInput },
-          fields: {},
-          shadow: false,
-          topLevel: false,
-        };
-        blocks[retId].parent = askId;
-
-        // create inline stack reporter block that wraps SUBSTACK pointing to askId
-        const inlineId = genId();
-        blocks[inlineId] = {
-          opcode: "control_inline_stack_output",
-          next: null,
-          parent: null,
-          inputs: { SUBSTACK: [2, askId] },
-          fields: {},
-          shadow: false,
-          topLevel: false,
-        };
-        // set parents for the inner blocks
-        blocks[askId].parent = inlineId;
-        blocks[retId].parent = askId; // already set
-        blocks[answerId].parent = retId; // already set
-
-        return { type: "id", id: inlineId, node: exprNode };
+        // produce args ["", operand] to make NUM1 blank and NUM2 the block
+        return { opcode: generator.mapOpToOpcode(expr.op), args: ["", exprToNested(opd)] };
       }
-      // Emit a reporter block for the call; opcode = name
-      const id = genId();
-      // Try to use metadata to map positional args -> real input names
-      const meta = blocksMeta[exprNode.name];
-      let inputs = {};
-      if (meta && Array.isArray(meta)) {
-        const params = meta[0] || [];
-        if (exprNode.args && exprNode.args.length > 0) {
-          for (let i = 0; i < exprNode.args.length; i++) {
-            const param = params[i] || { name: "INPUT" + (i + 1), type: null };
-            const inName = param.name || "INPUT" + (i + 1);
-            const a = exprNode.args[i];
-            if (!a) {
-              inputs[inName] = [1, [InputTypes.text, ""]];
-            } else if (a.type === "Literal") {
-              if (param.type === "number" || a.litType === "number")
-                inputs[inName] = [1, [InputTypes.math_number, String(a.value)]];
-              else inputs[inName] = [1, [InputTypes.text, String(a.value)]];
-            } else {
-              const emitted = emitExpression(a);
-              if (!emitted) throw new Error("emitExpression: call arg missing");
-              if (emitted.type === "lit") inputs[inName] = emitted.value;
-              else {
-                inputs[inName] = [3, emitted.id, makeShadowForExpr(a)];
-                blocks[emitted.id].parent = id;
-              }
-            }
-          }
-        }
-      } else {
-        // fallback to generic INPUTn mapping
-        if (exprNode.args && exprNode.args.length > 0) {
-          for (let i = 0; i < exprNode.args.length; i++) {
-            const a = exprNode.args[i];
-            const inName = "INPUT" + (i + 1);
-            if (!a) {
-              inputs[inName] = [1, [InputTypes.text, ""]];
-            } else if (a.type === "Literal") {
-              if (a.litType === "number") inputs[inName] = [1, [InputTypes.math_number, String(a.value)]];
-              else inputs[inName] = [1, [InputTypes.text, String(a.value)]];
-            } else {
-              const emitted = emitExpression(a);
-              if (!emitted) throw new Error("emitExpression: call arg missing");
-              if (emitted.type === "lit") inputs[inName] = emitted.value;
-              else {
-                inputs[inName] = [3, emitted.id, makeShadowForExpr(a)];
-                blocks[emitted.id].parent = id;
-              }
-            }
-          }
-        }
-      }
-      blocks[id] = {
-        opcode: exprNode.name,
-        next: null,
-        parent: null,
-        inputs,
-        fields: {},
-        shadow: false,
-        topLevel: false,
-      };
-      return { type: "id", id, node: exprNode };
+      // other unary ops (!, ~)
+      const op = generator.mapOpToOpcode(expr.op);
+      return { opcode: op, args: [exprToNested(expr.operand)] };
     }
-    if (exprNode.type === "Unary") {
-      const opcode = mapOpToOpcode(exprNode.op);
-      const id = genId();
-      const inputs = {};
-      const operand = emitExpression(exprNode.operand);
-      if (!operand) throw new Error("emitExpression: unary operand missing");
-      if (operand.type === "lit") inputs.OPERAND = operand.value;
-      else {
-        inputs.OPERAND = [3, operand.id, null];
-        blocks[operand.id].parent = id;
-      }
-      blocks[id] = { opcode, next: null, parent: null, inputs, fields: {}, shadow: false, topLevel: false };
-      return { type: "id", id, node: exprNode };
-    }
-    if (exprNode.type === "Binary") {
-      // Special-case concatenation overload for Lua-style '..' — if operands are non-numeric, emit expandable join
-      if (exprNode.op === "..") {
-        // collect flattened operands
+    if (expr.type === "Binary") {
+      // handle Lua-style concat '..' as expandable join inputs (flatten chain)
+      if (expr.op === "..") {
         function collectConcatOperands(node, acc) {
           if (!node) return acc;
           if (node.type === "Binary" && node.op === "..") {
@@ -980,268 +663,87 @@ function emitProject(astStmts) {
           }
           return acc;
         }
-        const operands = collectConcatOperands(exprNode, []);
-
-        // Determine if all operands are numeric literals — if so, treat as math add
-        const allNumericLiterals = operands.every((o) => o.type === "Literal" && o.litType === "number");
-        if (!allNumericLiterals) {
-          // build expandable join
-          const joinId = genId();
-          const inputs = {};
-          const mutation = { tagName: "mutation", children: [], inputcount: String(operands.length) };
-          for (let i = 0; i < operands.length; i++) {
-            const name = "INPUT" + (i + 1);
-            const opNode = operands[i];
-            const emitted = emitExpression(opNode);
-            if (!emitted) throw new Error("emitExpression: join operand missing");
-            if (emitted.type === "lit") {
-              // join expects text inputs; coerce literal to text inner type
-              const lit = emitted.value;
-              // lit is [1,[typeCode,value]] — replace typeCode with text
-              const val = [1, [InputTypes.text, String(lit[1][1])]];
-              inputs[name] = val;
-            } else {
-              // reporter child with a shadow fallback
-              const shadow = makeShadowForExpr(opNode);
-              inputs[name] = [3, emitted.id, shadow];
-              blocks[emitted.id].parent = joinId;
-            }
-          }
-          blocks[joinId] = {
-            opcode: "operator_expandablejoininputs",
-            next: null,
-            parent: null,
-            inputs,
-            fields: {},
-            shadow: false,
-            topLevel: false,
-            mutation,
-          };
-          return { type: "id", id: joinId, node: exprNode };
-        }
+        const operands = collectConcatOperands(expr, []);
+        const nestedParts = operands.map((o) => exprToNested(o));
+        return { opcode: "operator_expandablejoininputs", inputs: nestedParts, mutation: { inputcount: String(operands.length) } };
       }
-
-      // General binary handling (math/comparison/logical)
-      // if concat operator was used but all operands numeric, treat as numeric add
-      const opForBinary =
-        exprNode.op === ".." && typeof allNumericLiterals !== "undefined" && allNumericLiterals
-          ? "+"
-          : exprNode.op;
-      const opcode = mapOpToOpcode(opForBinary);
-      const id = genId();
-      const inputs = {};
-      const left = emitExpression(exprNode.left);
-      const right = emitExpression(exprNode.right);
-      if (!left || !right) throw new Error("emitExpression: binary operands missing");
-
-      const mathOps = new Set([
-        "operator_add",
-        "operator_subtract",
-        "operator_multiply",
-        "operator_divide",
-        "operator_power",
-      ]);
-      const leftName = mathOps.has(opcode) ? "NUM1" : "OPERAND1";
-      const rightName = mathOps.has(opcode) ? "NUM2" : "OPERAND2";
-
-      if (left.type === "lit") inputs[leftName] = left.value;
-      else {
-        inputs[leftName] = [3, left.id, null];
-        if (!blocks[left.id]) throw new Error("emitExpression: missing left child " + left.id);
-        blocks[left.id].parent = id;
-      }
-      if (right.type === "lit") inputs[rightName] = right.value;
-      else {
-        inputs[rightName] = [3, right.id, null];
-        if (!blocks[right.id]) throw new Error("emitExpression: missing right child " + right.id);
-        blocks[right.id].parent = id;
-      }
-
-      blocks[id] = { opcode, next: null, parent: null, inputs, fields: {}, shadow: false, topLevel: false };
-      return { type: "id", id, node: exprNode };
+      const op = generator.mapOpToOpcode(expr.op);
+      return { opcode: op, args: [exprToNested(expr.left), exprToNested(expr.right)] };
     }
-    throw new Error("emitExpression: unsupported node type " + exprNode.type);
+    return "";
   }
 
-  function emitIf(node) {
-    // node.cases: [{cond, thenBlock}, ...]
-    const caseSeqs = [];
-    for (let i = 0; i < node.cases.length; i++) {
-      const cs = node.cases[i];
-      caseSeqs.push(emitSequence(cs.thenBlock.body, null));
+  function stmtToNested(stmt) {
+    if (!stmt) return null;
+    if (stmt.type === "Print") {
+      const msg = exprToNested(stmt.expr);
+      const seconds = stmt.options && stmt.options.seconds !== undefined ? stmt.options.seconds : undefined;
+      const opcode = seconds !== undefined ? "looks_sayforsecs" : "looks_say";
+      const node = { opcode, args: [msg] };
+      if (seconds !== undefined) node.args.push(seconds);
+      return node;
     }
-    let elseSeq = null;
-    if (node.elseBlock) elseSeq = emitSequence(node.elseBlock.body, null);
-
-    // Emit condition reporters and checkbox shadows
-    const condResArr = [];
-    for (let i = 0; i < node.cases.length; i++) {
-      const cond = node.cases[i].cond;
-      const cres = emitExpression(cond);
-      if (!cres) throw new Error("emitIf: condition must be an expression");
-      // If literal, coerce to a boolean reporter by creating a shadow boolean block
-      if (cres.type !== "id") {
-        const boolId = genId();
-        const boolOpcode =
-          cres.type === "lit" && cres.value && cres.value[1] && String(cres.value[1][1]) === "true"
-            ? "operator_trueBoolean"
-            : "operator_falseBoolean";
-        blocks[boolId] = {
-          opcode: boolOpcode,
-          next: null,
-          parent: null,
-          inputs: {},
-          fields: {},
-          shadow: true,
-          topLevel: true,
-        };
-        cres.id = boolId;
-        cres.type = "id";
+    if (stmt.type === "If") {
+      const node = { opcode: "if", cases: [] };
+      for (const c of stmt.cases) {
+        node.cases.push({ cond: exprToNested(c.cond), then: (c.thenBlock.body || []).map(stmtToNested).filter(Boolean) });
       }
-      condResArr.push(cres);
+      if (stmt.elseBlock) node.else = (stmt.elseBlock.body || []).map(stmtToNested).filter(Boolean);
+      return node;
     }
-
-    // Create checkbox shadows (one per condition) to use as shadows in BOOL inputs
-    const checkboxIds = [];
-    for (let i = 0; i < condResArr.length; i++) {
-      const cid = genId();
-      const unique = Math.random().toString(36).slice(2, 10);
-      blocks[cid] = {
-        opcode: "checkbox",
-        next: null,
-        parent: null,
-        inputs: {},
-        fields: { CHECKBOX: ["FALSE", unique] },
-        shadow: true,
-        topLevel: true,
-      };
-      checkboxIds.push(cid);
+    if (stmt.type === "Call") return { opcode: stmt.name, args: (stmt.args || []).map(exprToNested) };
+    if (stmt.type === "Declare") {
+      if (stmt.value)
+        return { opcode: "SPtempVars_setVar", args: [stmt.name, exprToNested(stmt.value)] };
+      return { opcode: "SPtempVars_setVar", args: [stmt.name, ""] };
     }
-
-    // Build the control_expandableIf block
-    const ifId = genId();
-    const inputs = {};
-    // For each case, add BOOLi and SUBSTACKi
-    for (let i = 0; i < condResArr.length; i++) {
-      const idx = i + 1;
-      inputs["BOOL" + idx] = [3, condResArr[i].id, checkboxIds[i]];
-      inputs["SUBSTACK" + idx] = [2, caseSeqs[i].first || null];
-    }
-    // Add final SUBSTACK for else if there is an else, else it's omitted
-    if (elseSeq) {
-      inputs["SUBSTACK" + (condResArr.length + 1)] = [2, elseSeq.first || null];
-    }
-
-    const branches = String(condResArr.length + (elseSeq ? 1 : 0));
-    const mutation = { tagName: "mutation", children: [], branches };
-    mutation["ends-in-else"] = elseSeq ? "true" : "false";
-
-    blocks[ifId] = {
-      opcode: "control_expandableIf",
-      next: null,
-      parent: null,
-      inputs,
-      fields: {},
-      shadow: false,
-      topLevel: false,
-      mutation,
-    };
-
-    // Wire parents for condition reporters and substack firsts
-    for (let i = 0; i < condResArr.length; i++) {
-      blocks[condResArr[i].id].parent = ifId;
-      if (caseSeqs[i].first) blocks[caseSeqs[i].first].parent = ifId;
-    }
-    if (elseSeq && elseSeq.first) blocks[elseSeq.first].parent = ifId;
-
-    return { first: ifId, last: ifId };
+    if (stmt.type === "Assign") return { opcode: "SPtempVars_setVar", args: [stmt.name, exprToNested(stmt.value)] };
+    return { opcode: stmt.type, args: [] };
   }
 
-  // top-level: only allow On statements
-  for (const s of astStmts) {
-    if (s.type !== "On") throw new Error("Top-level must be 'on' statements");
-    let opcode = "";
-    switch (s.event) {
+  // top-level AST is list of On nodes
+  nestedInput = ast.map((s) => {
+    if (s.type === "On") {
+      let opcode = s.event;
+      switch (s.event) {
         case "flag":
-            opcode = "event_whenflagclicked";
-            break;
-        case "stop":
-        case "stopped":
-            opcode = "event_whenstopclicked";
-            break;
+          opcode = "event_whenflagclicked";
+          break;
         case "click":
-        case "clicked":
-            opcode = "event_whenthisspriteclicked";
-            break;
+          opcode = "event_whenthisspriteclicked";
+          break;
         default:
-            opcode = s.event;
+          opcode = s.event;
+      }
+      const children = (s.body && s.body.body ? s.body.body.map(stmtToNested).filter(Boolean) : []);
+      return { opcode, children };
     }
-    const eventId = genId();
-    const seq = emitSequence(s.body.body, eventId);
-    blocks[eventId] = {
-      opcode,
-      next: seq.first || null,
-      parent: null,
-      inputs: {},
-      fields: {},
-      shadow: false,
-      topLevel: true,
-      x: 0,
-      y: 0,
-    };
-    if (seq.first) blocks[seq.first].parent = eventId;
-  }
-
-  return { blocks, variables, askUsed };
+    // fallback wrap
+    return { opcode: "event_whenthisspriteclicked", children: [stmtToNested(s)].filter(Boolean) };
+  });
 }
 
-/* -------------------------
-  CLI: glue
---------------------------*/
-const input = process.argv[2]
-  ? fs.readFileSync(process.argv[2], "utf8")
-  : `// example
-on("flag", *{
-  print("Hello!", {seconds: 2});
-  if (1 > 0) {
-    print(true, {seconds: 2});
-  } else {
-    print("false", {seconds: 2});
-  }
-});
-`;
-const outJSONLocation = process.argv[3] || path.join(__dirname, "project.json");
-
-// Do not strip comments here; ANTLR grammar handles both // and /* */ comments via lexer rules.
-const cleaned = input;
-
-// Parse with ANTLR and build AST
-let ast;
-try {
-  ast = parseWithAntlr(cleaned);
-  //console.log('AST built (ANTLR)');
-} catch (e) {
-  console.error("Parse/AST error:", (e && e.message) || e);
-  if (e && e.stack) console.error(e.stack);
-  process.exit(1);
-}
-
-// (type checking and casting removed)
-
-// Emit blocks
+// Now always use nested input for generation
 let emitResult;
 try {
-  emitResult = emitProject(ast);
-  //console.log('Emit OK');
+  emitResult = generator.generateFromNested(nestedInput);
+  //console.log(JSON.stringify(emitResult, null, 2));
 } catch (e) {
   console.error("Emit error:", (e && e.message) || e);
   if (e && e.stack) console.error(e.stack);
   process.exit(1);
 }
 
+// Convert pseudocode blocks into a real project.json `blocks` object
+const pseudoConverter = require('./lib/pseudocodeToProject');
+const projectBlocks = pseudoConverter.convert(emitResult);
+// projectBlocks is an object keyed by id — place into out.targets[1].blocks later
+
+
 // Produce final project JSON, preserving exact skeleton
 const out = JSON.parse(JSON.stringify(TEMPLATE));
-out.targets[1].blocks = emitResult.blocks;
+  out.targets[1].blocks = projectBlocks;
+  //console.log(JSON.stringify(projectBlocks, null, 2));
 // Never emit native target variables; always use SPtempVars extension for variables.
 out.targets[1].variables = {};
 // Also remove any template stage variables so the output contains no builtin variables.
@@ -1263,10 +765,66 @@ if (emitResult && emitResult.askUsed) {
   if (!out.extensions.includes("pmControlsExpansion")) out.extensions.push("pmControlsExpansion");
 }
 
-// Write to file
-fs.writeFileSync(outJSONLocation, JSON.stringify(out, null, 2), "utf8");
-console.log(
-  `✅ ${outJSONLocation.split(path.sep).pop()} written with`,
-  Object.keys(emitResult.blocks).length,
-  "blocks."
-);
+// Add pmOperatorsExpansion if strict equality '===' or other pmOperatorsExpansion ops were used
+if (emitResult && (emitResult.pmOperatorsExpansion_used)) {
+  out.extensions = out.extensions || [];
+  if (!out.extensions.includes("pmOperatorsExpansion")) out.extensions.push("pmOperatorsExpansion");
+}
+
+// Write to file or package as .pmp (zip)
+if (String(outJSONLocation).toLowerCase().endsWith('.pmp')) {
+  const pmpPath = outJSONLocation;
+  const assetsDir = path.join(__dirname, 'startingAssets');
+
+  // create output stream for zip
+  const output = fs.createWriteStream(pmpPath);
+  const archive = ensureArchiver()('zip', { zlib: { level: 9 } });
+
+  output.on('close', () => {
+    console.log(`✅ ${path.basename(pmpPath)} written (${archive.pointer()} bytes)`);
+    //console.log(Object.keys(emitResult.blocks).length, 'blocks included in project.json.');
+  });
+
+  archive.on('warning', (err) => {
+    if (err.code === 'ENOENT') console.warn(err.message);
+    else throw err;
+  });
+  archive.on('error', (err) => {
+    throw err;
+  });
+
+  archive.pipe(output);
+
+  // Add project.json from memory
+  archive.append(JSON.stringify(out, null, 2), { name: 'project.json' });
+
+  // Add startingAssets directory contents (preserve relative paths)
+  if (fs.existsSync(assetsDir)) {
+    (function addFilesRecursive(dir, relPath) {
+      const items = fs.readdirSync(dir, { withFileTypes: true });
+      for (const it of items) {
+        const full = path.join(dir, it.name);
+        const nameInArchive = path.posix.join(relPath, it.name);
+        if (it.isDirectory()) addFilesRecursive(full, nameInArchive);
+        else if (it.isFile()) archive.file(full, { name: nameInArchive });
+      }
+    })(assetsDir, '');
+  } else {
+    console.warn(`⚠️ startingAssets directory not found at ${assetsDir} — .pmp will only contain project.json`);
+  }
+
+  // Also write companion project.json next to the .pmp so file on disk
+  // matches the packaged project (helpful for inspection/debugging).
+  const companionJson = path.join(path.dirname(pmpPath), 'project.json');
+  fs.writeFileSync(companionJson, JSON.stringify(out, null, 2), 'utf8');
+  console.log(`✅ ${path.basename(companionJson)} written next to ${path.basename(pmpPath)}`);
+
+  archive.finalize();
+} else {
+  fs.writeFileSync(outJSONLocation, JSON.stringify(out, null, 2), "utf8");
+  console.log(
+    `✅ ${outJSONLocation.split(path.sep).pop()} written with`,
+    Object.keys(emitResult.blocks).length,
+    "blocks."
+  );
+}

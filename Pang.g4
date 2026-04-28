@@ -64,18 +64,26 @@ ifStmt
 expr
     : primary
     | '!' expr
+    | '~' expr
+    | ('+' | '-') expr
     // power (right-associative)
-    | expr POWER expr
+    | <assoc=right> expr POWER expr
     // multiplicative
     | expr ('*' | '/') expr
     // additive
     | expr ('+' | '-') expr
+    // shifts
+    | expr ('<<' | '>>' | '>>>') expr
     // concatenation (Lua-style)
     | expr CONCAT expr
     // comparisons
     | expr ('<' | '<=' | '>' | '>=') expr
     // equality
     | expr ('==' | '!=' | '===' | '!==') expr
+    // bitwise
+    | expr '&' expr
+    | expr '^' expr
+    | expr '|' expr
     // logical
     | expr '&&' expr
     | expr '||' expr
