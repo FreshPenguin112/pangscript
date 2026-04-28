@@ -471,7 +471,7 @@ const generator = require("./lib/generator");
 --------------------------*/
 const input = process.argv[2]
   ? fs.readFileSync(process.argv[2], "utf8")
-  : fs.readFileSync(path.join(__dirname, "test.ps"), "utf8");
+  : fs.readFileSync(path.join(__dirname, "test.pang"), "utf8");
 const outJSONLocation = process.argv[3] || path.join(__dirname, "project.json");
 
 // Do not strip comments here; ANTLR grammar handles both // and /* */ comments via lexer rules.
