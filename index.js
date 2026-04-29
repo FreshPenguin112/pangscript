@@ -139,8 +139,10 @@ class AstBuilder extends PangVisitor {
     // Accept either an inlineBlock() or a normal block() to be flexible with
     // different parser/grammar shapes.
     let body = null;
-    if (ctx.inlineBlock) body = this.visit(ctx.inlineBlock());
-    else if (ctx.block) body = this.visit(ctx.block());
+    const ibCtx = (ctx.inlineBlock && typeof ctx.inlineBlock === 'function') ? ctx.inlineBlock() : null;
+    const bCtx = (ctx.block && typeof ctx.block === 'function') ? ctx.block() : null;
+    if (ibCtx) body = this.visit(ibCtx);
+    else if (bCtx) body = this.visit(bCtx);
     else body = { type: "Block", body: [] };
     return { type: "On", event, body };
   }
@@ -239,6 +241,22 @@ class AstBuilder extends PangVisitor {
     return { type: 'MemberCall', chain: names, args };
   }
 
+  visitArrowFunction(ctx) {
+    // arrowFunction : '(' (IDENT (',' IDENT)*)? ')' '=>' (block | inlineBlock)
+    //               | IDENT '=>' (block | inlineBlock)
+    const params = [];
+    try {
+      if (ctx.IDENT && typeof ctx.IDENT === 'function') {
+        const idNodes = ctx.IDENT();
+        if (Array.isArray(idNodes)) {
+          for (let i = 0; i < idNodes.length; i++) params.push(idNodes[i].getText());
+        } else if (idNodes) params.push(idNodes.getText());
+      }
+    } catch (e) {}
+    const body = ctx.block ? this.visit(ctx.block()) : (ctx.inlineBlock ? this.visit(ctx.inlineBlock()) : { type: 'Block', body: [] });
+    return { type: 'Lambda', params, body };
+  }
+
   visitMemberExpr(ctx) {
     const ids = [];
     if (!ctx) return ids;
@@ -287,10 +305,42 @@ class AstBuilder extends PangVisitor {
   }
 
   visitAssignStmt(ctx) {
-    const name = ctx.IDENT().getText();
     if (!ctx.expr || !ctx.expr()) return null;
     const value = this.visit(ctx.expr());
-    return { type: "Assign", name, value };
+    // If parser provides memberExpr (member chain), prefer that form
+    try {
+      if (ctx.memberExpr && typeof ctx.memberExpr === 'function' && ctx.memberExpr()) {
+        const me = ctx.memberExpr();
+        const raw = me.getText ? me.getText() : '';
+        const chain = raw ? raw.split('.') : [];
+        return { type: 'Assign', memberChain: chain, value };
+      }
+    } catch (e) {}
+
+    // Fallback: attempt to extract left-hand side from the full text of
+    // the ctx (handles cases where the ANTLR parser wasn't regenerated
+    // and ctx.memberExpr() is not available). This will catch forms like
+    // `this.foo = 5` or `obj.prop = x` and produce a memberChain.
+    try {
+      if (ctx.getText && typeof ctx.getText === 'function') {
+        const full = ctx.getText();
+        // split on the first '=' to isolate the left side
+        const parts = full.split('=');
+        let left = parts && parts.length > 0 ? parts[0] : '';
+        // remove whitespace so `this . foo` also becomes `this.foo`
+        left = String(left).replace(/\s+/g, '');
+        if (left) {
+          const chain = left.split('.');
+          if (Array.isArray(chain) && chain.length >= 2) {
+            return { type: 'Assign', memberChain: chain, value };
+          }
+        }
+      }
+    } catch (e) {}
+
+    // Final fallback: IDENT or THIS token (single-name assignment)
+    const name = ctx.IDENT ? ctx.IDENT().getText() : (ctx.THIS ? ctx.THIS().getText() : '');
+    return { type: 'Assign', name, value };
   }
 
   visitIfStmt(ctx) {
@@ -506,6 +556,11 @@ class AstBuilder extends PangVisitor {
       return { type: "Literal", litType: "boolean", value: ctx.getText() === "true" };
     if (ctx.getText && ctx.getText() === "this") return { type: 'This' };
     if (ctx.printCall()) return this.visit(ctx.printCall());
+    if (ctx.inlineBlock && ctx.inlineBlock()) {
+      const body = this.visit(ctx.inlineBlock());
+      return { type: 'Lambda', params: [], body };
+    }
+    if (ctx.arrowFunction && ctx.arrowFunction()) return this.visit(ctx.arrowFunction());
     if (ctx.functionCall && ctx.functionCall()) return this.visit(ctx.functionCall());
     // parenthesized expression: primary may be '(' expr ')'
     if (ctx.expr && ctx.expr()) {
@@ -807,12 +862,13 @@ if (!nestedInput) {
       if (node.type === 'Class') {
         const name = node.name;
         classRegistry[name] = { methods: {} };
+        // Mark that classes are present/used as soon as we discover one.
+        usedClasses = true;
         for (const m of node.members || []) {
           classRegistry[name].methods[m.name] = Array.isArray(m.params) ? m.params.slice() : [];
         }
         return;
       }
-      if (Object.keys(classRegistry).length !== 0) usedClasses = true;
       // descend into common container fields
       if (node.type === 'Block' && Array.isArray(node.body)) return walk(node.body);
       if (node.type === 'On' && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
@@ -854,6 +910,17 @@ if (!nestedInput) {
   // Convert AST to nested JSON form (canonical representation generator expects)
   function exprToNested(expr) {
     if (!expr) return "";
+    // Lambda expressions (arrow functions) -> emit jwLambda_newLambda nested block
+    if (expr.type === 'Lambda') {
+      let paramArg = null;
+      if (expr.params && expr.params.length > 0) {
+        if (expr.params.length === 1) paramArg = expr.params[0];
+        else paramArg = expr.params.slice();
+      }
+      const lambdaArg = paramArg !== null ? paramArg : { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
+      const lambdaBlock = { opcode: 'jwLambda_newLambda', args: [ lambdaArg, (expr.body && Array.isArray(expr.body.body)) ? expr.body.body.map(stmtToNested).filter(Boolean) : [] ] };
+      return lambdaBlock;
+    }
     if (expr.type === "Literal") return expr.value;
     if (expr.type === "Var") return { type: "Var", name: expr.name };
     if (expr.type === "This") return { opcode: 'jwClass_self', args: [] };
@@ -861,7 +928,7 @@ if (!nestedInput) {
       const chain = expr.chain || [];
       if (chain.length < 2) return "";
       // Build nested receiver (object) stopping before the final property
-      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [] } : { type: 'Var', name: chain[0] };
+      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
@@ -877,15 +944,33 @@ if (!nestedInput) {
       const methodParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[methodName] ? classRegistry[className].methods[methodName] : null;
 
       if (Array.isArray(methodParams) && methodParams.length > 0) {
-        // build setters for each declared param into thread-scoped vars
+        // Wrap instance method calls in an inline wrapper similar to
+        // constructor `new` wrappers. This ensures `this` inside the
+        // method body resolves to a thread-scoped temp instance and
+        // that parameter values are set as thread-scoped vars.
         const setters = [];
+        // Temporary receiver: if receiver is `jwClass_self` (i.e. `this`),
+        // no temp is required. Otherwise, copy receiver into a thread temp
+        // so method execution can reference it via thread-scoped getVar.
+        let receiverTempName = null;
+        let receiverRef = objReceiver;
+        const needTempForReceiver = !(objReceiver && objReceiver.opcode === 'jwClass_self');
+        if (needTempForReceiver) {
+          receiverTempName = __pw_newTemp('__m');
+          const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', receiverTempName, objReceiver] };
+          setters.push(setTemp);
+          receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', receiverTempName] };
+        }
+        // build setters for each declared param into thread-scoped vars
         for (let i = 0; i < methodParams.length; i++) {
           const pname = methodParams[i];
           const argExpr = expr.args && expr.args[i] ? exprToNested(expr.args[i]) : "";
           setters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
         }
+        // build method getter bound to the thread-local receiver
+        const boundMethodGetter = { opcode: 'jwClass_getProp', args: [methodName, receiverRef] };
         // call method and return its result
-        const callMethod = { opcode: 'jwLambda_executeR', args: [methodGetter, ""] };
+        const callMethod = { opcode: 'jwLambda_executeR', args: [boundMethodGetter, ""] };
         const ret = { opcode: 'procedures_return', inputs: [callMethod] };
         const inlineChildren = [].concat(setters, [ret]);
         return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
@@ -927,7 +1012,7 @@ if (!nestedInput) {
         // (SPtempVars_setVar was used earlier to assign the jwClass_class into a
         // global named after the class). Use SPtempVars_getVar to reference it
         // so converter emits a proper getVar reporter instead of a raw opcode.
-        classRefNested = { opcode: 'SPtempVars_getVar', inputs: ['global', String(callee.name)] };
+        classRefNested = { opcode: 'SPtempVars_getVar', inputs: ['global', String(callee.name)], noPlaceholder: true };
       } else if (callee && callee.type === 'MemberCall') {
         // member expression returning class value
         const chain = callee.chain || [];
@@ -935,9 +1020,13 @@ if (!nestedInput) {
       }
       if (!classRefNested) classRefNested = "";
 
-      // If no constructor args, emit simple jwClass_new reporter
+      // If class has no constructor method defined, emit simple jwClass_new
+      // reporter regardless of provided args — no wrapper is necessary.
+      let className = null;
+      if (callee && callee.type === 'Call' && typeof callee.name === 'string') className = callee.name;
+      const hasCtor = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods['constructor'];
       const cargs = (callee && callee.args) ? callee.args : [];
-      if (!expr.callee || (expr.callee && (!expr.callee.args || expr.callee.args.length === 0))) {
+      if (!hasCtor || !expr.callee || (expr.callee && (!expr.callee.args || expr.callee.args.length === 0))) {
         return { opcode: 'jwClass_new', args: [classRefNested] };
       }
 
@@ -948,7 +1037,7 @@ if (!nestedInput) {
       const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, { opcode: 'jwClass_new', args: [classRefNested] }] };
       // attempt to map constructor param names if we have class signature info
       const ctorParamSetters = [];
-      let className = null;
+      //let className = null;
       if (callee && callee.type === 'Call' && typeof callee.name === 'string') className = callee.name;
       const ctorParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods['constructor'] ? classRegistry[className].methods['constructor'] : null;
       if (Array.isArray(ctorParams) && ctorParams.length > 0) {
@@ -1045,7 +1134,7 @@ if (!nestedInput) {
       const chain = stmt.chain || [];
       if (chain.length < 2) return null;
       // Build receiver object nested (stop before final property)
-      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [] } : { type: 'Var', name: chain[0] };
+      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
@@ -1081,7 +1170,23 @@ if (!nestedInput) {
         return { opcode: "SPtempVars_setVar", args: [stmt.name, exprToNested(stmt.value)] };
       return { opcode: "SPtempVars_setVar", args: [stmt.name, ""] };
     }
-    if (stmt.type === "Assign") return { opcode: "SPtempVars_setVar", args: [stmt.name, exprToNested(stmt.value)] };
+    if (stmt.type === "Assign") {
+      // memberChain indicates a member assignment like `obj.prop = val` or `this.prop = val`
+      if (stmt.memberChain && Array.isArray(stmt.memberChain) && stmt.memberChain.length >= 2) {
+        const chain = stmt.memberChain;
+        let objReceiver = (chain[0] === 'this') ? { opcode: 'jwClass_self', args: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
+        if (chain.length > 2) {
+          for (let i = 1; i < chain.length - 1; i++) {
+            const prop = chain[i];
+            objReceiver = { opcode: 'jwClass_getProp', args: [prop, objReceiver] };
+          }
+        }
+        const propName = chain[chain.length - 1];
+        const val = exprToNested(stmt.value);
+        return { opcode: 'jwClass_setProp', args: [propName, objReceiver, val] };
+      }
+      return { opcode: "SPtempVars_setVar", args: [stmt.name || '', exprToNested(stmt.value)] };
+    }
     if (stmt.type === 'While') {
       const cond = stmt.cond ? exprToNested(stmt.cond) : false;
       const children = stmt.body && stmt.body.body ? stmt.body.body.map(stmtToNested).filter(Boolean) : [];
@@ -1141,7 +1246,7 @@ if (!nestedInput) {
         const lambdaArg = paramArg !== null ? paramArg : { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
         const lambdaBlock = { opcode: 'jwLambda_newLambda', args: [ lambdaArg, (m.body && Array.isArray(m.body.body)) ? m.body.body.map(stmtToNested).filter(Boolean) : [] ] };
         // setProp [methodName] on [SELF] to [lambda]
-        const setProp = { opcode: 'jwClass_setProp', args: [m.name, { opcode: 'jwClass_self', args: [] }, lambdaBlock] };
+        const setProp = { opcode: 'jwClass_setProp', args: [m.name, { opcode: 'jwClass_self', args: [], noPlaceholder: true }, lambdaBlock] };
         substackBlocks.push(setProp);
       }
       const classBlock = { opcode: 'jwClass_class', args: [className, { opcode: 'jwClass_self', args: [], shadow: true, noPlaceholder: true }, substackBlocks] };
@@ -1187,6 +1292,36 @@ try {
   console.error("Emit error:", (e && e.message) || e);
   if (e && e.stack) console.error(e.stack);
   process.exit(1);
+}
+
+// If the AST/path-based detection didn't mark classes as used, also
+// inspect the nested input / pseudocode for any jwClass opcodes so we
+// reliably include the jwClass extension when needed (handles cases
+// where input was provided as nested JSON or parser wasn't regenerated).
+function nestedContainsOpcode(obj, prefix) {
+  if (!obj) return false;
+  if (Array.isArray(obj)) {
+    for (const el of obj) if (nestedContainsOpcode(el, prefix)) return true;
+    return false;
+  }
+  if (typeof obj === 'object') {
+    if (obj.opcode && typeof obj.opcode === 'string' && obj.opcode.startsWith(prefix)) return true;
+    if (obj.name && typeof obj.name === 'string' && obj.name.startsWith(prefix)) return true;
+    if (obj.children && nestedContainsOpcode(obj.children, prefix)) return true;
+    if (obj.inputs && nestedContainsOpcode(obj.inputs, prefix)) return true;
+    if (obj.args && nestedContainsOpcode(obj.args, prefix)) return true;
+    // Check properties recursively (safe guard for nested shapes)
+    for (const k of Object.keys(obj)) {
+      if (nestedContainsOpcode(obj[k], prefix)) return true;
+    }
+  }
+  return false;
+}
+
+if (!usedClasses) {
+  if (nestedContainsOpcode(nestedInput, 'jwClass') || (emitResult && nestedContainsOpcode(emitResult.blocks || [], 'jwClass'))) {
+    usedClasses = true;
+  }
 }
 
 // Convert pseudocode blocks into a real project.json `blocks` object

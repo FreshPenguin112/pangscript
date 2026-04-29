@@ -24,7 +24,7 @@ statement
     ;
 
 onCall
-    : 'on' '(' STRING ',' inlineBlock ')'
+    : 'on' '(' STRING ',' (inlineBlock | block) ')'
     ;
 
 // inline blocks allow a slightly different statement set where some
@@ -60,7 +60,7 @@ varDecl
 
 // Assignment statement (implicit let if variable not declared)
 assignStmt
-    : IDENT '=' expr
+    : memberExpr '=' expr
     ;
 
 ifStmt
@@ -116,6 +116,8 @@ primary
     | STRING
     | 'true'
     | 'false'
+    | inlineBlock
+    | arrowFunction
     | IDENT
     | printCall
     | functionCall
@@ -149,8 +151,13 @@ functionCall
     : memberExpr '(' (expr (',' expr)*)? ')'
     ;
 
+arrowFunction
+    : '(' (IDENT (',' IDENT)*)? ')' '=>' (block | inlineBlock)
+    | IDENT '=>' (block | inlineBlock)
+    ;
+
 memberExpr
-    : IDENT ('.' IDENT)*
+    : (IDENT | THIS) ('.' IDENT)*
     ;
 
 classDecl

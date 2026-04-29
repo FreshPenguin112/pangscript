@@ -10,3 +10,7 @@ pm-blocks
 *.pmp
 project.json
 vscode-pang
+*.json
+!package.json
+*.pang
+!test.pang
