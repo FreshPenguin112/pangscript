@@ -1,0 +1,29 @@
+on("flag", *{
+    // semi-advanced demo: nested loops, break, ask(), concat, const/let
+    let total = 0;
+    for (let i = 0; i < 5; i = i + 1) {
+        print("Outer: " .. i);
+        for (let j = 0; j < 4; j = j + 1) {
+            print("  Inner: " .. j);
+            if (j === 2) {
+                // break exits the innermost loop
+                break;
+            };
+            total = total + j;
+        };
+    }
+
+    print("Total: " .. total);
+    const farewell = "Done";
+
+    // ask returns a value via inline stack; demonstrate using it in a while
+    let times = ask("How many times to greet?");
+    let k = 0;
+    while (k < times) {
+        print(farewell .. " #" .. k);
+        if (k === 2) {
+            break;
+        };
+        k = k + 1;
+    }
+});

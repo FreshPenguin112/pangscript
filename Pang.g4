@@ -9,14 +9,18 @@ statementItem
     : onCall
     | printCall
     | functionCall
+    | classDecl
     | varDecl
     | assignStmt
+    | breakStmt
     ;
 
 // statements require semicolons by default (most statements end with ';')
 statement
-    : statementItem ';'
-    | ifStmt ';'    // keep semicolon at top-level if desired; we'll accept both in visitors
+    : statementItem ';'?
+    | ifStmt ';'?    // keep semicolon at top-level if desired; we'll accept both in visitors
+    | forStmt ';'?
+    | whileStmt ';'?
     ;
 
 onCall
@@ -35,8 +39,10 @@ inlineBlockBody
 
 // Inline statements reuse statementItem but allow control-structures without a trailing semicolon.
 inlineStatement
-    : statementItem ';'
-    | ifStmt
+    : statementItem ';'?
+    | ifStmt ';'?    // allow if statements without semicolons in inline blocks
+    | forStmt ';'?   // allow for statements without semicolons in inline blocks
+    | whileStmt ';'? // allow while statements without semicolons in inline blocks
     ;
 
 block
@@ -61,8 +67,21 @@ ifStmt
     : 'if' '(' expr ')' block ( 'else' 'if' '(' expr ')' block )* ( 'else' block )?
     ;
 
+forStmt
+    : 'for' '(' (varDecl | assignStmt)? ';' expr? ';' (assignStmt | functionCall | expr)? ')' block
+    ;
+
+whileStmt
+    : 'while' '(' expr ')' block
+    ;
+
+breakStmt
+    : 'break'
+    ;
+
 expr
     : primary
+    | 'new' functionCall
     | '!' expr
     | '~' expr
     | ('+' | '-') expr
@@ -126,7 +145,19 @@ optionValue
     ;
 
 functionCall
-    : IDENT '(' (expr (',' expr)*)? ')'
+    : memberExpr '(' (expr (',' expr)*)? ')'
+    ;
+
+memberExpr
+    : IDENT ('.' IDENT)*
+    ;
+
+classDecl
+    : 'class' IDENT ( 'extends' IDENT )? '{' classMember* '}'
+    ;
+
+classMember
+    : IDENT '(' (IDENT (',' IDENT)*)? ')' block
     ;
 
 IDENT
@@ -144,13 +175,8 @@ CONCAT
     ;
 
 // --- lexer rules ---
-
 STRING
-    : '"' ( ESC | ~["\\] )* '"'
-    ;
-
-fragment ESC
-    : '\\' .
+    : '"' ( '\\' . | ~["\\\r\n] )* '"'
     ;
 
 NUMBER

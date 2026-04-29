@@ -267,6 +267,7 @@ Object.assign(module.exports.processedBlocks, {
         { name: 'NAME', type: 1 },
         { name: 'START', type: 'number' },
         { name: 'END', type: 'number' },
+        { name: 'SUBSTACK', type: 'substack' },
         { name: 'INC_VALUE', type: 'number' }
     ], "branch"],
     // run thread vars in scope (no args)
@@ -315,4 +316,76 @@ Object.assign(module.exports.processedBlocks, {
         { name: 'TYPE', type: 1, field: 'TYPE', options: ['global', 'sprite', 'thread'] },
         { name: 'NAME', type: 1 }
     ], "stack"]
+});
+
+// Add metadata for jwClass and jwLambda extension blocks so the emitter can
+// create proper inputs/substacks when these extension blocks are used from
+// generated pseudocode. These are minimal shapes matching the original
+// extension definitions used by the runtime.
+Object.assign(module.exports.processedBlocks, {
+    // jwClass blocks
+    jwClass_class: [[
+        { name: 'NAME', type: 1 },
+        { name: 'SELF', type: 1 },
+        { name: 'SUBSTACK', type: 'substack' }
+    ], 'reporter'],
+    jwClass_self: [[
+    ], 'reporter'],
+    jwClass_extend: [[
+        { name: 'CLASS', type: 1 },
+        { name: 'EXTENSION', type: 1 }
+    ], 'reporter'],
+    jwClass_setProp: [[
+        { name: 'NAME', type: 1 },
+        { name: 'POINTER', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], 'stack'],
+    jwClass_getProp: [[
+        { name: 'NAME', type: 1 },
+        { name: 'POINTER', type: 1 }
+    ], 'reporter'],
+    jwClass_getClass: [[
+        { name: 'POINTER', type: 1 }
+    ], 'reporter'],
+    jwClass_new: [[
+        { name: 'CLASS', type: 1 }
+    ], 'reporter'],
+    jwClass_getName: [[
+        { name: 'CLASS', type: 1 }
+    ], 'reporter'],
+    jwClass_instanceof: [[
+        { name: 'POINTER', type: 1 },
+        { name: 'CLASS', type: 1 }
+    ], 'reporter'],
+
+    // jwLambda blocks
+    jwLambda_arg: [[
+    ], 'reporter'],
+    jwLambda_newLambda: [[
+        { name: 'ARG', type: 1, field: 'ARG' },
+        { name: 'SUBSTACK', type: 'substack' }
+    ], 'reporter'],
+    jwLambda_newLambdaR: [[
+        { name: 'ARG', type: 1, field: 'ARG' },
+        { name: 'VALUE', type: 1 }
+    ], 'reporter'],
+    jwLambda_rawLambdaInput: [[
+        { name: 'FIELD', type: 1 }
+    ], 'reporter'],
+    jwLambda_rawLambda: [[
+        { name: 'RAW', type: 1 }
+    ], 'reporter'],
+    jwLambda_execute: [[
+        { name: 'LAMBDA', type: 1 },
+        { name: 'ARG', type: 1 }
+    ], 'stack'],
+    jwLambda_executeR: [[
+        { name: 'LAMBDA', type: 1 },
+        { name: 'ARG', type: 1 }
+    ], 'reporter'],
+    jwLambda_this: [[
+    ], 'reporter'],
+    jwLambda_timesExecuted: [[
+        { name: 'LAMBDA', type: 1 }
+    ], 'reporter']
 });
