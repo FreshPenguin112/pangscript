@@ -362,11 +362,11 @@ Object.assign(module.exports.processedBlocks, {
     jwLambda_arg: [[
     ], 'reporter'],
     jwLambda_newLambda: [[
-        { name: 'ARG', type: 1, field: 'ARG' },
+        { name: 'ARG', type: 1 },
         { name: 'SUBSTACK', type: 'substack' }
     ], 'reporter'],
     jwLambda_newLambdaR: [[
-        { name: 'ARG', type: 1, field: 'ARG' },
+        { name: 'ARG', type: 1 },
         { name: 'VALUE', type: 1 }
     ], 'reporter'],
     jwLambda_rawLambdaInput: [[

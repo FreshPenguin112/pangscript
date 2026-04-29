@@ -80,7 +80,8 @@ breakStmt
     ;
 
 expr
-    : primary
+    : THIS
+    | primary
     | 'new' functionCall
     | '!' expr
     | '~' expr
@@ -174,6 +175,9 @@ CONCAT
     : '.' '.'
     ;
 
+THIS
+    : 'this'
+    ;
 // --- lexer rules ---
 STRING
     : '"' ( '\\' . | ~["\\\r\n] )* '"'

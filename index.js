@@ -233,6 +233,7 @@ class AstBuilder extends PangVisitor {
       // ignore
     }
     if (names.length <= 1) {
+        //if (names[0] === "jwLambda_newLambda") 
       return { type: "Call", name: names[0] || "", args };
     }
     return { type: 'MemberCall', chain: names, args };
@@ -400,6 +401,7 @@ class AstBuilder extends PangVisitor {
 
     function helper(n) {
       if (!n) return;
+      //console.log(n)
       if (isBinaryNode(n)) {
         helper(n.expr(0));
         operators.push(n.children[1].getText());
@@ -427,6 +429,8 @@ class AstBuilder extends PangVisitor {
           try { operands.push({ type: 'Literal', litType: 'string', value: JSON.parse(s) }); return; } catch (e) { operands.push({ type: 'Literal', litType: 'string', value: s.replace(/^"|"$/g, "") }); return; }
         }
         if (n.getText && (n.getText() === 'true' || n.getText() === 'false')) { operands.push({ type: 'Literal', litType: 'boolean', value: n.getText() === 'true' }); return; }
+        //console.log(n)
+        if (n.THIS) { operands.push({ type: 'This' }); return; }
         if (n.IDENT && typeof n.IDENT === 'function' && n.IDENT()) { operands.push({ type: 'Var', name: n.IDENT().getText() }); return; }
         // fallback to visiting the node
         const val = self.visit(n);
@@ -500,6 +504,7 @@ class AstBuilder extends PangVisitor {
     }
     if (ctx.getText() === "true" || ctx.getText() === "false")
       return { type: "Literal", litType: "boolean", value: ctx.getText() === "true" };
+    if (ctx.getText && ctx.getText() === "this") return { type: 'This' };
     if (ctx.printCall()) return this.visit(ctx.printCall());
     if (ctx.functionCall && ctx.functionCall()) return this.visit(ctx.functionCall());
     // parenthesized expression: primary may be '(' expr ')'
@@ -627,7 +632,7 @@ if (!nestedInput) {
   try {
     ast = parseWithAntlr(cleaned);
     //console.log('AST built (ANTLR)');
-    console.error("DEBUG_AST:\n" + JSON.stringify(ast, null, 2));
+    //console.error("DEBUG_AST:\n" + JSON.stringify(ast, null, 2));
   } catch (e) {
     console.error("Parse/AST error:", (e && e.message) || e);
     if (e && e.stack) console.error(e.stack);
@@ -851,11 +856,12 @@ if (!nestedInput) {
     if (!expr) return "";
     if (expr.type === "Literal") return expr.value;
     if (expr.type === "Var") return { type: "Var", name: expr.name };
+    if (expr.type === "This") return { opcode: 'jwClass_self', args: [] };
     if (expr.type === 'MemberCall') {
       const chain = expr.chain || [];
       if (chain.length < 2) return "";
       // Build nested receiver (object) stopping before the final property
-      let objReceiver = { type: 'Var', name: chain[0] };
+      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [] } : { type: 'Var', name: chain[0] };
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
@@ -1039,7 +1045,7 @@ if (!nestedInput) {
       const chain = stmt.chain || [];
       if (chain.length < 2) return null;
       // Build receiver object nested (stop before final property)
-      let objReceiver = { type: 'Var', name: chain[0] };
+      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [] } : { type: 'Var', name: chain[0] };
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
@@ -1127,17 +1133,18 @@ if (!nestedInput) {
         // parameter we pass a string (legacy), for multiple params pass an
         // array of names so nestedToAst will convert it into a RawArray of
         // Literals and the generator can mark each param as thread-scoped.
-        let paramArg = "";
+        let paramArg = null;
         if (m.params && m.params.length > 0) {
           if (m.params.length === 1) paramArg = m.params[0];
           else paramArg = m.params.slice();
         }
-        const lambdaBlock = { opcode: 'jwLambda_newLambda', args: [ paramArg, (m.body && Array.isArray(m.body.body)) ? m.body.body.map(stmtToNested).filter(Boolean) : [] ] };
+        const lambdaArg = paramArg !== null ? paramArg : { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
+        const lambdaBlock = { opcode: 'jwLambda_newLambda', args: [ lambdaArg, (m.body && Array.isArray(m.body.body)) ? m.body.body.map(stmtToNested).filter(Boolean) : [] ] };
         // setProp [methodName] on [SELF] to [lambda]
         const setProp = { opcode: 'jwClass_setProp', args: [m.name, { opcode: 'jwClass_self', args: [] }, lambdaBlock] };
         substackBlocks.push(setProp);
       }
-      const classBlock = { opcode: 'jwClass_class', args: [className, { opcode: 'jwClass_self', args: [] }, substackBlocks] };
+      const classBlock = { opcode: 'jwClass_class', args: [className, { opcode: 'jwClass_self', args: [], shadow: true, noPlaceholder: true }, substackBlocks] };
       // assign into temp/global var using SPtempVars_setVar (simplified args form)
       return { opcode: 'SPtempVars_setVar', args: [className, classBlock] };
     }
@@ -1173,7 +1180,7 @@ if (!nestedInput) {
 let emitResult;
 try {
   // DEBUG: dump nested representation to inspect emitted class/new/method shapes
-  console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
+  //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
   emitResult = generator.generateFromNested(nestedInput);
   //console.log(JSON.stringify(emitResult, null, 2));
 } catch (e) {
@@ -1218,7 +1225,7 @@ if (emitResult && (emitResult.pmOperatorsExpansion_used)) {
   out.extensions = out.extensions || [];
   if (!out.extensions.includes("pmOperatorsExpansion")) out.extensions.push("pmOperatorsExpansion");
 }
-console.log(usedClasses);
+//console.log(usedClasses);
 if (usedClasses) {
     out.extensions = out.extensions || [];
     if (!out.extensions.includes("jwClass")) {

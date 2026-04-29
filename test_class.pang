@@ -2,6 +2,7 @@ on("flag", *{
     class Foo {
         constructor(x, y) {
             print(x + y, {seconds: 2});
+            print(this, {seconds: 2})
         }
         bar() {
             print("bar");
