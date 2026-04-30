@@ -1,0 +1,14 @@
+on("flag", *{
+    class Foo {
+        constructor(x, y) {
+            print(x + y, {seconds: 2});
+            print(this, {seconds: 2})
+        }
+        bar() {
+            print("bar");
+        }
+    }
+
+    let a = new Foo(5, 10);
+    a.bar();
+});

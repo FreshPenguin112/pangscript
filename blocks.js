@@ -389,3 +389,8 @@ Object.assign(module.exports.processedBlocks, {
         { name: 'LAMBDA', type: 1 }
     ], 'reporter']
 });
+Object.assign(module.exports.processedBlocks, {
+    procedures_return: [[
+        { name: 'return', type: 1 }
+    ], 'stack']
+});

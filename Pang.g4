@@ -12,6 +12,7 @@ statementItem
     | classDecl
     | varDecl
     | assignStmt
+    | returnStmt
     | breakStmt
     ;
 
@@ -43,6 +44,11 @@ inlineStatement
     | ifStmt ';'?    // allow if statements without semicolons in inline blocks
     | forStmt ';'?   // allow for statements without semicolons in inline blocks
     | whileStmt ';'? // allow while statements without semicolons in inline blocks
+    ;
+
+// return statement — optional expression value
+returnStmt
+    : 'return' expr?
     ;
 
 block
@@ -121,6 +127,7 @@ primary
     | IDENT
     | printCall
     | functionCall
+    | memberExpr
     | '(' expr ')'
     ;
 // have to use options_ since options is a reserved word in ANTLR
@@ -148,7 +155,7 @@ optionValue
     ;
 
 functionCall
-    : memberExpr '(' (expr (',' expr)*)? ')'
+    : memberExpr ( '(' (expr (',' expr)*)? ')' | '.' IDENT )+
     ;
 
 arrowFunction
@@ -161,7 +168,7 @@ memberExpr
     ;
 
 classDecl
-    : 'class' IDENT ( 'extends' IDENT )? '{' classMember* '}'
+    : 'class' IDENT ( 'extends' IDENT )? '{' (classMember | statementItem)* '}'
     ;
 
 classMember

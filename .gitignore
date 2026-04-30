@@ -14,3 +14,5 @@ vscode-pang
 !package.json
 *.pang
 !test.pang
+!test_arrow.pang
+!test_class.pang

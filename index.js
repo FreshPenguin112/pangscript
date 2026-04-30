@@ -93,10 +93,40 @@ const blocksMeta = require("./blocks").processedBlocks;
 
 // helper counter for generating short temporary variable names used by
 // inline wrappers (e.g., constructor invocation sequences)
+// helper counters for generating synthetic temporary variable names used by
+// inline wrappers, arg setters, constructor temps, etc.
 let __pw_temp_counter = 0;
+let __pw_arg_counter = 0;
+// Argument UID map: assign a small random uid per logical argument/key so
+// all occurrences of the same argument share the same uid (no global run uid).
+const __pw_arg_uid_map = Object.create(null);
+function genRandomUid() {
+  return Math.random().toString(36).slice(2, 7);
+}
+function getUidForKey(key) {
+  if (!key) return genRandomUid();
+  if (!__pw_arg_uid_map[key]) __pw_arg_uid_map[key] = genRandomUid();
+  return __pw_arg_uid_map[key];
+}
+function getTaggedArgName(scopeKey, origName) {
+  const uid = getUidForKey(scopeKey);
+  const clean = String(origName).replace(/^_+/, '');
+  return `__${uid}_${clean}`;
+}
+
 function __pw_newTemp(prefix = "temp") {
   __pw_temp_counter += 1;
-  return `${prefix}${__pw_temp_counter}`;
+  const clean = String(prefix).replace(/^_+/, '');
+  return `__${genRandomUid()}_${clean}${__pw_temp_counter}`;
+}
+
+// If a scopeKey is provided, reuse a UID for that key so the generated
+// arg name is stable across uses; otherwise produce a fresh synthetic name.
+function __pw_newArgTemp(base = "value", scopeKey = null) {
+  __pw_arg_counter += 1;
+  const clean = String(base).replace(/^_+/, '');
+  if (scopeKey) return getTaggedArgName(scopeKey, clean);
+  return `__${genRandomUid()}_${clean}${__pw_arg_counter}`;
 }
 
 // Build a simple AST visitor by extending the generated visitor
@@ -117,6 +147,7 @@ class AstBuilder extends PangVisitor {
       if (item.functionCall && item.functionCall()) return this.visit(item.functionCall());
       if (item.varDecl && item.varDecl()) return this.visit(item.varDecl());
       if (item.assignStmt && item.assignStmt()) return this.visit(item.assignStmt());
+      if (item.returnStmt && item.returnStmt()) return this.visit(item.returnStmt());
       if (item.classDecl && item.classDecl()) return this.visit(item.classDecl());
       if (item.breakStmt && item.breakStmt()) return this.visit(item.breakStmt());
       return null;
@@ -165,6 +196,7 @@ class AstBuilder extends PangVisitor {
             else if (si.functionCall && si.functionCall()) stmts.push(this.visit(si.functionCall()));
             else if (si.varDecl && si.varDecl()) stmts.push(this.visit(si.varDecl()));
             else if (si.assignStmt && si.assignStmt()) stmts.push(this.visit(si.assignStmt()));
+            else if (si.returnStmt && si.returnStmt()) stmts.push(this.visit(si.returnStmt()));
             else if (si.classDecl && si.classDecl()) stmts.push(this.visit(si.classDecl()));
             else if (si.breakStmt && si.breakStmt()) stmts.push(this.visit(si.breakStmt()));
           } else if (st.ifStmt && st.ifStmt()) {
@@ -208,37 +240,128 @@ class AstBuilder extends PangVisitor {
   visitFunctionCall(ctx) {
     // IDENT '(' (expr (',' expr)*)? ')'
     // memberExpr '(' ... ')' — support dotted names like `obj.method`
+    // Support chained calls like `obj.m1(...).m2(...)` by parsing the
+    // functionCall children and grouping argument lists per-call. The
+    // parse shape is: memberExpr '(' args ')' ('.' IDENT '(' args ')')*
     let memberExpr = null;
     try {
       memberExpr = ctx.memberExpr ? ctx.memberExpr() : null;
     } catch (e) {
       memberExpr = null;
     }
-    const names = [];
+    // collect base identifiers from memberExpr (e.g., ['num','add'])
+    const baseNames = [];
     if (memberExpr && memberExpr.IDENT) {
       const idNodes = memberExpr.IDENT();
       if (Array.isArray(idNodes)) {
-        for (let i = 0; i < idNodes.length; i++) names.push(idNodes[i].getText());
-      } else if (idNodes) names.push(idNodes.getText());
+        for (let i = 0; i < idNodes.length; i++) baseNames.push(idNodes[i].getText());
+      } else if (idNodes) baseNames.push(idNodes.getText());
     }
-    const args = [];
-    try {
-      const exprs = ctx.expr ? ctx.expr() : null;
-      if (exprs) {
-        if (Array.isArray(exprs)) {
-          for (let i = 0; i < exprs.length; i++) args.push(this.visit(exprs[i]));
+
+    // Walk children to extract argument-groups for each `(...)` pair and
+    // the method name that precedes each group. Track the index of the
+    // last closing parenthesis so we can also detect trailing `.IDENT`
+    // property accesses that have no parentheses (e.g., `call().prop`).
+    const children = ctx.children || [];
+    const calls = []; // sequence of { baseNames?:[], methodName?:string, args:[] }
+    let lastParenIndex = -1;
+    for (let i = 0; i < children.length; i++) {
+      const ch = children[i];
+      const txt = ch && ch.getText ? ch.getText() : null;
+      if (txt === '(') {
+        // identify whether this group's method comes from the base memberExpr
+        const prev = children[i - 1];
+        let isBase = false;
+        if (prev && prev.constructor && prev.constructor.name && prev.constructor.name.endsWith('MemberExprContext')) {
+          isBase = true;
+        }
+        // collect expr contexts until matching ')'
+        const args = [];
+        let j = i + 1;
+        for (; j < children.length; j++) {
+          const inner = children[j];
+          const innerText = inner && inner.getText ? inner.getText() : null;
+          if (innerText === ')') break;
+          if (inner && inner.constructor && inner.constructor.name && inner.constructor.name.endsWith('ExprContext')) {
+            args.push(this.visit(inner));
+          }
+        }
+        // advance i to position of ')'
+        i = j;
+        lastParenIndex = j;
+        if (isBase) {
+          calls.push({ baseNames: baseNames.slice(), args });
         } else {
-          args.push(this.visit(exprs));
+          // For suffix calls, only treat as method-name call when the '(' is
+          // directly preceded by '. IDENT' in the children sequence. This
+          // prevents earlier IDENTs (from prior calls) being mistaken for the
+          // current method name (e.g., num.test()("x")).
+          let methodName = null;
+          const prevChild = children[i - 1];
+          const prevPrevChild = children[i - 2];
+          const prevText = prevChild && prevChild.getText ? prevChild.getText() : null;
+          const prevPrevText = prevPrevChild && prevPrevChild.getText ? prevPrevChild.getText() : null;
+          if (prevText && /^[A-Za-z_][A-Za-z0-9_]*$/.test(prevText) && prevPrevText === '.') {
+            methodName = prevText;
+          } else if (prevChild && prevChild.constructor && prevChild.constructor.name && prevChild.constructor.name.endsWith('MemberExprContext')) {
+            // If the immediate preceding child is a MemberExprContext, prefer its last IDENT
+            try {
+              const ids = prevChild.IDENT ? (Array.isArray(prevChild.IDENT()) ? prevChild.IDENT().map(x => x.getText()) : [prevChild.IDENT().getText()]) : [];
+              if (ids && ids.length > 0) methodName = ids[ids.length - 1];
+            } catch (e) {}
+          }
+          calls.push({ methodName, args });
         }
       }
-    } catch (e) {
-      // ignore
     }
-    if (names.length <= 1) {
-        //if (names[0] === "jwLambda_newLambda") 
-      return { type: "Call", name: names[0] || "", args };
+
+    // Detect any trailing property access tokens after the last ')', e.g.
+    // `num.add(5).add(6).num` where `.num` has no parentheses. Collect a
+    // list of property names (in order) to attach to the resulting AST.
+    const trailingProps = [];
+    let k = lastParenIndex + 1;
+    while (k < children.length) {
+      const tok = children[k];
+      const txt = tok && tok.getText ? tok.getText() : null;
+      if (txt === '.') {
+        const next = children[k + 1];
+        const nextText = next && next.getText ? next.getText() : null;
+        if (nextText && /^[A-Za-z_][A-Za-z0-9_]*$/.test(nextText)) {
+          trailingProps.push(nextText);
+          k += 2;
+          continue;
+        }
+      }
+      break;
     }
-    return { type: 'MemberCall', chain: names, args };
+
+    // Build nested AST from the calls list. The first entry uses baseNames
+    // to form either a `Call` or `MemberCall`. Subsequent entries become
+    // MemberCall nodes whose receiver is the previous call AST.
+    if (calls.length === 0) return null;
+    let ast = null;
+    const first = calls[0];
+    if (first.baseNames) {
+      if (first.baseNames.length <= 1) ast = { type: 'Call', name: first.baseNames[0] || '', args: first.args };
+      else ast = { type: 'MemberCall', chain: first.baseNames, args: first.args };
+    } else {
+      ast = { type: 'Call', name: first.methodName || '', args: first.args };
+    }
+    for (let k = 1; k < calls.length; k++) {
+      const c = calls[k];
+      ast = { type: 'MemberCall', chain: [ast, c.methodName], args: c.args };
+    }
+
+    // Attach any trailing property accesses (e.g., `.num`) collected earlier
+    // so expressions like `num.add(5).add(6).num` become a Member node whose
+    // receiver is the chained call AST.
+    if (trailingProps && trailingProps.length > 0) {
+      for (let pi = 0; pi < trailingProps.length; pi++) {
+        const pname = trailingProps[pi];
+        ast = { type: 'Member', chain: [ast, pname] };
+      }
+    }
+    return ast;
   }
 
   visitArrowFunction(ctx) {
@@ -277,6 +400,20 @@ class AstBuilder extends PangVisitor {
       const cms = Array.isArray(ctx.classMember()) ? ctx.classMember() : [ctx.classMember()];
       for (let i = 0; i < cms.length; i++) members.push(this.visit(cms[i]));
     }
+    // Also accept top-level statements inside class body (e.g., `this.foo = ...;`)
+    if (ctx.statementItem) {
+      const sis = Array.isArray(ctx.statementItem()) ? ctx.statementItem() : [ctx.statementItem()];
+      for (let i = 0; i < sis.length; i++) {
+        const si = sis[i];
+        if (si.assignStmt && si.assignStmt()) members.push(this.visit(si.assignStmt()));
+        else if (si.varDecl && si.varDecl()) members.push(this.visit(si.varDecl()));
+        else if (si.functionCall && si.functionCall()) members.push(this.visit(si.functionCall()));
+        else if (si.printCall && si.printCall()) members.push(this.visit(si.printCall()));
+        else if (si.classDecl && si.classDecl()) members.push(this.visit(si.classDecl()));
+        else if (si.onCall && si.onCall()) members.push(this.visit(si.onCall()));
+        else if (si.breakStmt && si.breakStmt()) members.push(this.visit(si.breakStmt()));
+      }
+    }
     return { type: 'Class', name, extends: ext, members };
   }
 
@@ -302,6 +439,13 @@ class AstBuilder extends PangVisitor {
     let value = null;
     if (ctx.expr && ctx.expr()) value = this.visit(ctx.expr());
     return { type: "Declare", kind, name, value };
+  }
+
+  visitReturn(ctx) {
+    // 'return' expr?
+    const exprCtx = ctx.expr ? ctx.expr() : null;
+    const value = exprCtx ? this.visit(exprCtx) : null;
+    return { type: 'Return', value };
   }
 
   visitAssignStmt(ctx) {
@@ -562,6 +706,12 @@ class AstBuilder extends PangVisitor {
     }
     if (ctx.arrowFunction && ctx.arrowFunction()) return this.visit(ctx.arrowFunction());
     if (ctx.functionCall && ctx.functionCall()) return this.visit(ctx.functionCall());
+    // allow member expressions (e.g., this.x or obj.prop) as primary expressions
+    if (ctx.memberExpr && ctx.memberExpr()) {
+      const chain = this.visit(ctx.memberExpr());
+      if (Array.isArray(chain) && chain.length === 1) return { type: 'Var', name: chain[0] };
+      return { type: 'Member', chain };
+    }
     // parenthesized expression: primary may be '(' expr ')'
     if (ctx.expr && ctx.expr()) {
       // expr() may be array-like depending on ANTLR generation; handle both
@@ -688,6 +838,52 @@ if (!nestedInput) {
     ast = parseWithAntlr(cleaned);
     //console.log('AST built (ANTLR)');
     //console.error("DEBUG_AST:\n" + JSON.stringify(ast, null, 2));
+    try {
+      fs.writeFileSync('/tmp/pang_ast_debug.json', JSON.stringify(ast, null, 2), 'utf8');
+    } catch (e) {}
+    // Normalize odd array-shaped nodes that sometimes appear from the
+    // ANTLR visitor (e.g., [null, expr] representing a return). This
+    // ensures downstream passes see a consistent AST shape.
+    function normalizeAstArrays(root) {
+      function walk(node) {
+        if (!node) return;
+        if (Array.isArray(node)) {
+          for (const n of node) walk(n);
+          return;
+        }
+        if (node.type === 'Block' && Array.isArray(node.body)) {
+          const newBody = [];
+          for (const item of node.body) {
+            if (Array.isArray(item)) {
+              // special-case pattern [null, expr] -> Return
+              if (item.length === 2 && (item[0] === null || item[0] === undefined) && item[1] && typeof item[1] === 'object') {
+                newBody.push({ type: 'Return', value: item[1] });
+                continue;
+              }
+              // otherwise flatten and push non-null entries
+              for (const it of item) {
+                if (it == null) continue;
+                newBody.push(it);
+              }
+            } else {
+              newBody.push(item);
+            }
+          }
+          node.body = newBody;
+        }
+        // recurse into children
+        for (const k of Object.keys(node)) {
+          if (node[k] && typeof node[k] === 'object') walk(node[k]);
+        }
+      }
+      walk(root);
+    }
+    try {
+      normalizeAstArrays(ast);
+      try { fs.writeFileSync('/tmp/pang_ast_debug_normalized.json', JSON.stringify(ast, null, 2), 'utf8'); } catch (e) {}
+    } catch (e) {
+      // non-fatal; continue with original ast
+    }
   } catch (e) {
     console.error("Parse/AST error:", (e && e.message) || e);
     if (e && e.stack) console.error(e.stack);
@@ -852,6 +1048,8 @@ if (!nestedInput) {
   // Collect class definitions (name -> method param lists) so constructor
   // argument mapping can be emitted later during nested conversion.
   const classRegistry = {};
+  // Map of variables assigned lambda values -> param name lists
+  const varToLambda = {};
   function collectClasses(root) {
     function walk(node) {
       if (!node) return;
@@ -861,11 +1059,36 @@ if (!nestedInput) {
       }
       if (node.type === 'Class') {
         const name = node.name;
-        classRegistry[name] = { methods: {} };
+        classRegistry[name] = { methods: {}, methodReturns: {}, methodReturnOriginals: {} };
         // Mark that classes are present/used as soon as we discover one.
         usedClasses = true;
         for (const m of node.members || []) {
-          classRegistry[name].methods[m.name] = Array.isArray(m.params) ? m.params.slice() : [];
+          // generate tagged param names for this method so call-sites
+          // and the method body use the same synthetic thread-var names.
+          const origParams = Array.isArray(m.params) ? m.params.slice() : (m.params ? [m.params] : []);
+          // Use a per-method scope key so all occurrences of the same method
+          // parameter share the same uid-prefixed name.
+          const tagged = origParams.map((p, i) => p ? __pw_newArgTemp(p, `class:${name}:${m.name}:param:${i}:${p}`) : p);
+          classRegistry[name].methods[m.name] = tagged;
+          // Detect if this method returns a lambda at the top level of its body
+          let retLambdaParams = null;
+          if (m && m.body && Array.isArray(m.body.body)) {
+            for (const st of m.body.body) {
+              if (st && st.type === 'Return' && st.value && st.value.type === 'Lambda') {
+                const lp = st.value.params;
+                if (Array.isArray(lp)) retLambdaParams = lp.slice();else if (lp) retLambdaParams = [lp];
+                break;
+              }
+            }
+          }
+          // Map returned-lambda param names to tagged names as well and store originals
+          if (Array.isArray(retLambdaParams) && retLambdaParams.length > 0) {
+            classRegistry[name].methodReturnOriginals[m.name] = retLambdaParams.slice();
+            classRegistry[name].methodReturns[m.name] = retLambdaParams.map((p, i) => p ? __pw_newArgTemp(p, `class:${name}:${m.name}:return:param:${i}:${p}`) : p);
+          } else {
+            classRegistry[name].methodReturns[m.name] = retLambdaParams;
+            classRegistry[name].methodReturnOriginals[m.name] = retLambdaParams;
+          }
         }
         return;
       }
@@ -893,11 +1116,20 @@ if (!nestedInput) {
           varToClass[node.name] = callee.name;
         }
       }
+      // Track variables initialized to lambda expressions so we know their arg names
+        if (node.type === 'Declare' && node.value && node.value.type === 'Lambda') {
+        const lp = node.value.params;
+        if (Array.isArray(lp)) varToLambda[node.name] = lp.map((p, i) => p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p);else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];else varToLambda[node.name] = [];
+      }
       if (node.type === 'Assign' && node.value && node.value.type === 'New') {
         const callee = node.value.callee;
         if (callee && callee.type === 'Call' && typeof callee.name === 'string') {
           varToClass[node.name] = callee.name;
         }
+      }
+      if (node.type === 'Assign' && node.value && node.value.type === 'Lambda') {
+        const lp = node.value.params;
+        if (Array.isArray(lp)) varToLambda[node.name] = lp.map((p, i) => p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p);else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];else varToLambda[node.name] = [];
       }
       if (node.type === 'Block' && Array.isArray(node.body)) return walk(node.body);
       if (node.type === 'On' && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
@@ -908,77 +1140,362 @@ if (!nestedInput) {
   collectVarAssignments(ast);
 
   // Convert AST to nested JSON form (canonical representation generator expects)
-  function exprToNested(expr) {
+  function exprToNested(expr, inMethod = false, paramMap = null) {
     if (!expr) return "";
     // Lambda expressions (arrow functions) -> emit jwLambda_newLambda nested block
     if (expr.type === 'Lambda') {
-      let paramArg = null;
-      if (expr.params && expr.params.length > 0) {
-        if (expr.params.length === 1) paramArg = expr.params[0];
-        else paramArg = expr.params.slice();
+      const origParams = Array.isArray(expr.params) ? expr.params.slice() : (expr.params ? [expr.params] : []);
+      // reuse provided paramMap (from class/var precollection) or allocate fresh tagged names
+      let localParamMap = paramMap || null;
+      if (!localParamMap) {
+        localParamMap = {};
+        for (const p of origParams) if (p) localParamMap[p] = __pw_newArgTemp(p);
       }
-      const lambdaArg = paramArg !== null ? paramArg : { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
-      const lambdaBlock = { opcode: 'jwLambda_newLambda', args: [ lambdaArg, (expr.body && Array.isArray(expr.body.body)) ? expr.body.body.map(stmtToNested).filter(Boolean) : [] ] };
-      return lambdaBlock;
+      let lambdaArg;
+      if (!origParams || origParams.length === 0) lambdaArg = { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
+      else if (origParams.length === 1) lambdaArg = localParamMap[origParams[0]];
+      else lambdaArg = origParams.map((p) => localParamMap[p]);
+      let lambdaBody = [];
+      if (expr.body && Array.isArray(expr.body.body)) {
+        const raw = expr.body.body.map((s) => stmtToNested(s, true, localParamMap)).filter(Boolean);
+        lambdaBody = flattenNestedResults(raw);
+        assertReturnTerminal(lambdaBody, 'lambda body');
+      }
+      return { opcode: 'jwLambda_newLambda', inputs: [ lambdaArg, lambdaBody ] };
     }
     if (expr.type === "Literal") return expr.value;
-    if (expr.type === "Var") return { type: "Var", name: expr.name };
-    if (expr.type === "This") return { opcode: 'jwClass_self', args: [] };
+    if (expr.type === "Var") {
+      // If this variable name shadows a param in current paramMap, emit the tagged name
+      if (paramMap && expr.name && Object.prototype.hasOwnProperty.call(paramMap, expr.name)) return { type: "Var", name: paramMap[expr.name] };
+      return { type: "Var", name: expr.name };
+    }
+    if (expr.type === "This") return { opcode: 'jwClass_self', inputs: [] };
+    if (expr.type === 'Member' || expr.type === 'MemberExpr') {
+      const chain = expr.chain || [];
+      if (chain.length < 1) return "";
+      // If the receiver is itself an expression (e.g., a chained call AST),
+      // we need to support property access on the result of that expression,
+      // including when the receiver expression emitted an inline wrapper
+      // (control_inline_stack_output) that stored the object in a temp and
+      // returned it via `procedures_return`.
+      if (typeof chain[0] === 'object') {
+        // Build nested representation for the receiver expression
+        const recvExpr = chain[0];
+        const recvNested = exprToNested(recvExpr, inMethod, paramMap);
+        const props = chain.slice(1);
+        if (!props || props.length === 0) return recvNested;
+
+        // If recvNested is an inline wrapper we can splice the property
+        // access into its final `procedures_return` so the wrapper still
+        // executes the calls but returns the requested property value.
+        if (recvNested && recvNested.opcode === 'control_inline_stack_output' && Array.isArray(recvNested.inputs) && Array.isArray(recvNested.inputs[0])) {
+          const inlineChildren = recvNested.inputs[0];
+          // find the final procedures_return entry
+          for (let i = inlineChildren.length - 1; i >= 0; i--) {
+            const node = inlineChildren[i];
+            if (node && node.opcode === 'procedures_return') {
+              const retVal = node.inputs && node.inputs[0];
+              // If return value is a thread temp getter, attach property access
+              if (retVal && retVal.opcode === 'SPtempVars_getVar' && Array.isArray(retVal.inputs) && retVal.inputs[0] === 'thread') {
+                let receiverRef = retVal; // SPtempVars_getVar ['thread', temp]
+                // compose jwClass_getProp chain for all remaining props
+                let propGet = null;
+                for (let pi = 0; pi < props.length; pi++) {
+                  const pname = props[pi];
+                  if (pi === 0) propGet = { opcode: 'jwClass_getProp', inputs: [pname, receiverRef] };
+                  else propGet = { opcode: 'jwClass_getProp', inputs: [pname, propGet] };
+                }
+                // replace the procedures_return value with property getter
+                inlineChildren[i] = { opcode: 'procedures_return', inputs: [propGet] };
+                return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+              }
+              // If return value is not a temp getter, fallback to wrapping the return value
+              // with property getters by producing a new procedures_return that
+              // applies jwClass_getProp to the result expression.
+              let receiverRefAlt = node.inputs && node.inputs[0] ? node.inputs[0] : null;
+              let propGetAlt = null;
+              for (let pi = 0; pi < props.length; pi++) {
+                const pname = props[pi];
+                if (pi === 0) propGetAlt = { opcode: 'jwClass_getProp', inputs: [pname, receiverRefAlt] };
+                else propGetAlt = { opcode: 'jwClass_getProp', inputs: [pname, propGetAlt] };
+              }
+              inlineChildren[i] = { opcode: 'procedures_return', inputs: [propGetAlt] };
+              return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+            }
+          }
+        }
+
+        // Otherwise, recvNested is a reporter or nested value; just chain property gets
+        let receiverRef = recvNested;
+        for (let i = 0; i < props.length; i++) {
+          const prop = props[i];
+          receiverRef = { opcode: 'jwClass_getProp', inputs: [prop, receiverRef] };
+        }
+        return receiverRef;
+      }
+      // Build nested receiver (object) stopping before the final property
+      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
+      if (chain.length > 2) {
+        for (let i = 1; i < chain.length; i++) {
+          const prop = chain[i];
+          objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
+        }
+        return objReceiver;
+      }
+      if (chain.length === 2) {
+        const propName = chain[1];
+        return { opcode: 'jwClass_getProp', inputs: [propName, objReceiver] };
+      }
+      return objReceiver;
+    }
     if (expr.type === 'MemberCall') {
       const chain = expr.chain || [];
       if (chain.length < 2) return "";
-      // Build nested receiver (object) stopping before the final property
-      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
+      // Receiver may be a simple name or an expression (from a previous call).
+      let objReceiver = null;
+      const first = chain[0];
+      if (typeof first === 'string') {
+        objReceiver = (first === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: first };
+      } else if (typeof first === 'object') {
+        objReceiver = exprToNested(first, inMethod, paramMap);
+      } else {
+        objReceiver = { type: 'Var', name: String(first) };
+      }
+      // Build getters for any intermediate property names
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
-          objReceiver = { opcode: 'jwClass_getProp', args: [prop, objReceiver] };
+          if (typeof prop === 'string') objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
+          else objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
         }
       }
       const methodName = chain[chain.length - 1];
-      const methodGetter = { opcode: 'jwClass_getProp', args: [methodName, objReceiver] };
+      const methodGetter = { opcode: 'jwClass_getProp', inputs: [methodName, objReceiver] };
 
-      // Attempt to detect the class of the receiver variable to lookup method params
-      let className = null;
-      if (typeof chain[0] === 'string' && varToClass[chain[0]]) className = varToClass[chain[0]];
-      const methodParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[methodName] ? classRegistry[className].methods[methodName] : null;
-
-      if (Array.isArray(methodParams) && methodParams.length > 0) {
-        // Wrap instance method calls in an inline wrapper similar to
-        // constructor `new` wrappers. This ensures `this` inside the
-        // method body resolves to a thread-scoped temp instance and
-        // that parameter values are set as thread-scoped vars.
-        const setters = [];
-        // Temporary receiver: if receiver is `jwClass_self` (i.e. `this`),
-        // no temp is required. Otherwise, copy receiver into a thread temp
-        // so method execution can reference it via thread-scoped getVar.
-        let receiverTempName = null;
-        let receiverRef = objReceiver;
-        const needTempForReceiver = !(objReceiver && objReceiver.opcode === 'jwClass_self');
-        if (needTempForReceiver) {
-          receiverTempName = __pw_newTemp('__m');
-          const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', receiverTempName, objReceiver] };
-          setters.push(setTemp);
-          receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', receiverTempName] };
+      // If this MemberCall represents a chain (previous call ASTs embedded)
+      // flatten it into ordered steps and emit an inline wrapper that:
+      //  - sets thread-scoped temp vars for each call result
+      //  - sets named thread args before each call (when param names known)
+      //  - updates the temp with the call result repeatedly
+      //  - finally returns the last temp via `procedures_return`
+      function flattenMemberCall(node) {
+        const steps = [];
+        let baseClassName = null;
+        function helper(n) {
+          if (!n) return;
+          const ch = n.chain || [];
+          const first = ch[0];
+          if (typeof first === 'object') {
+            // previous call AST - recurse then append this method
+            helper(first);
+            const method = ch[ch.length - 1];
+            steps.push({ methodName: method, args: n.args || [] });
+            return;
+          }
+          // base case: a string-based chain like ['obj','prop','method']
+          const method = ch[ch.length - 1];
+          const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
+          if (receiverChain.length > 0 && typeof receiverChain[0] === 'string' && varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
+          steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
-        // build setters for each declared param into thread-scoped vars
-        for (let i = 0; i < methodParams.length; i++) {
-          const pname = methodParams[i];
-          const argExpr = expr.args && expr.args[i] ? exprToNested(expr.args[i]) : "";
-          setters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
-        }
-        // build method getter bound to the thread-local receiver
-        const boundMethodGetter = { opcode: 'jwClass_getProp', args: [methodName, receiverRef] };
-        // call method and return its result
-        const callMethod = { opcode: 'jwLambda_executeR', args: [boundMethodGetter, ""] };
-        const ret = { opcode: 'procedures_return', inputs: [callMethod] };
-        const inlineChildren = [].concat(setters, [ret]);
-        return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+        helper(node);
+        return { steps, baseClassName };
       }
 
-      // Fallback: pass first arg only
-      const argNested = expr.args && expr.args.length > 0 ? exprToNested(expr.args[0]) : "";
-      return { opcode: 'jwLambda_executeR', args: [methodGetter, argNested] };
+      const flat = flattenMemberCall(expr);
+      const steps = flat.steps || [];
+      const baseClassName = flat.baseClassName || null;
+
+      // If only a single step, fall back to previous behavior (no multi-temp wrapper)
+      if (steps.length <= 1) {
+        // attempt to detect method params from varToClass/classRegistry
+        let className = null;
+        if (typeof chain[0] === 'string' && varToClass[chain[0]]) className = varToClass[chain[0]];
+        const methodParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[methodName] ? classRegistry[className].methods[methodName] : null;
+        if (Array.isArray(methodParams) && methodParams.length > 0) {
+          const setters = [];
+          let receiverTempName = null;
+          let receiverRef = objReceiver;
+          const needTempForReceiver = !(objReceiver && objReceiver.opcode === 'jwClass_self');
+          if (needTempForReceiver) {
+            receiverTempName = __pw_newTemp('__m');
+            const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', receiverTempName, objReceiver] };
+            setters.push(setTemp);
+            receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', receiverTempName] };
+          }
+          for (let i = 0; i < methodParams.length; i++) {
+            const pname = methodParams[i];
+            const argExpr = expr.args && expr.args[i] ? exprToNested(expr.args[i], inMethod, paramMap) : "";
+            setters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+          }
+          const boundMethodGetter = { opcode: 'jwClass_getProp', inputs: [methodName, receiverRef] };
+          const callMethod = { opcode: 'jwLambda_executeR', inputs: [boundMethodGetter, ""] };
+          const ret = { opcode: 'procedures_return', inputs: [callMethod] };
+          const inlineChildren = [].concat(setters, [ret]);
+          return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+        }
+        // fallback: single-step — set thread var for positional arg then return result
+        const argNested = expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        if (argNested !== "") {
+          const argTempName = __pw_newArgTemp('value');
+          const setters2 = [{ opcode: 'SPtempVars_setVar', inputs: ['thread', argTempName, argNested] }];
+          const callMethod2 = { opcode: 'jwLambda_executeR', inputs: [methodGetter, ""] };
+          const ret2 = { opcode: 'procedures_return', inputs: [callMethod2] };
+          const inlineChildren2 = [].concat(setters2, [ret2]);
+          return { opcode: 'control_inline_stack_output', inputs: [inlineChildren2] };
+        }
+        return { opcode: 'jwLambda_executeR', inputs: [methodGetter, ""] };
+      }
+
+      // Multi-step chain: create temps for each intermediate call result
+      const inlineChildren = [];
+      let prevTemp = null;
+      // track arg names for a lambda returned by the previous call (if known)
+      let prevReturnedLambdaArgs = null;
+      // remember the last seen method name so we can recover chained calls
+      // where the AST emitted a `null` method slot for the subsequent call
+      // (e.g., num.add(5).add(6) sometimes appears as inner/outer nodes
+      // with a null method on the outer node). Use this only when the
+      // previous call did not return a lambda (i.e., it's an object).
+      let prevStepMethodName = null;
+      for (let si = 0; si < steps.length; si++) {
+        const step = steps[si];
+        // determine receiverRef: for first step use receiverChain -> build nested receiver
+        let receiverRef = null;
+        if (si === 0) {
+          const recvChain = step.receiverChain || [];
+          if (recvChain.length === 0) receiverRef = objReceiver; else {
+            // build nested receiver from recvChain
+            let r = (recvChain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: recvChain[0] };
+            for (let k = 1; k < recvChain.length; k++) r = { opcode: 'jwClass_getProp', inputs: [recvChain[k], r] };
+            receiverRef = r;
+          }
+        } else {
+          // receiver is previous temp
+          receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] };
+        }
+
+        // determine method params if available: prefer baseClassName when receiver is prev
+        let classNameForStep = null;
+        if (si === 0) {
+          if (Array.isArray(step.receiverChain) && step.receiverChain.length > 0 && typeof step.receiverChain[0] === 'string' && varToClass[step.receiverChain[0]]) classNameForStep = varToClass[step.receiverChain[0]];
+        } else {
+          classNameForStep = baseClassName;
+        }
+        const paramsForStep = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[step.methodName] ? classRegistry[classNameForStep].methods[step.methodName] : null;
+        const returnsLambdaArgsForMethod = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns ? classRegistry[classNameForStep].methodReturns[step.methodName] : null;
+
+        // If this step is a normal method call (methodName present)
+        if (step.methodName) {
+          // set thread vars for params if we know their names
+          if (Array.isArray(paramsForStep) && paramsForStep.length > 0) {
+            for (let pi = 0; pi < paramsForStep.length; pi++) {
+              const pname = paramsForStep[pi];
+              const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+            }
+            // call method via jwLambda_executeR on the bound getter and store into temp
+            const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
+            const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
+            const tempName = __pw_newTemp('__c');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            prevTemp = tempName;
+            // remember if this method is known to return a lambda and its arg names
+            prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+            prevStepMethodName = step.methodName;
+            continue;
+          }
+
+          // fallback when param names unknown: set a synthetic thread var for the first arg
+          const argPos = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+          const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
+          if (argPos !== "") {
+            const argTemp = __pw_newArgTemp('value');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, argPos] });
+          }
+          const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
+          const tempName = __pw_newTemp('__c');
+          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+          prevTemp = tempName;
+          prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+          prevStepMethodName = step.methodName;
+          continue;
+        }
+
+        // If step.methodName is falsy, this normally represents a call on a function-valued receiver
+        // (e.g., result-of-previous-call returned a lambda). However some AST shapes
+        // use a `null` method slot for chained method calls (outer node). If the
+        // previous method did NOT return a lambda, but we have a last seen method
+        // name, assume this is a chained method call and synthesize the property
+        // access on the previous temp instead of invoking the temp as a function.
+        if (!step.methodName && prevStepMethodName && (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) && prevTemp) {
+          // treat as a method call on the previous temp using the previously-seen method name
+          const fakeMethod = prevStepMethodName;
+          const fakeParams = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[fakeMethod] ? classRegistry[classNameForStep].methods[fakeMethod] : null;
+          if (Array.isArray(fakeParams) && fakeParams.length > 0) {
+            for (let pi = 0; pi < fakeParams.length; pi++) {
+              const pname = fakeParams[pi];
+              const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+            }
+            const boundMethod = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
+            const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
+            const tempName = __pw_newTemp('__c');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            prevTemp = tempName;
+            prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+            prevStepMethodName = fakeMethod;
+            continue;
+          }
+          // fallback: no named params for fakeMethod — treat like unknown-param method
+          const fakeArgExpr = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+          if (fakeArgExpr !== "") {
+            const argTemp = __pw_newArgTemp('value');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, fakeArgExpr] });
+          }
+          const boundMethod2 = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
+          const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [boundMethod2, ""] };
+          const tempName2 = __pw_newTemp('__c');
+          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
+          prevTemp = tempName2;
+          prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+          prevStepMethodName = fakeMethod;
+          continue;
+        }
+
+        if (Array.isArray(prevReturnedLambdaArgs) && prevReturnedLambdaArgs.length > 0) {
+          for (let pi = 0; pi < prevReturnedLambdaArgs.length; pi++) {
+            const pname = prevReturnedLambdaArgs[pi];
+            const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+          }
+          const callReporter = { opcode: 'jwLambda_executeR', inputs: [receiverRef, ""] };
+          const tempName = __pw_newTemp('__c');
+          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+          prevTemp = tempName;
+          // We don't currently track lambdas returned by anonymous/function-valued calls;
+          // reset prevReturnedLambdaArgs unless more static info becomes available.
+          prevReturnedLambdaArgs = null;
+          continue;
+        }
+
+        // fallback: call the function-valued receiver — set thread var for arg then call
+        const argPos2 = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+        if (argPos2 !== "") {
+          const argTemp2 = __pw_newArgTemp('value');
+          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp2, argPos2] });
+        }
+        const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [receiverRef, ""] };
+        const tempName2 = __pw_newTemp('__c');
+        inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
+        prevTemp = tempName2;
+        prevReturnedLambdaArgs = null;
+      }
+
+      // return the last temp value
+      const retNode = { opcode: 'procedures_return', inputs: [{ opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
+      inlineChildren.push(retNode);
+      return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
     }
     if (expr.type === "Call") {
       const name = expr.name;
@@ -991,16 +1508,16 @@ if (!nestedInput) {
         const argsArr = [];
         for (let i = 0; i < params.length; i++) {
           const a = expr.args && expr.args[i] !== undefined ? expr.args[i] : undefined;
-          argsArr.push(a === undefined ? "" : exprToNested(a));
+          argsArr.push(a === undefined ? "" : exprToNested(a, inMethod, paramMap));
         }
         // append any extra positional args after declared params
         if (expr.args && expr.args.length > params.length) {
-          for (let i = params.length; i < expr.args.length; i++) argsArr.push(exprToNested(expr.args[i]));
+          for (let i = params.length; i < expr.args.length; i++) argsArr.push(exprToNested(expr.args[i], inMethod, paramMap));
         }
-        return { opcode: name, args: argsArr, __shape: shape };
+        return { opcode: name, inputs: argsArr, __shape: shape };
       }
 
-      return { opcode: name, args: (expr.args || []).map(exprToNested), __shape: shape };
+      return { opcode: name, inputs: (expr.args || []).map((e) => exprToNested(e, inMethod, paramMap)), __shape: shape };
     }
     if (expr.type === 'New') {
       // expr.callee is a Call AST for the class reference; args are constructor args
@@ -1016,25 +1533,26 @@ if (!nestedInput) {
       } else if (callee && callee.type === 'MemberCall') {
         // member expression returning class value
         const chain = callee.chain || [];
-        if (chain.length > 0) classRefNested = exprToNested({ type: 'Var', name: chain[0] });
+        if (chain.length > 0) classRefNested = exprToNested({ type: 'Var', name: chain[0] }, inMethod, paramMap);
       }
       if (!classRefNested) classRefNested = "";
 
-      // If class has no constructor method defined, emit simple jwClass_new
-      // reporter regardless of provided args — no wrapper is necessary.
+      // Only create the inline constructor wrapper if the class explicitly
+      // defines a `constructor` method. If no constructor exists, simply
+      // emit a `jwClass_new` reporter and do not create a wrapper.
       let className = null;
       if (callee && callee.type === 'Call' && typeof callee.name === 'string') className = callee.name;
-      const hasCtor = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods['constructor'];
+      const hasCtor = !!(className && classRegistry[className] && classRegistry[className].methods && Object.prototype.hasOwnProperty.call(classRegistry[className].methods, 'constructor'));
       const cargs = (callee && callee.args) ? callee.args : [];
-      if (!hasCtor || !expr.callee || (expr.callee && (!expr.callee.args || expr.callee.args.length === 0))) {
-        return { opcode: 'jwClass_new', args: [classRefNested] };
+      if (!hasCtor) {
+        return { opcode: 'jwClass_new', inputs: [classRefNested] };
       }
 
       // Otherwise build an inline stack wrapper that: set tempNew = new CLASS;
       // call constructor via jwClass_getProp + jwLambda_execute; return tempNew
       const tempName = __pw_newTemp('__new');
       // set the tempNew as a thread-scoped temp variable
-      const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, { opcode: 'jwClass_new', args: [classRefNested] }] };
+      const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, { opcode: 'jwClass_new', inputs: [classRefNested] }] };
       // attempt to map constructor param names if we have class signature info
       const ctorParamSetters = [];
       //let className = null;
@@ -1043,7 +1561,7 @@ if (!nestedInput) {
       if (Array.isArray(ctorParams) && ctorParams.length > 0) {
         for (let i = 0; i < ctorParams.length; i++) {
           const pname = ctorParams[i];
-          const argExpr = callee && callee.args && callee.args[i] ? exprToNested(callee.args[i]) : "";
+          const argExpr = callee && callee.args && callee.args[i] ? exprToNested(callee.args[i], inMethod, paramMap) : "";
           ctorParamSetters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
         }
       }
@@ -1052,13 +1570,18 @@ if (!nestedInput) {
       // subsequent getters/readers inside the inline wrapper reference the
       // thread-scoped temp, not a global variable.
       let receiver = { opcode: 'SPtempVars_getVar', inputs: ['thread', tempName] };
-      const ctorGet = { opcode: 'jwClass_getProp', args: ['constructor', receiver] };
+      const ctorGet = { opcode: 'jwClass_getProp', inputs: ['constructor', receiver] };
       // If we didn't map constructor params, pass the first arg as fallback
-      const ctorArg = (!Array.isArray(ctorParams) || ctorParams.length === 0) && expr.callee && expr.callee.args && expr.callee.args.length > 0 ? exprToNested(expr.callee.args[0]) : "";
-      const callCtor = { opcode: 'jwLambda_execute', args: [ctorGet, ctorArg] };
+      const ctorArg = (!Array.isArray(ctorParams) || ctorParams.length === 0) && expr.callee && expr.callee.args && expr.callee.args.length > 0 ? exprToNested(expr.callee.args[0], inMethod, paramMap) : "";
+      const ctorArgSetters = [];
+      if (ctorArg !== "") {
+        const ctorArgTemp = __pw_newArgTemp('value');
+        ctorArgSetters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', ctorArgTemp, ctorArg] });
+      }
+      const callCtor = { opcode: 'jwLambda_execute', inputs: [ctorGet, ""] };
       // return the thread-scoped temp instance using SPtempVars_getVar
-      const ret = { opcode: 'procedures_return', args: [{ opcode: 'SPtempVars_getVar', inputs: ['thread', tempName] }] };
-      const inlineChildren = [setTemp].concat(ctorParamSetters, [callCtor, ret]).filter(Boolean);
+      const ret = { opcode: 'procedures_return', inputs: [{ opcode: 'SPtempVars_getVar', inputs: ['thread', tempName] }] };
+      const inlineChildren = [setTemp].concat(ctorParamSetters, ctorArgSetters, [callCtor, ret]).filter(Boolean);
       const inlineBlock = { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
       return inlineBlock;
     }
@@ -1066,7 +1589,7 @@ if (!nestedInput) {
       // Represent ternary using positional args so nested objects are preserved
       return {
         opcode: "control_if_return_else_return",
-        args: [exprToNested(expr.cond), exprToNested(expr.thenExpr), exprToNested(expr.elseExpr)]
+        inputs: [exprToNested(expr.cond, inMethod, paramMap), exprToNested(expr.thenExpr, inMethod, paramMap), exprToNested(expr.elseExpr, inMethod, paramMap)]
       };
     }
     if (expr.type === "Unary") {
@@ -1075,18 +1598,18 @@ if (!nestedInput) {
       // numeric shadow (e.g. -9). For non-literal operands, emit a
       // subtract call with a blank first arg so the converter produces a
       // block with NUM1 blank and NUM2 referencing the operand block.
-      if (expr.op === "+") return exprToNested(expr.operand);
+      if (expr.op === "+") return exprToNested(expr.operand, inMethod, paramMap);
       if (expr.op === "-") {
         const opd = expr.operand;
         if (opd && opd.type === "Literal" && opd.litType === "number") {
           return -Number(opd.value);
         }
         // produce args ["", operand] to make NUM1 blank and NUM2 the block
-        return { opcode: generator.mapOpToOpcode(expr.op), args: ["", exprToNested(opd)] };
+        return { opcode: generator.mapOpToOpcode(expr.op), inputs: ["", exprToNested(opd, inMethod, paramMap)] };
       }
       // other unary ops (!, ~)
       const op = generator.mapOpToOpcode(expr.op);
-      return { opcode: op, args: [exprToNested(expr.operand)] };
+      return { opcode: op, inputs: [exprToNested(expr.operand, inMethod, paramMap)] };
     }
     if (expr.type === "Binary") {
       // handle Lua-style concat '..' as expandable join inputs (flatten chain)
@@ -1102,94 +1625,336 @@ if (!nestedInput) {
           return acc;
         }
         const operands = collectConcatOperands(expr, []);
-        const nestedParts = operands.map((o) => exprToNested(o));
+        const nestedParts = operands.map((o) => exprToNested(o, inMethod, paramMap));
         return { opcode: "operator_expandablejoininputs", inputs: nestedParts, mutation: { inputcount: String(operands.length) } };
       }
       const op = generator.mapOpToOpcode(expr.op);
-      return { opcode: op, args: [exprToNested(expr.left), exprToNested(expr.right)] };
+      return { opcode: op, inputs: [exprToNested(expr.left, inMethod, paramMap), exprToNested(expr.right, inMethod, paramMap)] };
     }
     return "";
   }
 
-  function stmtToNested(stmt) {
+  // Flatten an array of results from stmtToNested (which may return arrays)
+  // into a single flat array of block objects.
+  function flattenNestedResults(arr) {
+    const out = [];
+    for (const v of arr || []) {
+      if (Array.isArray(v)) {
+        for (const x of v) if (x) out.push(x);
+      } else if (v) out.push(v);
+    }
+    return out;
+  }
+
+  function assertReturnTerminal(arr, context) {
+    if (!Array.isArray(arr)) return;
+    for (let i = 0; i < arr.length; i++) {
+      const e = arr[i];
+      if (e && e.opcode === 'procedures_return' && i !== arr.length - 1) {
+        throw new Error("'return' must be the last statement in " + context);
+      }
+    }
+  }
+
+  function stmtToNested(stmt, inMethod = false, paramMap = null) {
     if (!stmt) return null;
     if (stmt.type === "Print") {
-      const msg = exprToNested(stmt.expr);
+      const msg = exprToNested(stmt.expr, inMethod, paramMap);
       const seconds = stmt.options && stmt.options.seconds !== undefined ? stmt.options.seconds : undefined;
       const opcode = seconds !== undefined ? "looks_sayforsecs" : "looks_say";
-      const node = { opcode, args: [msg] };
-      if (seconds !== undefined) node.args.push(seconds);
+      const node = { opcode, inputs: [msg] };
+      if (seconds !== undefined) node.inputs.push(seconds);
       return node;
     }
     if (stmt.type === "If") {
       const node = { opcode: "if", cases: [] };
       for (const c of stmt.cases) {
-        node.cases.push({ cond: exprToNested(c.cond), then: (c.thenBlock.body || []).map(stmtToNested).filter(Boolean) });
+        const thenRaw = (c.thenBlock && c.thenBlock.body) ? c.thenBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+        const thenArr = flattenNestedResults(thenRaw);
+        assertReturnTerminal(thenArr, 'if-then branch');
+        node.cases.push({ cond: exprToNested(c.cond, inMethod, paramMap), then: thenArr });
       }
-      if (stmt.elseBlock) node.else = (stmt.elseBlock.body || []).map(stmtToNested).filter(Boolean);
+      if (stmt.elseBlock) {
+        const elseRaw = (stmt.elseBlock && stmt.elseBlock.body) ? stmt.elseBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+        const elseArr = flattenNestedResults(elseRaw);
+        assertReturnTerminal(elseArr, 'if-else branch');
+        node.else = elseArr;
+      }
       return node;
     }
-    if (stmt.type === "Call") return { opcode: stmt.name, args: (stmt.args || []).map(exprToNested) };
+    if (stmt.type === "Call") return { opcode: stmt.name, inputs: (stmt.args || []).map((a) => exprToNested(a, inMethod, paramMap)) };
     if (stmt.type === 'MemberCall') {
       const chain = stmt.chain || [];
       if (chain.length < 2) return null;
-      // Build receiver object nested (stop before final property)
-      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', args: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
+      // Build receiver object nested (stop before final property).
+      let objReceiver = null;
+      const first = chain[0];
+      if (typeof first === 'string') {
+        objReceiver = (first === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: first };
+      } else if (typeof first === 'object') {
+        objReceiver = exprToNested(first, inMethod, paramMap);
+      } else {
+        objReceiver = { type: 'Var', name: String(first) };
+      }
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
-          objReceiver = { opcode: 'jwClass_getProp', args: [prop, objReceiver] };
+          if (typeof prop === 'string') objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
+          else objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
         }
       }
       const methodName = chain[chain.length - 1];
-      const methodGetter = { opcode: 'jwClass_getProp', args: [methodName, objReceiver] };
+      const methodGetter = { opcode: 'jwClass_getProp', inputs: [methodName, objReceiver] };
 
       // Try to detect class for receiver variable
       let className = null;
       if (typeof chain[0] === 'string' && varToClass[chain[0]]) className = varToClass[chain[0]];
       const methodParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[methodName] ? classRegistry[className].methods[methodName] : null;
 
-      if (Array.isArray(methodParams) && methodParams.length > 0) {
-        const setters = [];
-        for (let i = 0; i < methodParams.length; i++) {
-          const pname = methodParams[i];
-          const argExpr = stmt.args && stmt.args[i] ? exprToNested(stmt.args[i]) : "";
-          setters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+      // If this MemberCall represents a chain of calls (previous call ASTs embedded),
+      // flatten it and emit a sequence of stack blocks that set temps for each
+      // intermediate call result. Do not emit an inline wrapper or a return
+      // value here — just emit the setters/calls directly as stack blocks.
+      function flattenMemberCallStmt(node) {
+        const steps = [];
+        let baseClassName = null;
+        function helper(n) {
+          if (!n) return;
+          const ch = n.chain || [];
+          const first = ch[0];
+          if (typeof first === 'object') {
+            helper(first);
+            const method = ch[ch.length - 1];
+            steps.push({ methodName: method, args: n.args || [] });
+            return;
+          }
+          const method = ch[ch.length - 1];
+          const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
+          if (receiverChain.length > 0 && typeof receiverChain[0] === 'string' && varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
+          steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
-        const call = { opcode: 'jwLambda_execute', args: [methodGetter, ""] };
-        const inlineChildren = [].concat(setters, [call]);
-        return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+        helper(node);
+        return { steps, baseClassName };
       }
 
-      // fallback: pass first arg only
-      const argNested = stmt.args && stmt.args.length > 0 ? exprToNested(stmt.args[0]) : "";
-      return { opcode: 'jwLambda_execute', args: [methodGetter, argNested] };
+      const flat = flattenMemberCallStmt(stmt);
+      const steps = flat.steps || [];
+      const baseClassName = flat.baseClassName || null;
+
+      // If we have a true chain (more than one step), emit stack-level temps
+      if (steps.length > 1) {
+        const inlineChildren = [];
+        let prevTemp = null;
+        let prevReturnedLambdaArgs = null;
+        let prevStepMethodName = null;
+        for (let si = 0; si < steps.length; si++) {
+          const step = steps[si];
+          // determine receiverRef: for first step use receiverChain -> build nested receiver
+          let receiverRef = null;
+          if (si === 0) {
+            const recvChain = step.receiverChain || [];
+            if (recvChain.length === 0) receiverRef = objReceiver; else {
+              let r = (recvChain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: recvChain[0] };
+              for (let k = 1; k < recvChain.length; k++) r = { opcode: 'jwClass_getProp', inputs: [recvChain[k], r] };
+              receiverRef = r;
+            }
+          } else {
+            receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] };
+          }
+
+          // determine method params if available
+          let classNameForStep = null;
+          if (si === 0) {
+            if (Array.isArray(step.receiverChain) && step.receiverChain.length > 0 && typeof step.receiverChain[0] === 'string' && varToClass[step.receiverChain[0]]) classNameForStep = varToClass[step.receiverChain[0]];
+          } else {
+            classNameForStep = baseClassName;
+          }
+          const paramsForStep = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[step.methodName] ? classRegistry[classNameForStep].methods[step.methodName] : null;
+          const returnsLambdaArgsForMethod = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns ? classRegistry[classNameForStep].methodReturns[step.methodName] : null;
+
+          if (step.methodName) {
+            if (Array.isArray(paramsForStep) && paramsForStep.length > 0) {
+              for (let pi = 0; pi < paramsForStep.length; pi++) {
+                const pname = paramsForStep[pi];
+                const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+                inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+              }
+              const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
+              const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
+              const tempName = __pw_newTemp('__c');
+              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+              prevTemp = tempName;
+              prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+              prevStepMethodName = step.methodName;
+              continue;
+            }
+            const argPos = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+            const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
+            if (argPos !== "") {
+              const argTemp = __pw_newArgTemp('value');
+              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, argPos] });
+            }
+            const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
+            const tempName = __pw_newTemp('__c');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            prevTemp = tempName;
+            prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+            prevStepMethodName = step.methodName;
+            continue;
+          }
+
+          // call-on-return case: receiverRef is a function-valued temp
+          // Also support the AST shape where the outer call's method slot is
+          // null but the chain intends to call the same method again on the
+          // returned object (e.g., num.add(5).add(6)). If the previous call
+          // did not return a lambda and we have a prior method name,
+          // synthesize a method call on the previous temp.
+          if (!step.methodName && prevStepMethodName && (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) && prevTemp) {
+            const fakeMethod = prevStepMethodName;
+            const fakeParams = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[fakeMethod] ? classRegistry[classNameForStep].methods[fakeMethod] : null;
+            if (Array.isArray(fakeParams) && fakeParams.length > 0) {
+              for (let pi = 0; pi < fakeParams.length; pi++) {
+                const pname = fakeParams[pi];
+                const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+                inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+              }
+              const boundMethod = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
+              const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
+              const tempName = __pw_newTemp('__c');
+              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+              prevTemp = tempName;
+              prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+              prevStepMethodName = fakeMethod;
+              continue;
+            }
+            const fakeArg = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+            if (fakeArg !== "") {
+              const argTemp = __pw_newArgTemp('value');
+              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, fakeArg] });
+            }
+            const boundMethod2 = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
+            const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [boundMethod2, ""] };
+            const tempName2 = __pw_newTemp('__c');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
+            prevTemp = tempName2;
+            prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+            prevStepMethodName = fakeMethod;
+            continue;
+          }
+          if (Array.isArray(prevReturnedLambdaArgs) && prevReturnedLambdaArgs.length > 0) {
+            for (let pi = 0; pi < prevReturnedLambdaArgs.length; pi++) {
+              const pname = prevReturnedLambdaArgs[pi];
+              const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+            }
+            const callReporter = { opcode: 'jwLambda_executeR', inputs: [receiverRef, ""] };
+            const tempName = __pw_newTemp('__c');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            prevTemp = tempName;
+            prevReturnedLambdaArgs = null;
+            continue;
+          }
+
+          // fallback
+          const argPos2 = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+          const boundMethod2 = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
+          if (argPos2 !== "") {
+            const argTemp2 = __pw_newArgTemp('value');
+            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp2, argPos2] });
+          }
+          const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [boundMethod2, ""] };
+          const tempName2 = __pw_newTemp('__c');
+          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
+          prevTemp = tempName2;
+        }
+
+        // Emit the sequence of stack blocks directly (no inline wrapper and no return)
+        return inlineChildren;
+      }
+
+      // Non-chain or single-step fallback: existing behavior
+      if (Array.isArray(methodParams) && methodParams.length > 0) {
+          const setters = [];
+          // Build thread-scoped setters for each declared param
+          for (let i = 0; i < methodParams.length; i++) {
+            const pname = methodParams[i];
+            const argExpr = stmt.args && stmt.args[i] ? exprToNested(stmt.args[i], inMethod, paramMap) : "";
+            setters.push({ opcode: 'SPtempVars_setVar', inputs: ["thread", pname, argExpr] });
+          }
+          // Call the method (no inline wrapper) — emit setters then the call
+          const call = { opcode: 'jwLambda_execute', inputs: [methodGetter, ""] };
+          return [].concat(setters, [call]);
+      }
+
+      // fallback: set a synthetic thread var for the first arg then call
+      const argNested = stmt.args && stmt.args.length > 0 ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
+      if (argNested !== "") {
+        const argTempName = __pw_newArgTemp('value');
+        const setter = { opcode: 'SPtempVars_setVar', inputs: ['thread', argTempName, argNested] };
+        const call = { opcode: 'jwLambda_execute', inputs: [methodGetter, ""] };
+        return [].concat([setter], [call]);
+      }
+      return { opcode: 'jwLambda_execute', inputs: [methodGetter, ""] };
     }
     if (stmt.type === "Declare") {
-      if (stmt.value)
-        return { opcode: "SPtempVars_setVar", args: [stmt.name, exprToNested(stmt.value)] };
-      return { opcode: "SPtempVars_setVar", args: [stmt.name, ""] };
+      const scope = (inMethod && (stmt.kind === 'let' || stmt.kind === 'const')) ? 'thread' : (stmt.kind === 'thread' ? 'thread' : 'global');
+      if (stmt.value) return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, exprToNested(stmt.value, inMethod, paramMap)] };
+      return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, ""] };
+    }
+    if (stmt.type === 'Return') {
+      // Only allowed inside class methods or lambdas (inMethod flag)
+      if (!inMethod) throw new Error("'return' used outside of a method or lambda is not allowed");
+      const val = stmt.value ? exprToNested(stmt.value, inMethod, paramMap) : "";
+      // If returned value is a block-like object, reject only if its
+      // block shape is a stack/branch (i.e., not a reporter). Allow
+      // reporter-type blocks that may include substack inputs (e.g., lambdas).
+      //console.log(val)
+      if (val && typeof val === 'object' && val.opcode) {
+        const meta = blocksMeta[val.opcode] || blocksMeta[val.opcode.replace(/^operator_/, 'operator_')] || null;
+        const shape = meta ? meta[1] : null;
+        if (shape === 'stack' || shape === 'branch') throw new Error("'return' value cannot be a stack/branch block");
+      }
+      return { opcode: 'procedures_return', inputs: [val] };
     }
     if (stmt.type === "Assign") {
       // memberChain indicates a member assignment like `obj.prop = val` or `this.prop = val`
       if (stmt.memberChain && Array.isArray(stmt.memberChain) && stmt.memberChain.length >= 2) {
         const chain = stmt.memberChain;
-        let objReceiver = (chain[0] === 'this') ? { opcode: 'jwClass_self', args: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
+        let objReceiver = (chain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
         if (chain.length > 2) {
           for (let i = 1; i < chain.length - 1; i++) {
             const prop = chain[i];
-            objReceiver = { opcode: 'jwClass_getProp', args: [prop, objReceiver] };
+            objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
           }
         }
         const propName = chain[chain.length - 1];
-        const val = exprToNested(stmt.value);
-        return { opcode: 'jwClass_setProp', args: [propName, objReceiver, val] };
+        // If RHS is a Binary with a null/undefined left (common parser shape
+        // for `this.prop = this.prop + X`), synthesize the left operand as a
+        // member access to the same chain so the emitted binary has a proper
+        // getter for the existing property value.
+        let val = null;
+        if (stmt.value && stmt.value.type === 'Binary' && (stmt.value.left === null || typeof stmt.value.left === 'undefined')) {
+          let leftNested = null;
+          if (chain[0] === 'this') {
+            leftNested = { opcode: 'jwClass_getProp', inputs: [propName, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }] };
+          } else {
+            leftNested = exprToNested({ type: 'Member', chain: chain.slice() }, inMethod, paramMap);
+          }
+          const rightNested = exprToNested(stmt.value.right, inMethod, paramMap);
+          const op = generator.mapOpToOpcode(stmt.value.op);
+          val = { opcode: op, inputs: [leftNested, rightNested] };
+        } else {
+          val = exprToNested(stmt.value, inMethod, paramMap);
+        }
+        return { opcode: 'jwClass_setProp', inputs: [propName, objReceiver, val] };
       }
-      return { opcode: "SPtempVars_setVar", args: [stmt.name || '', exprToNested(stmt.value)] };
+      return { opcode: "SPtempVars_setVar", inputs: [stmt.kind === "thread" ? "thread" : "global", stmt.name || '', exprToNested(stmt.value, inMethod, paramMap)] };
     }
     if (stmt.type === 'While') {
-      const cond = stmt.cond ? exprToNested(stmt.cond) : false;
-      const children = stmt.body && stmt.body.body ? stmt.body.body.map(stmtToNested).filter(Boolean) : [];
+      const cond = stmt.cond ? exprToNested(stmt.cond, inMethod, paramMap) : false;
+      const raw = stmt.body && stmt.body.body ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+      const children = flattenNestedResults(raw);
+      assertReturnTerminal(children, 'while body');
       return { opcode: 'control_while', inputs: [cond, children] };
     }
     if (stmt.type === 'For') {
@@ -1201,27 +1966,29 @@ if (!nestedInput) {
       if (stmt.init) {
         if ((stmt.init.type === 'Declare' || stmt.init.type === 'Assign') && stmt.init.name) {
           varName = stmt.init.name;
-          if (stmt.init.value) start = exprToNested(stmt.init.value);
+          if (stmt.init.value) start = exprToNested(stmt.init.value, inMethod, paramMap);
         }
       }
       if (stmt.cond) {
         // if cond is a Binary comparing var to value, extract the RHS as end
-        if (stmt.cond.type === 'Binary' && stmt.cond.left && stmt.cond.left.type === 'Var' && stmt.cond.left.name === varName) {
-          end = exprToNested(stmt.cond.right);
+          if (stmt.cond.type === 'Binary' && stmt.cond.left && stmt.cond.left.type === 'Var' && stmt.cond.left.name === varName) {
+          end = exprToNested(stmt.cond.right, inMethod, paramMap);
         } else {
-          end = exprToNested(stmt.cond);
+          end = exprToNested(stmt.cond, inMethod, paramMap);
         }
       }
       if (stmt.update) {
         if (stmt.update.type === 'Assign' && stmt.update.value && stmt.update.value.type === 'Binary') {
           const bin = stmt.update.value;
-          if (bin.right) inc = exprToNested(bin.right);
+          if (bin.right) inc = exprToNested(bin.right, inMethod, paramMap);
           if (bin.op === '-') inc = typeof inc === 'number' ? -inc : inc;
         } else {
-          inc = exprToNested(stmt.update);
+          inc = exprToNested(stmt.update, inMethod, paramMap);
         }
       }
-      const body = stmt.body && stmt.body.body ? stmt.body.body.map(stmtToNested).filter(Boolean) : [];
+      const raw = stmt.body && stmt.body.body ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+      const body = flattenNestedResults(raw);
+      assertReturnTerminal(body, 'for body');
       return { opcode: 'SPtempVars_forVar', inputs: ['thread', varName, start, end, body, inc] };
     }
     if (stmt.type === 'Break') {
@@ -1234,30 +2001,98 @@ if (!nestedInput) {
       // build substack array: each method becomes a jwClass_setProp block
       const substackBlocks = [];
       for (const m of stmt.members || []) {
-        // embed parameter names into jwLambda_newLambda. For a single
-        // parameter we pass a string (legacy), for multiple params pass an
-        // array of names so nestedToAst will convert it into a RawArray of
-        // Literals and the generator can mark each param as thread-scoped.
-        let paramArg = null;
-        if (m.params && m.params.length > 0) {
-          if (m.params.length === 1) paramArg = m.params[0];
-          else paramArg = m.params.slice();
+        // If the member is a normal method declaration (visitClassMember),
+        // `m` will be a Method node with `name`, `params`, and `body`.
+        if (m && m.type === 'Method') {
+          // Use pre-collected tagged param names when available so
+          // method declarations and call-sites agree on the thread-var names.
+          const taggedParams = classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[m.name] ? classRegistry[className].methods[m.name] : null;
+          let lambdaArg = null;
+          if (Array.isArray(taggedParams) && taggedParams.length > 0) lambdaArg = taggedParams.slice();
+          else if (m.params && m.params.length > 0) lambdaArg = (m.params.length === 1) ? m.params[0] : m.params.slice();
+          else lambdaArg = { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
+
+          // Build a methodParamMap mapping original param names -> tagged names
+          let methodParamMap = null;
+          if (Array.isArray(taggedParams) && Array.isArray(m.params)) {
+            methodParamMap = {};
+            for (let i = 0; i < m.params.length; i++) {
+              const orig = m.params[i];
+              const tagged = taggedParams[i];
+              if (orig && tagged) methodParamMap[orig] = tagged;
+            }
+          }
+          // If this method has a recorded returned-lambda, merge its param mappings
+          // into the methodParamMap so inner returned-lambda params are emitted
+          // using the same tagged names inside the method body.
+          const retOrig = classRegistry[className] && classRegistry[className].methodReturnOriginals && classRegistry[className].methodReturnOriginals[m.name] ? classRegistry[className].methodReturnOriginals[m.name] : null;
+          const retTagged = classRegistry[className] && classRegistry[className].methodReturns && classRegistry[className].methodReturns[m.name] ? classRegistry[className].methodReturns[m.name] : null;
+          if (Array.isArray(retOrig) && Array.isArray(retTagged) && retOrig.length === retTagged.length) {
+            if (!methodParamMap) methodParamMap = {};
+            for (let i = 0; i < retOrig.length; i++) {
+              const o = retOrig[i];
+              const t = retTagged[i];
+              if (o && t) methodParamMap[o] = t;
+            }
+          }
+
+          let methodBody = [];
+          if (m.body && Array.isArray(m.body.body)) {
+            const raw = m.body.body.map((s) => stmtToNested(s, true, methodParamMap)).filter(Boolean);
+            methodBody = flattenNestedResults(raw);
+            assertReturnTerminal(methodBody, `method '${m.name}' body`);
+          }
+          const lambdaBlock = { opcode: 'jwLambda_newLambda', inputs: [ lambdaArg, methodBody ] };
+          const setProp = { opcode: 'jwClass_setProp', inputs: [m.name, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }, lambdaBlock] };
+          substackBlocks.push(setProp);
+          continue;
         }
-        const lambdaArg = paramArg !== null ? paramArg : { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
-        const lambdaBlock = { opcode: 'jwLambda_newLambda', args: [ lambdaArg, (m.body && Array.isArray(m.body.body)) ? m.body.body.map(stmtToNested).filter(Boolean) : [] ] };
-        // setProp [methodName] on [SELF] to [lambda]
-        const setProp = { opcode: 'jwClass_setProp', args: [m.name, { opcode: 'jwClass_self', args: [], noPlaceholder: true }, lambdaBlock] };
-        substackBlocks.push(setProp);
+
+        // If the member is an assignment inside the class body (e.g., `this.foo = ...;`),
+        // convert it into a jwClass_setProp attaching the value to the class (SELF).
+        if (m && m.type === 'Assign' && Array.isArray(m.memberChain) && m.memberChain.length >= 2) {
+          const chain = m.memberChain;
+          const propName = chain[chain.length - 1];
+          // Workaround: some parser output produces a Binary RHS with a null
+          // left when the expression is of the form `this.prop = this.prop + X`.
+          // In that case synthesize the left operand as a getter for the same
+          // memberChain so the binary op becomes (this.prop + X).
+          let val = null;
+          if (m.value && m.value.type === 'Binary' && (m.value.left === null || typeof m.value.left === 'undefined')) {
+            let leftNested = null;
+            const propNameLocal = propName;
+            if (chain[0] === 'this') {
+              leftNested = { opcode: 'jwClass_getProp', inputs: [propNameLocal, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }] };
+            } else {
+              leftNested = exprToNested({ type: 'Member', chain: chain.slice() }, inMethod, paramMap);
+            }
+            const rightNested = exprToNested(m.value.right, inMethod, paramMap);
+            const op = generator.mapOpToOpcode(m.value.op);
+            val = { opcode: op, inputs: [ leftNested, rightNested ] };
+          } else {
+            val = exprToNested(m.value, inMethod, paramMap);
+          }
+          const setProp = { opcode: 'jwClass_setProp', inputs: [propName, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }, val] };
+          substackBlocks.push(setProp);
+          continue;
+        }
+
+        // Other member shapes can be ignored or handled in future (e.g., declarations).
       }
-      const classBlock = { opcode: 'jwClass_class', args: [className, { opcode: 'jwClass_self', args: [], shadow: true, noPlaceholder: true }, substackBlocks] };
-      // assign into temp/global var using SPtempVars_setVar (simplified args form)
-      return { opcode: 'SPtempVars_setVar', args: [className, classBlock] };
+      const classBlock = { opcode: 'jwClass_class', inputs: [className, { opcode: 'jwClass_self', inputs: [], shadow: true, noPlaceholder: true }, substackBlocks] };
+      // assign into temp/global var using SPtempVars_setVar (simplified inputs form)
+      return { opcode: 'SPtempVars_setVar', inputs: ["global", className, classBlock] };
     }
-    return { opcode: stmt.type, args: [] };
+    // If stmt.type is missing/undefined, skip emitting a block for it.
+    if (!stmt.type) return null;
+    return { opcode: stmt.type, inputs: [] };
   }
 
   // top-level AST -> nestedInput. Emit `On` nodes as hat blocks, and
   // emit other top-level statements directly (no fake hat wrapper).
+  // If stmtToNested returns an array (sequence of blocks), expand it
+  // into multiple top-level nested items so sequential statements
+  // (e.g., setter blocks + a call) are emitted in order.
   nestedInput = [];
   for (const s of ast) {
     if (s && s.type === "On") {
@@ -1272,27 +2107,57 @@ if (!nestedInput) {
         default:
           opcode = s.event;
       }
-      const children = (s.body && s.body.body ? s.body.body.map(stmtToNested).filter(Boolean) : []);
-      nestedInput.push({ opcode, children });
+      const rawChildren = (s.body && s.body.body ? s.body.body.map((c) => stmtToNested(c, false)).filter(Boolean) : []);
+        const children = [];
+        for (const c of rawChildren) {
+          if (Array.isArray(c)) children.push(...c); else children.push(c);
+        }
+        nestedInput.push({ opcode, children });
     } else {
       const node = stmtToNested(s);
-      if (node) nestedInput.push(node);
+      if (!node) continue;
+      if (Array.isArray(node)) {
+        for (const n of node) if (n) nestedInput.push(n);
+      } else {
+        nestedInput.push(node);
+      }
     }
   }
 }
 
-// Now always use nested input for generation
-let emitResult;
-try {
-  // DEBUG: dump nested representation to inspect emitted class/new/method shapes
-  //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
-  emitResult = generator.generateFromNested(nestedInput);
-  //console.log(JSON.stringify(emitResult, null, 2));
-} catch (e) {
-  console.error("Emit error:", (e && e.message) || e);
-  if (e && e.stack) console.error(e.stack);
-  process.exit(1);
-}
+  // Now always use nested input for generation
+  let emitResult;
+  try {
+    // DEBUG: dump nested representation to inspect emitted class/new/method shapes
+    try {
+      fs.writeFileSync('/tmp/pang_nested_debug.json', JSON.stringify(nestedInput, null, 2), 'utf8');
+    } catch (e) {}
+    //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
+    emitResult = generator.generateFromNested(nestedInput);
+    // quick validation: ensure emitted pseudocode blocks look reasonable
+    try {
+      if (emitResult && Array.isArray(emitResult.blocks)) {
+        for (let i = 0; i < emitResult.blocks.length; i++) {
+          const b = emitResult.blocks[i];
+          if (!b || typeof b !== 'object' || !b.opcode) console.error('BAD_PSEUDO_BLOCK', i, JSON.stringify(b, null, 2));
+        }
+      } else {
+        console.error('EMIT_RESULT_BLOCKS', typeof emitResult.blocks, JSON.stringify(emitResult.blocks, null, 2));
+      }
+    } catch (e) {
+      console.error('EmitResult validation error', e && e.message);
+    }
+    // dump emitResult to temp file for debugging malformed pseudocode
+    try {
+      fs.writeFileSync('/tmp/pang_emit_debug.json', JSON.stringify(emitResult, null, 2), 'utf8');
+    } catch (e) {
+      // ignore write errors
+    }
+  } catch (e) {
+    console.error("Emit error:", (e && e.message) || e);
+    if (e && e.stack) console.error(e.stack);
+    process.exit(1);
+  }
 
 // If the AST/path-based detection didn't mark classes as used, also
 // inspect the nested input / pseudocode for any jwClass opcodes so we
@@ -1304,12 +2169,11 @@ function nestedContainsOpcode(obj, prefix) {
     for (const el of obj) if (nestedContainsOpcode(el, prefix)) return true;
     return false;
   }
-  if (typeof obj === 'object') {
+    if (typeof obj === 'object') {
     if (obj.opcode && typeof obj.opcode === 'string' && obj.opcode.startsWith(prefix)) return true;
     if (obj.name && typeof obj.name === 'string' && obj.name.startsWith(prefix)) return true;
     if (obj.children && nestedContainsOpcode(obj.children, prefix)) return true;
     if (obj.inputs && nestedContainsOpcode(obj.inputs, prefix)) return true;
-    if (obj.args && nestedContainsOpcode(obj.args, prefix)) return true;
     // Check properties recursively (safe guard for nested shapes)
     for (const k of Object.keys(obj)) {
       if (nestedContainsOpcode(obj[k], prefix)) return true;

@@ -1,0 +1,19 @@
+on("flag", *{
+    class Num {
+        constructor(num) {
+            this.num = num;
+        }
+        add(value) {
+            this.num = this.num + value;
+            let foo = "aaa";
+            return this;
+        }
+        test() {
+            return (a) => {return a .. "foo";};
+        }
+    }
+    let test = 21;
+    let num = new Num(test);
+    print(num.add(5).add(6).num, {seconds: 2});
+    print(num.test()("bar "), {seconds: 2})
+});
