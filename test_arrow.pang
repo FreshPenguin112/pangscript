@@ -2,6 +2,7 @@ on("flag", *{
     class Num {
         constructor(num) {
             this.num = num;
+            this.add(1);
         }
         add(value) {
             this.num = this.num + value;
@@ -9,11 +10,12 @@ on("flag", *{
             return this;
         }
         test() {
-            return (a) => {return a .. "foo";};
+            return (a) => {return () => {return a .. "foo";}};
         }
     }
     let test = 21;
     let num = new Num(test);
+    print(num.num, {seconds: 2})
     print(num.add(5).add(6).num, {seconds: 2});
-    print(num.test()("bar "), {seconds: 2})
+    print(num.test()("bar ")(), {seconds: 2})
 });

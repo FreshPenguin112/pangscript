@@ -155,7 +155,10 @@ optionValue
     ;
 
 functionCall
-    : memberExpr ( '(' (expr (',' expr)*)? ')' | '.' IDENT )+
+    : memberExpr
+      ('.' IDENT)*
+      '(' (expr (',' expr)*)? ')'
+      ( '(' (expr (',' expr)*)? ')' | '.' IDENT )*
     ;
 
 arrowFunction

@@ -110,13 +110,13 @@ function getUidForKey(key) {
 }
 function getTaggedArgName(scopeKey, origName) {
   const uid = getUidForKey(scopeKey);
-  const clean = String(origName).replace(/^_+/, '');
+  const clean = String(origName).replace(/^_+/, "");
   return `__${uid}_${clean}`;
 }
 
 function __pw_newTemp(prefix = "temp") {
   __pw_temp_counter += 1;
-  const clean = String(prefix).replace(/^_+/, '');
+  const clean = String(prefix).replace(/^_+/, "");
   return `__${genRandomUid()}_${clean}${__pw_temp_counter}`;
 }
 
@@ -124,7 +124,7 @@ function __pw_newTemp(prefix = "temp") {
 // arg name is stable across uses; otherwise produce a fresh synthetic name.
 function __pw_newArgTemp(base = "value", scopeKey = null) {
   __pw_arg_counter += 1;
-  const clean = String(base).replace(/^_+/, '');
+  const clean = String(base).replace(/^_+/, "");
   if (scopeKey) return getTaggedArgName(scopeKey, clean);
   return `__${genRandomUid()}_${clean}${__pw_arg_counter}`;
 }
@@ -170,8 +170,8 @@ class AstBuilder extends PangVisitor {
     // Accept either an inlineBlock() or a normal block() to be flexible with
     // different parser/grammar shapes.
     let body = null;
-    const ibCtx = (ctx.inlineBlock && typeof ctx.inlineBlock === 'function') ? ctx.inlineBlock() : null;
-    const bCtx = (ctx.block && typeof ctx.block === 'function') ? ctx.block() : null;
+    const ibCtx = ctx.inlineBlock && typeof ctx.inlineBlock === "function" ? ctx.inlineBlock() : null;
+    const bCtx = ctx.block && typeof ctx.block === "function" ? ctx.block() : null;
     if (ibCtx) body = this.visit(ibCtx);
     else if (bCtx) body = this.visit(bCtx);
     else body = { type: "Block", body: [] };
@@ -268,11 +268,16 @@ class AstBuilder extends PangVisitor {
     for (let i = 0; i < children.length; i++) {
       const ch = children[i];
       const txt = ch && ch.getText ? ch.getText() : null;
-      if (txt === '(') {
+      if (txt === "(") {
         // identify whether this group's method comes from the base memberExpr
         const prev = children[i - 1];
         let isBase = false;
-        if (prev && prev.constructor && prev.constructor.name && prev.constructor.name.endsWith('MemberExprContext')) {
+        if (
+          prev &&
+          prev.constructor &&
+          prev.constructor.name &&
+          prev.constructor.name.endsWith("MemberExprContext")
+        ) {
           isBase = true;
         }
         // collect expr contexts until matching ')'
@@ -281,8 +286,13 @@ class AstBuilder extends PangVisitor {
         for (; j < children.length; j++) {
           const inner = children[j];
           const innerText = inner && inner.getText ? inner.getText() : null;
-          if (innerText === ')') break;
-          if (inner && inner.constructor && inner.constructor.name && inner.constructor.name.endsWith('ExprContext')) {
+          if (innerText === ")") break;
+          if (
+            inner &&
+            inner.constructor &&
+            inner.constructor.name &&
+            inner.constructor.name.endsWith("ExprContext")
+          ) {
             args.push(this.visit(inner));
           }
         }
@@ -301,12 +311,21 @@ class AstBuilder extends PangVisitor {
           const prevPrevChild = children[i - 2];
           const prevText = prevChild && prevChild.getText ? prevChild.getText() : null;
           const prevPrevText = prevPrevChild && prevPrevChild.getText ? prevPrevChild.getText() : null;
-          if (prevText && /^[A-Za-z_][A-Za-z0-9_]*$/.test(prevText) && prevPrevText === '.') {
+          if (prevText && /^[A-Za-z_][A-Za-z0-9_]*$/.test(prevText) && prevPrevText === ".") {
             methodName = prevText;
-          } else if (prevChild && prevChild.constructor && prevChild.constructor.name && prevChild.constructor.name.endsWith('MemberExprContext')) {
+          } else if (
+            prevChild &&
+            prevChild.constructor &&
+            prevChild.constructor.name &&
+            prevChild.constructor.name.endsWith("MemberExprContext")
+          ) {
             // If the immediate preceding child is a MemberExprContext, prefer its last IDENT
             try {
-              const ids = prevChild.IDENT ? (Array.isArray(prevChild.IDENT()) ? prevChild.IDENT().map(x => x.getText()) : [prevChild.IDENT().getText()]) : [];
+              const ids = prevChild.IDENT
+                ? Array.isArray(prevChild.IDENT())
+                  ? prevChild.IDENT().map((x) => x.getText())
+                  : [prevChild.IDENT().getText()]
+                : [];
               if (ids && ids.length > 0) methodName = ids[ids.length - 1];
             } catch (e) {}
           }
@@ -323,7 +342,7 @@ class AstBuilder extends PangVisitor {
     while (k < children.length) {
       const tok = children[k];
       const txt = tok && tok.getText ? tok.getText() : null;
-      if (txt === '.') {
+      if (txt === ".") {
         const next = children[k + 1];
         const nextText = next && next.getText ? next.getText() : null;
         if (nextText && /^[A-Za-z_][A-Za-z0-9_]*$/.test(nextText)) {
@@ -338,18 +357,48 @@ class AstBuilder extends PangVisitor {
     // Build nested AST from the calls list. The first entry uses baseNames
     // to form either a `Call` or `MemberCall`. Subsequent entries become
     // MemberCall nodes whose receiver is the previous call AST.
-    if (calls.length === 0) return null;
+    if (calls.length === 0) {
+      // No parentheses groups — this is a pure member-access chain like `a.b.c`.
+      // Reconstruct the identifier chain from the parsed pieces and return
+      // a `Member` AST so downstream code emits property-getters.
+      const chain = [];
+      if (baseNames && baseNames.length > 0) {
+        chain.push(...baseNames);
+      }
+      // Collect any dotted identifiers present in the children sequence
+      for (let i = 0; i < children.length; i++) {
+        const tok = children[i];
+        const t = tok && tok.getText ? tok.getText() : null;
+        if (t === ".") {
+          const next = children[i + 1];
+          const nextText = next && next.getText ? next.getText() : null;
+          if (nextText && /^[A-Za-z_][A-Za-z0-9_]*$/.test(nextText)) {
+            // avoid duplicating the last entry when baseNames already included it
+            if (chain.length === 0 || chain[chain.length - 1] !== nextText) chain.push(nextText);
+            i++;
+            continue;
+          }
+        }
+        // If children include raw IDENT tokens (unlikely here), collect them
+        if (t && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t)) {
+          if (chain.length === 0 || chain[chain.length - 1] !== t) chain.push(t);
+        }
+      }
+      if (chain.length <= 1) return null;
+      return { type: "Member", chain };
+    }
     let ast = null;
     const first = calls[0];
     if (first.baseNames) {
-      if (first.baseNames.length <= 1) ast = { type: 'Call', name: first.baseNames[0] || '', args: first.args };
-      else ast = { type: 'MemberCall', chain: first.baseNames, args: first.args };
+      if (first.baseNames.length <= 1)
+        ast = { type: "Call", name: first.baseNames[0] || "", args: first.args };
+      else ast = { type: "MemberCall", chain: first.baseNames, args: first.args };
     } else {
-      ast = { type: 'Call', name: first.methodName || '', args: first.args };
+      ast = { type: "Call", name: first.methodName || "", args: first.args };
     }
     for (let k = 1; k < calls.length; k++) {
       const c = calls[k];
-      ast = { type: 'MemberCall', chain: [ast, c.methodName], args: c.args };
+      ast = { type: "MemberCall", chain: [ast, c.methodName], args: c.args };
     }
 
     // Attach any trailing property accesses (e.g., `.num`) collected earlier
@@ -358,7 +407,7 @@ class AstBuilder extends PangVisitor {
     if (trailingProps && trailingProps.length > 0) {
       for (let pi = 0; pi < trailingProps.length; pi++) {
         const pname = trailingProps[pi];
-        ast = { type: 'Member', chain: [ast, pname] };
+        ast = { type: "Member", chain: [ast, pname] };
       }
     }
     return ast;
@@ -369,15 +418,19 @@ class AstBuilder extends PangVisitor {
     //               | IDENT '=>' (block | inlineBlock)
     const params = [];
     try {
-      if (ctx.IDENT && typeof ctx.IDENT === 'function') {
+      if (ctx.IDENT && typeof ctx.IDENT === "function") {
         const idNodes = ctx.IDENT();
         if (Array.isArray(idNodes)) {
           for (let i = 0; i < idNodes.length; i++) params.push(idNodes[i].getText());
         } else if (idNodes) params.push(idNodes.getText());
       }
     } catch (e) {}
-    const body = ctx.block ? this.visit(ctx.block()) : (ctx.inlineBlock ? this.visit(ctx.inlineBlock()) : { type: 'Block', body: [] });
-    return { type: 'Lambda', params, body };
+    const body = ctx.block
+      ? this.visit(ctx.block())
+      : ctx.inlineBlock
+        ? this.visit(ctx.inlineBlock())
+        : { type: "Block", body: [] };
+    return { type: "Lambda", params, body };
   }
 
   visitMemberExpr(ctx) {
@@ -393,7 +446,12 @@ class AstBuilder extends PangVisitor {
   visitClassDecl(ctx) {
     // class IDENT ( 'extends' IDENT )? '{' classMember* '}'
     const idNodes = ctx.IDENT ? ctx.IDENT() : [];
-    const name = Array.isArray(idNodes) && idNodes.length > 0 ? idNodes[0].getText() : (idNodes && idNodes.getText ? idNodes.getText() : '');
+    const name =
+      Array.isArray(idNodes) && idNodes.length > 0
+        ? idNodes[0].getText()
+        : idNodes && idNodes.getText
+          ? idNodes.getText()
+          : "";
     const ext = Array.isArray(idNodes) && idNodes.length > 1 ? idNodes[1].getText() : null;
     const members = [];
     if (ctx.classMember) {
@@ -414,22 +472,22 @@ class AstBuilder extends PangVisitor {
         else if (si.breakStmt && si.breakStmt()) members.push(this.visit(si.breakStmt()));
       }
     }
-    return { type: 'Class', name, extends: ext, members };
+    return { type: "Class", name, extends: ext, members };
   }
 
   visitClassMember(ctx) {
     // IDENT '(' (IDENT (',' IDENT)*)? ')' block
-    const name = ctx.IDENT && ctx.IDENT(0) ? ctx.IDENT(0).getText() : '';
+    const name = ctx.IDENT && ctx.IDENT(0) ? ctx.IDENT(0).getText() : "";
     const params = [];
     // IDENT tokens may include method name at index 0 and params afterwards
-    if (ctx.IDENT && typeof ctx.IDENT === 'function') {
+    if (ctx.IDENT && typeof ctx.IDENT === "function") {
       const idNodes = ctx.IDENT();
       if (Array.isArray(idNodes)) {
         for (let i = 1; i < idNodes.length; i++) params.push(idNodes[i].getText());
       }
     }
-    const body = ctx.block ? this.visit(ctx.block()) : { type: 'Block', body: [] };
-    return { type: 'Method', name, params, body };
+    const body = ctx.block ? this.visit(ctx.block()) : { type: "Block", body: [] };
+    return { type: "Method", name, params, body };
   }
 
   visitVarDecl(ctx) {
@@ -445,7 +503,7 @@ class AstBuilder extends PangVisitor {
     // 'return' expr?
     const exprCtx = ctx.expr ? ctx.expr() : null;
     const value = exprCtx ? this.visit(exprCtx) : null;
-    return { type: 'Return', value };
+    return { type: "Return", value };
   }
 
   visitAssignStmt(ctx) {
@@ -453,11 +511,11 @@ class AstBuilder extends PangVisitor {
     const value = this.visit(ctx.expr());
     // If parser provides memberExpr (member chain), prefer that form
     try {
-      if (ctx.memberExpr && typeof ctx.memberExpr === 'function' && ctx.memberExpr()) {
+      if (ctx.memberExpr && typeof ctx.memberExpr === "function" && ctx.memberExpr()) {
         const me = ctx.memberExpr();
-        const raw = me.getText ? me.getText() : '';
-        const chain = raw ? raw.split('.') : [];
-        return { type: 'Assign', memberChain: chain, value };
+        const raw = me.getText ? me.getText() : "";
+        const chain = raw ? raw.split(".") : [];
+        return { type: "Assign", memberChain: chain, value };
       }
     } catch (e) {}
 
@@ -466,25 +524,25 @@ class AstBuilder extends PangVisitor {
     // and ctx.memberExpr() is not available). This will catch forms like
     // `this.foo = 5` or `obj.prop = x` and produce a memberChain.
     try {
-      if (ctx.getText && typeof ctx.getText === 'function') {
+      if (ctx.getText && typeof ctx.getText === "function") {
         const full = ctx.getText();
         // split on the first '=' to isolate the left side
-        const parts = full.split('=');
-        let left = parts && parts.length > 0 ? parts[0] : '';
+        const parts = full.split("=");
+        let left = parts && parts.length > 0 ? parts[0] : "";
         // remove whitespace so `this . foo` also becomes `this.foo`
-        left = String(left).replace(/\s+/g, '');
+        left = String(left).replace(/\s+/g, "");
         if (left) {
-          const chain = left.split('.');
+          const chain = left.split(".");
           if (Array.isArray(chain) && chain.length >= 2) {
-            return { type: 'Assign', memberChain: chain, value };
+            return { type: "Assign", memberChain: chain, value };
           }
         }
       }
     } catch (e) {}
 
     // Final fallback: IDENT or THIS token (single-name assignment)
-    const name = ctx.IDENT ? ctx.IDENT().getText() : (ctx.THIS ? ctx.THIS().getText() : '');
-    return { type: 'Assign', name, value };
+    const name = ctx.IDENT ? ctx.IDENT().getText() : ctx.THIS ? ctx.THIS().getText() : "";
+    return { type: "Assign", name, value };
   }
 
   visitIfStmt(ctx) {
@@ -526,10 +584,14 @@ class AstBuilder extends PangVisitor {
     let update = null;
     if (ctx.assignStmt && ctx.assignStmt().length) {
       // assignStmt might appear as array or single
-      const asn = Array.isArray(ctx.assignStmt()) ? ctx.assignStmt()[ctx.assignStmt().length - 1] : ctx.assignStmt();
+      const asn = Array.isArray(ctx.assignStmt())
+        ? ctx.assignStmt()[ctx.assignStmt().length - 1]
+        : ctx.assignStmt();
       update = this.visit(asn);
     } else if (ctx.functionCall && ctx.functionCall().length) {
-      const fc = Array.isArray(ctx.functionCall()) ? ctx.functionCall()[ctx.functionCall().length - 1] : ctx.functionCall();
+      const fc = Array.isArray(ctx.functionCall())
+        ? ctx.functionCall()[ctx.functionCall().length - 1]
+        : ctx.functionCall();
       update = this.visit(fc);
     } else {
       try {
@@ -547,7 +609,7 @@ class AstBuilder extends PangVisitor {
   }
 
   visitBreakStmt(ctx) {
-    return { type: 'Break' };
+    return { type: "Break" };
   }
 
   visitWhileStmt(ctx) {
@@ -562,9 +624,10 @@ class AstBuilder extends PangVisitor {
     // Prefer explicit unary handling for leading unary operators
     if (ctx.children && ctx.children[0] && ctx.children[0].getText) {
       const firstTok = ctx.children[0].getText();
-      if (firstTok === 'new') {
+      if (firstTok === "new") {
         // new <functionCall>
-        if (ctx.functionCall && ctx.functionCall()) return { type: 'New', callee: this.visit(ctx.functionCall()) };
+        if (ctx.functionCall && ctx.functionCall())
+          return { type: "New", callee: this.visit(ctx.functionCall()) };
       }
       if (firstTok === "!" || firstTok === "~" || firstTok === "+" || firstTok === "-") {
         return { type: "Unary", op: firstTok, operand: this.visit(ctx.expr(0)) };
@@ -574,7 +637,7 @@ class AstBuilder extends PangVisitor {
     // Ternary conditional: expr '?' expr ':' expr
     if (ctx.children && ctx.children.length === 5) {
       const hasQuestion = ctx.children.some(
-        (c) => c && typeof c.getText === "function" && c.getText() === "?"
+        (c) => c && typeof c.getText === "function" && c.getText() === "?",
       );
       if (hasQuestion) {
         const cond = this.visit(ctx.expr(0));
@@ -590,7 +653,15 @@ class AstBuilder extends PangVisitor {
     const self = this;
 
     function isBinaryNode(n) {
-      return (n && typeof n.expr === 'function' && n.expr(0) && n.expr(1) && n.children && n.children.length === 3 && n.children[1].getText() !== '?' );
+      return (
+        n &&
+        typeof n.expr === "function" &&
+        n.expr(0) &&
+        n.expr(1) &&
+        n.children &&
+        n.children.length === 3 &&
+        n.children[1].getText() !== "?"
+      );
     }
 
     function helper(n) {
@@ -602,30 +673,45 @@ class AstBuilder extends PangVisitor {
         helper(n.expr(1));
       } else {
         // atomic node: handle primary/function/print/ident/number/string specially
-        if (typeof n.primary === 'function' && n.primary()) {
+        if (typeof n.primary === "function" && n.primary()) {
           operands.push(self.visit(n.primary()));
           return;
         }
-        if (typeof n.functionCall === 'function' && n.functionCall()) {
+        if (typeof n.functionCall === "function" && n.functionCall()) {
           operands.push(self.visit(n.functionCall()));
           return;
         }
-        if (typeof n.printCall === 'function' && n.printCall()) {
+        if (typeof n.printCall === "function" && n.printCall()) {
           operands.push(self.visit(n.printCall()));
           return;
         }
-        if (n.NUMBER && typeof n.NUMBER === 'function' && n.NUMBER()) {
-          operands.push({ type: 'Literal', litType: 'number', value: Number(n.NUMBER().getText()) });
+        if (n.NUMBER && typeof n.NUMBER === "function" && n.NUMBER()) {
+          operands.push({ type: "Literal", litType: "number", value: Number(n.NUMBER().getText()) });
           return;
         }
-        if (n.STRING && typeof n.STRING === 'function' && n.STRING()) {
+        if (n.STRING && typeof n.STRING === "function" && n.STRING()) {
           const s = n.STRING().getText();
-          try { operands.push({ type: 'Literal', litType: 'string', value: JSON.parse(s) }); return; } catch (e) { operands.push({ type: 'Literal', litType: 'string', value: s.replace(/^"|"$/g, "") }); return; }
+          try {
+            operands.push({ type: "Literal", litType: "string", value: JSON.parse(s) });
+            return;
+          } catch (e) {
+            operands.push({ type: "Literal", litType: "string", value: s.replace(/^"|"$/g, "") });
+            return;
+          }
         }
-        if (n.getText && (n.getText() === 'true' || n.getText() === 'false')) { operands.push({ type: 'Literal', litType: 'boolean', value: n.getText() === 'true' }); return; }
+        if (n.getText && (n.getText() === "true" || n.getText() === "false")) {
+          operands.push({ type: "Literal", litType: "boolean", value: n.getText() === "true" });
+          return;
+        }
         //console.log(n)
-        if (n.THIS) { operands.push({ type: 'This' }); return; }
-        if (n.IDENT && typeof n.IDENT === 'function' && n.IDENT()) { operands.push({ type: 'Var', name: n.IDENT().getText() }); return; }
+        if (n.THIS) {
+          operands.push({ type: "This" });
+          return;
+        }
+        if (n.IDENT && typeof n.IDENT === "function" && n.IDENT()) {
+          operands.push({ type: "Var", name: n.IDENT().getText() });
+          return;
+        }
         // fallback to visiting the node
         const val = self.visit(n);
         operands.push(val);
@@ -651,7 +737,7 @@ class AstBuilder extends PangVisitor {
       ["^"],
       ["|"],
       ["&&"],
-      ["||"]
+      ["||"],
     ];
 
     let values = operands.slice();
@@ -659,7 +745,7 @@ class AstBuilder extends PangVisitor {
 
     for (let level = 0; level < PRECEDENCE_LEVELS.length; level++) {
       const levelOps = PRECEDENCE_LEVELS[level];
-      const rightAssoc = (level === 0); // `**` is right-associative
+      const rightAssoc = level === 0; // `**` is right-associative
       if (rightAssoc) {
         for (let i = ops.length - 1; i >= 0; i--) {
           if (levelOps.includes(ops[i])) {
@@ -698,19 +784,19 @@ class AstBuilder extends PangVisitor {
     }
     if (ctx.getText() === "true" || ctx.getText() === "false")
       return { type: "Literal", litType: "boolean", value: ctx.getText() === "true" };
-    if (ctx.getText && ctx.getText() === "this") return { type: 'This' };
+    if (ctx.getText && ctx.getText() === "this") return { type: "This" };
     if (ctx.printCall()) return this.visit(ctx.printCall());
     if (ctx.inlineBlock && ctx.inlineBlock()) {
       const body = this.visit(ctx.inlineBlock());
-      return { type: 'Lambda', params: [], body };
+      return { type: "Lambda", params: [], body };
     }
     if (ctx.arrowFunction && ctx.arrowFunction()) return this.visit(ctx.arrowFunction());
     if (ctx.functionCall && ctx.functionCall()) return this.visit(ctx.functionCall());
     // allow member expressions (e.g., this.x or obj.prop) as primary expressions
     if (ctx.memberExpr && ctx.memberExpr()) {
       const chain = this.visit(ctx.memberExpr());
-      if (Array.isArray(chain) && chain.length === 1) return { type: 'Var', name: chain[0] };
-      return { type: 'Member', chain };
+      if (Array.isArray(chain) && chain.length === 1) return { type: "Var", name: chain[0] };
+      return { type: "Member", chain };
     }
     // parenthesized expression: primary may be '(' expr ')'
     if (ctx.expr && ctx.expr()) {
@@ -786,6 +872,24 @@ class AstBuilder extends PangVisitor {
     return obj;
   }
 }
+const { ParseTreeWalker } = require("antlr4");
+
+function nodeToString(node, parser, indent = "") {
+  const { children } = node;
+  // terminal node
+  if (!children || children.length === 0) {
+    return indent + node.getText();
+  }
+  const ruleName =
+    node.constructor.name === "TerminalNodeImpl"
+      ? node.getText()
+      : parser.ruleNames[node.ruleIndex] || node.constructor.name;
+  let out = indent + ruleName;
+  for (const ch of children) {
+    out += "\n" + nodeToString(ch, parser, indent + "  ");
+  }
+  return out;
+}
 
 // helper to parse and build AST
 function parseWithAntlr(source) {
@@ -795,6 +899,7 @@ function parseWithAntlr(source) {
   const parser = new PangParser(tokens);
   parser.buildParseTrees = true;
   const tree = parser.program();
+  //console.log(nodeToString(tree, parser));
   const visitor = new AstBuilder();
   return visitor.visit(tree);
 }
@@ -839,7 +944,7 @@ if (!nestedInput) {
     //console.log('AST built (ANTLR)');
     //console.error("DEBUG_AST:\n" + JSON.stringify(ast, null, 2));
     try {
-      fs.writeFileSync('/tmp/pang_ast_debug.json', JSON.stringify(ast, null, 2), 'utf8');
+      fs.writeFileSync("/tmp/pang_ast_debug.json", JSON.stringify(ast, null, 2), "utf8");
     } catch (e) {}
     // Normalize odd array-shaped nodes that sometimes appear from the
     // ANTLR visitor (e.g., [null, expr] representing a return). This
@@ -851,13 +956,18 @@ if (!nestedInput) {
           for (const n of node) walk(n);
           return;
         }
-        if (node.type === 'Block' && Array.isArray(node.body)) {
+        if (node.type === "Block" && Array.isArray(node.body)) {
           const newBody = [];
           for (const item of node.body) {
             if (Array.isArray(item)) {
               // special-case pattern [null, expr] -> Return
-              if (item.length === 2 && (item[0] === null || item[0] === undefined) && item[1] && typeof item[1] === 'object') {
-                newBody.push({ type: 'Return', value: item[1] });
+              if (
+                item.length === 2 &&
+                (item[0] === null || item[0] === undefined) &&
+                item[1] &&
+                typeof item[1] === "object"
+              ) {
+                newBody.push({ type: "Return", value: item[1] });
                 continue;
               }
               // otherwise flatten and push non-null entries
@@ -873,14 +983,16 @@ if (!nestedInput) {
         }
         // recurse into children
         for (const k of Object.keys(node)) {
-          if (node[k] && typeof node[k] === 'object') walk(node[k]);
+          if (node[k] && typeof node[k] === "object") walk(node[k]);
         }
       }
       walk(root);
     }
     try {
       normalizeAstArrays(ast);
-      try { fs.writeFileSync('/tmp/pang_ast_debug_normalized.json', JSON.stringify(ast, null, 2), 'utf8'); } catch (e) {}
+      try {
+        fs.writeFileSync("/tmp/pang_ast_debug_normalized.json", JSON.stringify(ast, null, 2), "utf8");
+      } catch (e) {}
     } catch (e) {
       // non-fatal; continue with original ast
     }
@@ -893,11 +1005,12 @@ if (!nestedInput) {
   // Debug: locate any Print statements that contain concat '..' expressions
   function containsConcat(node) {
     if (!node) return false;
-    if (node.type === 'Binary' && node.op === '..') return true;
-    if (node.type === 'Binary') return containsConcat(node.left) || containsConcat(node.right);
-    if (node.type === 'Ternary') return containsConcat(node.cond) || containsConcat(node.thenExpr) || containsConcat(node.elseExpr);
-    if (node.type === 'Unary') return containsConcat(node.operand);
-    if (node.type === 'Call' && Array.isArray(node.args)) return node.args.some(containsConcat);
+    if (node.type === "Binary" && node.op === "..") return true;
+    if (node.type === "Binary") return containsConcat(node.left) || containsConcat(node.right);
+    if (node.type === "Ternary")
+      return containsConcat(node.cond) || containsConcat(node.thenExpr) || containsConcat(node.elseExpr);
+    if (node.type === "Unary") return containsConcat(node.operand);
+    if (node.type === "Call" && Array.isArray(node.args)) return node.args.some(containsConcat);
     return false;
   }
 
@@ -913,54 +1026,55 @@ if (!nestedInput) {
         return;
       }
       switch (stmt.type) {
-        case 'Declare':
-          if (stmt.kind === 'const') {
+        case "Declare":
+          if (stmt.kind === "const") {
             consts.add(stmt.name);
           }
           break;
-        case 'Assign':
+        case "Assign":
           if (consts.has(stmt.name)) {
             throw new Error(`Cannot reassign to const '${stmt.name}'`);
           }
           break;
-        case 'If':
+        case "If":
           for (const c of stmt.cases) {
             walkExpression(c.cond);
             walkStatement(c.thenBlock && c.thenBlock.body);
           }
           if (stmt.elseBlock) walkStatement(stmt.elseBlock.body);
           break;
-        case 'For':
-              if (stmt.init) {
-                // init may be Declare or Assign. Disallow declaring `const` in for-loop header.
-                if (stmt.init.type === 'Declare' && stmt.init.kind === 'const') {
-                  throw new Error(`Cannot declare const '${stmt.init.name}' in for-loop header`);
-                }
-                // If init declares a const elsewhere (not in for header), we still track it.
-                if (stmt.init.type === 'Declare' && stmt.init.kind === 'const') {
-                  consts.add(stmt.init.name);
-                }
-                walkStatement(stmt.init);
-              }
+        case "For":
+          if (stmt.init) {
+            // init may be Declare or Assign. Disallow declaring `const` in for-loop header.
+            if (stmt.init.type === "Declare" && stmt.init.kind === "const") {
+              throw new Error(`Cannot declare const '${stmt.init.name}' in for-loop header`);
+            }
+            // If init declares a const elsewhere (not in for header), we still track it.
+            if (stmt.init.type === "Declare" && stmt.init.kind === "const") {
+              consts.add(stmt.init.name);
+            }
+            walkStatement(stmt.init);
+          }
           if (stmt.cond) walkExpression(stmt.cond);
           if (stmt.update) {
-            if (stmt.update.type === 'Assign' && consts.has(stmt.update.name)) {
+            if (stmt.update.type === "Assign" && consts.has(stmt.update.name)) {
               throw new Error(`Cannot reassign to const '${stmt.update.name}'`);
             }
             // update can be an expression or assign; walk accordingly
-            if (stmt.update.type === 'Assign') walkStatement(stmt.update);else walkExpression(stmt.update);
+            if (stmt.update.type === "Assign") walkStatement(stmt.update);
+            else walkExpression(stmt.update);
           }
           // body is a Block
           walkStatement(stmt.body && stmt.body.body);
           break;
-        case 'While':
+        case "While":
           if (stmt.cond) walkExpression(stmt.cond);
           walkStatement(stmt.body && stmt.body.body);
           break;
-        case 'Block':
+        case "Block":
           for (const s of stmt.body || []) walkStatement(s);
           break;
-        case 'On':
+        case "On":
           if (stmt.body && stmt.body.body) walkStatement(stmt.body.body);
           break;
         default:
@@ -976,19 +1090,19 @@ if (!nestedInput) {
         return;
       }
       switch (expr.type) {
-        case 'Binary':
+        case "Binary":
           walkExpression(expr.left);
           walkExpression(expr.right);
           break;
-        case 'Unary':
+        case "Unary":
           walkExpression(expr.operand);
           break;
-        case 'Ternary':
+        case "Ternary":
           walkExpression(expr.cond);
           walkExpression(expr.thenExpr);
           walkExpression(expr.elseExpr);
           break;
-        case 'Call':
+        case "Call":
           for (const a of expr.args || []) walkExpression(a);
           break;
         default:
@@ -997,7 +1111,7 @@ if (!nestedInput) {
     }
 
     for (const node of rootAst) {
-      if (node && node.type === 'On' && node.body && node.body.body) {
+      if (node && node.type === "On" && node.body && node.body.body) {
         for (const st of node.body.body) walkStatement(st);
       } else {
         walkStatement(node);
@@ -1008,7 +1122,7 @@ if (!nestedInput) {
   try {
     enforceConstImmutability(ast);
   } catch (e) {
-    console.error('Const assignment error:', e.message);
+    console.error("Const assignment error:", e.message);
     process.exit(1);
   }
 
@@ -1019,30 +1133,30 @@ if (!nestedInput) {
       for (let i = 0; i < stmts.length; i++) {
         const s = stmts[i];
         if (!s) continue;
-        if (s.type === 'Break') {
+        if (s.type === "Break") {
           if (i < stmts.length - 1) throw new Error("Cannot have code after 'break' in the same block");
         }
         // Recurse into nested blocks where break rules also apply
-        if (s.type === 'If') {
+        if (s.type === "If") {
           for (const c of s.cases) {
             if (c.thenBlock && c.thenBlock.body) walkStatements(c.thenBlock.body);
           }
           if (s.elseBlock && s.elseBlock.body) walkStatements(s.elseBlock.body);
-        } else if (s.type === 'For' || s.type === 'While' || s.type === 'Block' || s.type === 'On') {
+        } else if (s.type === "For" || s.type === "While" || s.type === "Block" || s.type === "On") {
           if (s.body && s.body.body) walkStatements(s.body.body);
         }
       }
     }
     for (const node of rootAst) {
-      if (node && node.type === 'On' && node.body && node.body.body) walkStatements(node.body.body);
-      else if (node && node.type === 'Block' && node.body) walkStatements(node.body);
+      if (node && node.type === "On" && node.body && node.body.body) walkStatements(node.body.body);
+      else if (node && node.type === "Block" && node.body) walkStatements(node.body);
     }
   }
 
   try {
     enforceNoCodeAfterBreak(ast);
   } catch (e) {
-    console.error('Break placement error:', e.message);
+    console.error("Break placement error:", e.message);
     process.exit(1);
   }
   // Collect class definitions (name -> method param lists) so constructor
@@ -1057,7 +1171,7 @@ if (!nestedInput) {
         for (const n of node) walk(n);
         return;
       }
-      if (node.type === 'Class') {
+      if (node.type === "Class") {
         const name = node.name;
         classRegistry[name] = { methods: {}, methodReturns: {}, methodReturnOriginals: {} };
         // Mark that classes are present/used as soon as we discover one.
@@ -1065,18 +1179,21 @@ if (!nestedInput) {
         for (const m of node.members || []) {
           // generate tagged param names for this method so call-sites
           // and the method body use the same synthetic thread-var names.
-          const origParams = Array.isArray(m.params) ? m.params.slice() : (m.params ? [m.params] : []);
+          const origParams = Array.isArray(m.params) ? m.params.slice() : m.params ? [m.params] : [];
           // Use a per-method scope key so all occurrences of the same method
           // parameter share the same uid-prefixed name.
-          const tagged = origParams.map((p, i) => p ? __pw_newArgTemp(p, `class:${name}:${m.name}:param:${i}:${p}`) : p);
+          const tagged = origParams.map((p, i) =>
+            p ? __pw_newArgTemp(p, `class:${name}:${m.name}:param:${i}:${p}`) : p,
+          );
           classRegistry[name].methods[m.name] = tagged;
           // Detect if this method returns a lambda at the top level of its body
           let retLambdaParams = null;
           if (m && m.body && Array.isArray(m.body.body)) {
             for (const st of m.body.body) {
-              if (st && st.type === 'Return' && st.value && st.value.type === 'Lambda') {
+              if (st && st.type === "Return" && st.value && st.value.type === "Lambda") {
                 const lp = st.value.params;
-                if (Array.isArray(lp)) retLambdaParams = lp.slice();else if (lp) retLambdaParams = [lp];
+                if (Array.isArray(lp)) retLambdaParams = lp.slice();
+                else if (lp) retLambdaParams = [lp];
                 break;
               }
             }
@@ -1084,7 +1201,9 @@ if (!nestedInput) {
           // Map returned-lambda param names to tagged names as well and store originals
           if (Array.isArray(retLambdaParams) && retLambdaParams.length > 0) {
             classRegistry[name].methodReturnOriginals[m.name] = retLambdaParams.slice();
-            classRegistry[name].methodReturns[m.name] = retLambdaParams.map((p, i) => p ? __pw_newArgTemp(p, `class:${name}:${m.name}:return:param:${i}:${p}`) : p);
+            classRegistry[name].methodReturns[m.name] = retLambdaParams.map((p, i) =>
+              p ? __pw_newArgTemp(p, `class:${name}:${m.name}:return:param:${i}:${p}`) : p,
+            );
           } else {
             classRegistry[name].methodReturns[m.name] = retLambdaParams;
             classRegistry[name].methodReturnOriginals[m.name] = retLambdaParams;
@@ -1093,8 +1212,8 @@ if (!nestedInput) {
         return;
       }
       // descend into common container fields
-      if (node.type === 'Block' && Array.isArray(node.body)) return walk(node.body);
-      if (node.type === 'On' && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
+      if (node.type === "Block" && Array.isArray(node.body)) return walk(node.body);
+      if (node.type === "On" && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
       if (node.body && Array.isArray(node.body)) return walk(node.body);
     }
     walk(root);
@@ -1110,29 +1229,39 @@ if (!nestedInput) {
         for (const n of node) walk(n);
         return;
       }
-      if (node.type === 'Declare' && node.value && node.value.type === 'New') {
+      if (node.type === "Declare" && node.value && node.value.type === "New") {
         const callee = node.value.callee;
-        if (callee && callee.type === 'Call' && typeof callee.name === 'string') {
+        if (callee && callee.type === "Call" && typeof callee.name === "string") {
           varToClass[node.name] = callee.name;
         }
       }
       // Track variables initialized to lambda expressions so we know their arg names
-        if (node.type === 'Declare' && node.value && node.value.type === 'Lambda') {
+      if (node.type === "Declare" && node.value && node.value.type === "Lambda") {
         const lp = node.value.params;
-        if (Array.isArray(lp)) varToLambda[node.name] = lp.map((p, i) => p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p);else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];else varToLambda[node.name] = [];
+        if (Array.isArray(lp))
+          varToLambda[node.name] = lp.map((p, i) =>
+            p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p,
+          );
+        else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];
+        else varToLambda[node.name] = [];
       }
-      if (node.type === 'Assign' && node.value && node.value.type === 'New') {
+      if (node.type === "Assign" && node.value && node.value.type === "New") {
         const callee = node.value.callee;
-        if (callee && callee.type === 'Call' && typeof callee.name === 'string') {
+        if (callee && callee.type === "Call" && typeof callee.name === "string") {
           varToClass[node.name] = callee.name;
         }
       }
-      if (node.type === 'Assign' && node.value && node.value.type === 'Lambda') {
+      if (node.type === "Assign" && node.value && node.value.type === "Lambda") {
         const lp = node.value.params;
-        if (Array.isArray(lp)) varToLambda[node.name] = lp.map((p, i) => p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p);else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];else varToLambda[node.name] = [];
+        if (Array.isArray(lp))
+          varToLambda[node.name] = lp.map((p, i) =>
+            p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p,
+          );
+        else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];
+        else varToLambda[node.name] = [];
       }
-      if (node.type === 'Block' && Array.isArray(node.body)) return walk(node.body);
-      if (node.type === 'On' && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
+      if (node.type === "Block" && Array.isArray(node.body)) return walk(node.body);
+      if (node.type === "On" && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
       if (node.body && Array.isArray(node.body)) return walk(node.body);
     }
     walk(root);
@@ -1143,8 +1272,8 @@ if (!nestedInput) {
   function exprToNested(expr, inMethod = false, paramMap = null) {
     if (!expr) return "";
     // Lambda expressions (arrow functions) -> emit jwLambda_newLambda nested block
-    if (expr.type === 'Lambda') {
-      const origParams = Array.isArray(expr.params) ? expr.params.slice() : (expr.params ? [expr.params] : []);
+    if (expr.type === "Lambda") {
+      const origParams = Array.isArray(expr.params) ? expr.params.slice() : expr.params ? [expr.params] : [];
       // reuse provided paramMap (from class/var precollection) or allocate fresh tagged names
       let localParamMap = paramMap || null;
       if (!localParamMap) {
@@ -1152,25 +1281,27 @@ if (!nestedInput) {
         for (const p of origParams) if (p) localParamMap[p] = __pw_newArgTemp(p);
       }
       let lambdaArg;
-      if (!origParams || origParams.length === 0) lambdaArg = { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
+      if (!origParams || origParams.length === 0)
+        lambdaArg = { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
       else if (origParams.length === 1) lambdaArg = localParamMap[origParams[0]];
       else lambdaArg = origParams.map((p) => localParamMap[p]);
       let lambdaBody = [];
       if (expr.body && Array.isArray(expr.body.body)) {
         const raw = expr.body.body.map((s) => stmtToNested(s, true, localParamMap)).filter(Boolean);
         lambdaBody = flattenNestedResults(raw);
-        assertReturnTerminal(lambdaBody, 'lambda body');
+        assertReturnTerminal(lambdaBody, "lambda body");
       }
-      return { opcode: 'jwLambda_newLambda', inputs: [ lambdaArg, lambdaBody ] };
+      return { opcode: "jwLambda_newLambda", inputs: [lambdaArg, lambdaBody] };
     }
     if (expr.type === "Literal") return expr.value;
     if (expr.type === "Var") {
       // If this variable name shadows a param in current paramMap, emit the tagged name
-      if (paramMap && expr.name && Object.prototype.hasOwnProperty.call(paramMap, expr.name)) return { type: "Var", name: paramMap[expr.name] };
+      if (paramMap && expr.name && Object.prototype.hasOwnProperty.call(paramMap, expr.name))
+        return { type: "Var", name: paramMap[expr.name] };
       return { type: "Var", name: expr.name };
     }
-    if (expr.type === "This") return { opcode: 'jwClass_self', inputs: [] };
-    if (expr.type === 'Member' || expr.type === 'MemberExpr') {
+    if (expr.type === "This") return { opcode: "jwClass_self", inputs: [] };
+    if (expr.type === "Member" || expr.type === "MemberExpr") {
       const chain = expr.chain || [];
       if (chain.length < 1) return "";
       // If the receiver is itself an expression (e.g., a chained call AST),
@@ -1178,7 +1309,7 @@ if (!nestedInput) {
       // including when the receiver expression emitted an inline wrapper
       // (control_inline_stack_output) that stored the object in a temp and
       // returned it via `procedures_return`.
-      if (typeof chain[0] === 'object') {
+      if (typeof chain[0] === "object") {
         // Build nested representation for the receiver expression
         const recvExpr = chain[0];
         const recvNested = exprToNested(recvExpr, inMethod, paramMap);
@@ -1188,26 +1319,36 @@ if (!nestedInput) {
         // If recvNested is an inline wrapper we can splice the property
         // access into its final `procedures_return` so the wrapper still
         // executes the calls but returns the requested property value.
-        if (recvNested && recvNested.opcode === 'control_inline_stack_output' && Array.isArray(recvNested.inputs) && Array.isArray(recvNested.inputs[0])) {
+        if (
+          recvNested &&
+          recvNested.opcode === "control_inline_stack_output" &&
+          Array.isArray(recvNested.inputs) &&
+          Array.isArray(recvNested.inputs[0])
+        ) {
           const inlineChildren = recvNested.inputs[0];
           // find the final procedures_return entry
           for (let i = inlineChildren.length - 1; i >= 0; i--) {
             const node = inlineChildren[i];
-            if (node && node.opcode === 'procedures_return') {
+            if (node && node.opcode === "procedures_return") {
               const retVal = node.inputs && node.inputs[0];
               // If return value is a thread temp getter, attach property access
-              if (retVal && retVal.opcode === 'SPtempVars_getVar' && Array.isArray(retVal.inputs) && retVal.inputs[0] === 'thread') {
+              if (
+                retVal &&
+                retVal.opcode === "SPtempVars_getVar" &&
+                Array.isArray(retVal.inputs) &&
+                retVal.inputs[0] === "thread"
+              ) {
                 let receiverRef = retVal; // SPtempVars_getVar ['thread', temp]
                 // compose jwClass_getProp chain for all remaining props
                 let propGet = null;
                 for (let pi = 0; pi < props.length; pi++) {
                   const pname = props[pi];
-                  if (pi === 0) propGet = { opcode: 'jwClass_getProp', inputs: [pname, receiverRef] };
-                  else propGet = { opcode: 'jwClass_getProp', inputs: [pname, propGet] };
+                  if (pi === 0) propGet = { opcode: "jwClass_getProp", inputs: [pname, receiverRef] };
+                  else propGet = { opcode: "jwClass_getProp", inputs: [pname, propGet] };
                 }
                 // replace the procedures_return value with property getter
-                inlineChildren[i] = { opcode: 'procedures_return', inputs: [propGet] };
-                return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+                inlineChildren[i] = { opcode: "procedures_return", inputs: [propGet] };
+                return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
               }
               // If return value is not a temp getter, fallback to wrapping the return value
               // with property getters by producing a new procedures_return that
@@ -1216,11 +1357,11 @@ if (!nestedInput) {
               let propGetAlt = null;
               for (let pi = 0; pi < props.length; pi++) {
                 const pname = props[pi];
-                if (pi === 0) propGetAlt = { opcode: 'jwClass_getProp', inputs: [pname, receiverRefAlt] };
-                else propGetAlt = { opcode: 'jwClass_getProp', inputs: [pname, propGetAlt] };
+                if (pi === 0) propGetAlt = { opcode: "jwClass_getProp", inputs: [pname, receiverRefAlt] };
+                else propGetAlt = { opcode: "jwClass_getProp", inputs: [pname, propGetAlt] };
               }
-              inlineChildren[i] = { opcode: 'procedures_return', inputs: [propGetAlt] };
-              return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+              inlineChildren[i] = { opcode: "procedures_return", inputs: [propGetAlt] };
+              return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
             }
           }
         }
@@ -1229,48 +1370,55 @@ if (!nestedInput) {
         let receiverRef = recvNested;
         for (let i = 0; i < props.length; i++) {
           const prop = props[i];
-          receiverRef = { opcode: 'jwClass_getProp', inputs: [prop, receiverRef] };
+          receiverRef = { opcode: "jwClass_getProp", inputs: [prop, receiverRef] };
         }
         return receiverRef;
       }
       // Build nested receiver (object) stopping before the final property
-      let objReceiver = (typeof chain[0] === 'string' && chain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
+      let objReceiver =
+        typeof chain[0] === "string" && chain[0] === "this"
+          ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+          : { type: "Var", name: chain[0] };
       if (chain.length > 2) {
         for (let i = 1; i < chain.length; i++) {
           const prop = chain[i];
-          objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
+          objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
         }
         return objReceiver;
       }
       if (chain.length === 2) {
         const propName = chain[1];
-        return { opcode: 'jwClass_getProp', inputs: [propName, objReceiver] };
+        return { opcode: "jwClass_getProp", inputs: [propName, objReceiver] };
       }
       return objReceiver;
     }
-    if (expr.type === 'MemberCall') {
+    if (expr.type === "MemberCall") {
       const chain = expr.chain || [];
       if (chain.length < 2) return "";
       // Receiver may be a simple name or an expression (from a previous call).
       let objReceiver = null;
       const first = chain[0];
-      if (typeof first === 'string') {
-        objReceiver = (first === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: first };
-      } else if (typeof first === 'object') {
+      if (typeof first === "string") {
+        objReceiver =
+          first === "this"
+            ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+            : { type: "Var", name: first };
+      } else if (typeof first === "object") {
         objReceiver = exprToNested(first, inMethod, paramMap);
       } else {
-        objReceiver = { type: 'Var', name: String(first) };
+        objReceiver = { type: "Var", name: String(first) };
       }
       // Build getters for any intermediate property names
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
-          if (typeof prop === 'string') objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
-          else objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
+          if (typeof prop === "string")
+            objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
+          else objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
         }
       }
       const methodName = chain[chain.length - 1];
-      const methodGetter = { opcode: 'jwClass_getProp', inputs: [methodName, objReceiver] };
+      const methodGetter = { opcode: "jwClass_getProp", inputs: [methodName, objReceiver] };
 
       // If this MemberCall represents a chain (previous call ASTs embedded)
       // flatten it into ordered steps and emit an inline wrapper that:
@@ -1285,7 +1433,7 @@ if (!nestedInput) {
           if (!n) return;
           const ch = n.chain || [];
           const first = ch[0];
-          if (typeof first === 'object') {
+          if (typeof first === "object") {
             // previous call AST - recurse then append this method
             helper(first);
             const method = ch[ch.length - 1];
@@ -1295,7 +1443,12 @@ if (!nestedInput) {
           // base case: a string-based chain like ['obj','prop','method']
           const method = ch[ch.length - 1];
           const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
-          if (receiverChain.length > 0 && typeof receiverChain[0] === 'string' && varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
+          if (
+            receiverChain.length > 0 &&
+            typeof receiverChain[0] === "string" &&
+            varToClass[receiverChain[0]]
+          )
+            baseClassName = varToClass[receiverChain[0]];
           steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
         helper(node);
@@ -1310,41 +1463,51 @@ if (!nestedInput) {
       if (steps.length <= 1) {
         // attempt to detect method params from varToClass/classRegistry
         let className = null;
-        if (typeof chain[0] === 'string' && varToClass[chain[0]]) className = varToClass[chain[0]];
-        const methodParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[methodName] ? classRegistry[className].methods[methodName] : null;
+        if (typeof chain[0] === "string" && varToClass[chain[0]]) className = varToClass[chain[0]];
+        const methodParams =
+          className &&
+          classRegistry[className] &&
+          classRegistry[className].methods &&
+          classRegistry[className].methods[methodName]
+            ? classRegistry[className].methods[methodName]
+            : null;
         if (Array.isArray(methodParams) && methodParams.length > 0) {
           const setters = [];
           let receiverTempName = null;
           let receiverRef = objReceiver;
-          const needTempForReceiver = !(objReceiver && objReceiver.opcode === 'jwClass_self');
+          const needTempForReceiver = !(objReceiver && objReceiver.opcode === "jwClass_self");
           if (needTempForReceiver) {
-            receiverTempName = __pw_newTemp('__m');
-            const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', receiverTempName, objReceiver] };
+            receiverTempName = __pw_newTemp("__m");
+            const setTemp = {
+              opcode: "SPtempVars_setVar",
+              inputs: ["thread", receiverTempName, objReceiver],
+            };
             setters.push(setTemp);
-            receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', receiverTempName] };
+            receiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", receiverTempName] };
           }
           for (let i = 0; i < methodParams.length; i++) {
             const pname = methodParams[i];
             const argExpr = expr.args && expr.args[i] ? exprToNested(expr.args[i], inMethod, paramMap) : "";
-            setters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+            setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
           }
-          const boundMethodGetter = { opcode: 'jwClass_getProp', inputs: [methodName, receiverRef] };
-          const callMethod = { opcode: 'jwLambda_executeR', inputs: [boundMethodGetter, ""] };
-          const ret = { opcode: 'procedures_return', inputs: [callMethod] };
+          const boundMethodGetter = { opcode: "jwClass_getProp", inputs: [methodName, receiverRef] };
+          const callMethod = { opcode: "jwLambda_executeR", inputs: [boundMethodGetter, ""] };
+          const ret = { opcode: "procedures_return", inputs: [callMethod] };
           const inlineChildren = [].concat(setters, [ret]);
-          return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+          return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
         }
         // fallback: single-step — set thread var for positional arg then return result
-        const argNested = expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const argNested =
+          expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
         if (argNested !== "") {
-          const argTempName = __pw_newArgTemp('value');
-          const setters2 = [{ opcode: 'SPtempVars_setVar', inputs: ['thread', argTempName, argNested] }];
-          const callMethod2 = { opcode: 'jwLambda_executeR', inputs: [methodGetter, ""] };
-          const ret2 = { opcode: 'procedures_return', inputs: [callMethod2] };
+          const argTempName = __pw_newArgTemp("value");
+          const setters2 = [{ opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] }];
+          const callMethod2 = { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
+          const ret2 = { opcode: "procedures_return", inputs: [callMethod2] };
           const inlineChildren2 = [].concat(setters2, [ret2]);
-          return { opcode: 'control_inline_stack_output', inputs: [inlineChildren2] };
+          return { opcode: "control_inline_stack_output", inputs: [inlineChildren2] };
         }
-        return { opcode: 'jwLambda_executeR', inputs: [methodGetter, ""] };
+        return { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
       }
 
       // Multi-step chain: create temps for each intermediate call result
@@ -1364,26 +1527,46 @@ if (!nestedInput) {
         let receiverRef = null;
         if (si === 0) {
           const recvChain = step.receiverChain || [];
-          if (recvChain.length === 0) receiverRef = objReceiver; else {
+          if (recvChain.length === 0) receiverRef = objReceiver;
+          else {
             // build nested receiver from recvChain
-            let r = (recvChain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: recvChain[0] };
-            for (let k = 1; k < recvChain.length; k++) r = { opcode: 'jwClass_getProp', inputs: [recvChain[k], r] };
+            let r =
+              recvChain[0] === "this"
+                ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+                : { type: "Var", name: recvChain[0] };
+            for (let k = 1; k < recvChain.length; k++)
+              r = { opcode: "jwClass_getProp", inputs: [recvChain[k], r] };
             receiverRef = r;
           }
         } else {
           // receiver is previous temp
-          receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] };
+          receiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] };
         }
 
         // determine method params if available: prefer baseClassName when receiver is prev
         let classNameForStep = null;
         if (si === 0) {
-          if (Array.isArray(step.receiverChain) && step.receiverChain.length > 0 && typeof step.receiverChain[0] === 'string' && varToClass[step.receiverChain[0]]) classNameForStep = varToClass[step.receiverChain[0]];
+          if (
+            Array.isArray(step.receiverChain) &&
+            step.receiverChain.length > 0 &&
+            typeof step.receiverChain[0] === "string" &&
+            varToClass[step.receiverChain[0]]
+          )
+            classNameForStep = varToClass[step.receiverChain[0]];
         } else {
           classNameForStep = baseClassName;
         }
-        const paramsForStep = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[step.methodName] ? classRegistry[classNameForStep].methods[step.methodName] : null;
-        const returnsLambdaArgsForMethod = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns ? classRegistry[classNameForStep].methodReturns[step.methodName] : null;
+        const paramsForStep =
+          classNameForStep &&
+          classRegistry[classNameForStep] &&
+          classRegistry[classNameForStep].methods &&
+          classRegistry[classNameForStep].methods[step.methodName]
+            ? classRegistry[classNameForStep].methods[step.methodName]
+            : null;
+        const returnsLambdaArgsForMethod =
+          classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns
+            ? classRegistry[classNameForStep].methodReturns[step.methodName]
+            : null;
 
         // If this step is a normal method call (methodName present)
         if (step.methodName) {
@@ -1391,33 +1574,39 @@ if (!nestedInput) {
           if (Array.isArray(paramsForStep) && paramsForStep.length > 0) {
             for (let pi = 0; pi < paramsForStep.length; pi++) {
               const pname = paramsForStep[pi];
-              const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
-              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+              const argExpr =
+                step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
             }
             // call method via jwLambda_executeR on the bound getter and store into temp
-            const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
-            const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
-            const tempName = __pw_newTemp('__c');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            const boundMethod = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
+            const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
+            const tempName = __pw_newTemp("__c");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
             prevTemp = tempName;
             // remember if this method is known to return a lambda and its arg names
-            prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+            prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
+              ? returnsLambdaArgsForMethod.slice()
+              : null;
             prevStepMethodName = step.methodName;
             continue;
           }
 
           // fallback when param names unknown: set a synthetic thread var for the first arg
-          const argPos = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
-          const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
+          const argPos =
+            step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+          const boundMethod = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
           if (argPos !== "") {
-            const argTemp = __pw_newArgTemp('value');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, argPos] });
+            const argTemp = __pw_newArgTemp("value");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPos] });
           }
-          const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
-          const tempName = __pw_newTemp('__c');
-          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+          const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
+          const tempName = __pw_newTemp("__c");
+          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
           prevTemp = tempName;
-          prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+          prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
+            ? returnsLambdaArgsForMethod.slice()
+            : null;
           prevStepMethodName = step.methodName;
           continue;
         }
@@ -1428,37 +1617,72 @@ if (!nestedInput) {
         // previous method did NOT return a lambda, but we have a last seen method
         // name, assume this is a chained method call and synthesize the property
         // access on the previous temp instead of invoking the temp as a function.
-        if (!step.methodName && prevStepMethodName && (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) && prevTemp) {
+        if (
+          !step.methodName &&
+          prevStepMethodName &&
+          (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) &&
+          prevTemp
+        ) {
           // treat as a method call on the previous temp using the previously-seen method name
           const fakeMethod = prevStepMethodName;
-          const fakeParams = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[fakeMethod] ? classRegistry[classNameForStep].methods[fakeMethod] : null;
+          const fakeParams =
+            classNameForStep &&
+            classRegistry[classNameForStep] &&
+            classRegistry[classNameForStep].methods &&
+            classRegistry[classNameForStep].methods[fakeMethod]
+              ? classRegistry[classNameForStep].methods[fakeMethod]
+              : null;
           if (Array.isArray(fakeParams) && fakeParams.length > 0) {
             for (let pi = 0; pi < fakeParams.length; pi++) {
               const pname = fakeParams[pi];
-              const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
-              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+              const argExpr =
+                step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
             }
-            const boundMethod = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
-            const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
-            const tempName = __pw_newTemp('__c');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            const boundMethod = {
+              opcode: "jwClass_getProp",
+              inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
+            };
+            const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
+            const tempName = __pw_newTemp("__c");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
             prevTemp = tempName;
-            prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+            prevReturnedLambdaArgs =
+              classNameForStep &&
+              classRegistry[classNameForStep] &&
+              classRegistry[classNameForStep].methodReturns &&
+              classRegistry[classNameForStep].methodReturns[fakeMethod]
+                ? Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod])
+                  ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice()
+                  : null
+                : null;
             prevStepMethodName = fakeMethod;
             continue;
           }
           // fallback: no named params for fakeMethod — treat like unknown-param method
-          const fakeArgExpr = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+          const fakeArgExpr =
+            step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
           if (fakeArgExpr !== "") {
-            const argTemp = __pw_newArgTemp('value');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, fakeArgExpr] });
+            const argTemp = __pw_newArgTemp("value");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, fakeArgExpr] });
           }
-          const boundMethod2 = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
-          const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [boundMethod2, ""] };
-          const tempName2 = __pw_newTemp('__c');
-          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
+          const boundMethod2 = {
+            opcode: "jwClass_getProp",
+            inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
+          };
+          const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
+          const tempName2 = __pw_newTemp("__c");
+          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] });
           prevTemp = tempName2;
-          prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+          prevReturnedLambdaArgs =
+            classNameForStep &&
+            classRegistry[classNameForStep] &&
+            classRegistry[classNameForStep].methodReturns &&
+            classRegistry[classNameForStep].methodReturns[fakeMethod]
+              ? Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod])
+                ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice()
+                : null
+              : null;
           prevStepMethodName = fakeMethod;
           continue;
         }
@@ -1467,35 +1691,43 @@ if (!nestedInput) {
           for (let pi = 0; pi < prevReturnedLambdaArgs.length; pi++) {
             const pname = prevReturnedLambdaArgs[pi];
             const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
           }
-          const callReporter = { opcode: 'jwLambda_executeR', inputs: [receiverRef, ""] };
-          const tempName = __pw_newTemp('__c');
-          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+          const callReporter = { opcode: "jwLambda_executeR", inputs: [receiverRef, ""] };
+          const tempName = __pw_newTemp("__c");
+          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
           prevTemp = tempName;
           // We don't currently track lambdas returned by anonymous/function-valued calls;
           // reset prevReturnedLambdaArgs unless more static info becomes available.
           prevReturnedLambdaArgs = null;
+            // Once we've executed a returned-lambda, clear the prior
+            // `methodName` to avoid synthesizing subsequent chained method
+            // calls on the temp (prevents double-invoking methods).
+            prevStepMethodName = null;
           continue;
         }
 
         // fallback: call the function-valued receiver — set thread var for arg then call
-        const argPos2 = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+        const argPos2 =
+          step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
         if (argPos2 !== "") {
-          const argTemp2 = __pw_newArgTemp('value');
-          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp2, argPos2] });
+          const argTemp2 = __pw_newArgTemp("value");
+          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp2, argPos2] });
         }
-        const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [receiverRef, ""] };
-        const tempName2 = __pw_newTemp('__c');
-        inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
+        const callReporter2 = { opcode: "jwLambda_executeR", inputs: [receiverRef, ""] };
+        const tempName2 = __pw_newTemp("__c");
+        inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] });
         prevTemp = tempName2;
         prevReturnedLambdaArgs = null;
       }
 
       // return the last temp value
-      const retNode = { opcode: 'procedures_return', inputs: [{ opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
+      const retNode = {
+        opcode: "procedures_return",
+        inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
+      };
       inlineChildren.push(retNode);
-      return { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+      return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
     }
     if (expr.type === "Call") {
       const name = expr.name;
@@ -1512,28 +1744,38 @@ if (!nestedInput) {
         }
         // append any extra positional args after declared params
         if (expr.args && expr.args.length > params.length) {
-          for (let i = params.length; i < expr.args.length; i++) argsArr.push(exprToNested(expr.args[i], inMethod, paramMap));
+          for (let i = params.length; i < expr.args.length; i++)
+            argsArr.push(exprToNested(expr.args[i], inMethod, paramMap));
         }
         return { opcode: name, inputs: argsArr, __shape: shape };
       }
 
-      return { opcode: name, inputs: (expr.args || []).map((e) => exprToNested(e, inMethod, paramMap)), __shape: shape };
+      return {
+        opcode: name,
+        inputs: (expr.args || []).map((e) => exprToNested(e, inMethod, paramMap)),
+        __shape: shape,
+      };
     }
-    if (expr.type === 'New') {
+    if (expr.type === "New") {
       // expr.callee is a Call AST for the class reference; args are constructor args
       const callee = expr.callee;
       // Determine a nested representation for the CLASS input
       let classRefNested = null;
-      if (callee && callee.type === 'Call') {
+      if (callee && callee.type === "Call") {
         // class reference is stored as a global variable named after the class
         // (SPtempVars_setVar was used earlier to assign the jwClass_class into a
         // global named after the class). Use SPtempVars_getVar to reference it
         // so converter emits a proper getVar reporter instead of a raw opcode.
-        classRefNested = { opcode: 'SPtempVars_getVar', inputs: ['global', String(callee.name)], noPlaceholder: true };
-      } else if (callee && callee.type === 'MemberCall') {
+        classRefNested = {
+          opcode: "SPtempVars_getVar",
+          inputs: ["global", String(callee.name)],
+          noPlaceholder: true,
+        };
+      } else if (callee && callee.type === "MemberCall") {
         // member expression returning class value
         const chain = callee.chain || [];
-        if (chain.length > 0) classRefNested = exprToNested({ type: 'Var', name: chain[0] }, inMethod, paramMap);
+        if (chain.length > 0)
+          classRefNested = exprToNested({ type: "Var", name: chain[0] }, inMethod, paramMap);
       }
       if (!classRefNested) classRefNested = "";
 
@@ -1541,55 +1783,85 @@ if (!nestedInput) {
       // defines a `constructor` method. If no constructor exists, simply
       // emit a `jwClass_new` reporter and do not create a wrapper.
       let className = null;
-      if (callee && callee.type === 'Call' && typeof callee.name === 'string') className = callee.name;
-      const hasCtor = !!(className && classRegistry[className] && classRegistry[className].methods && Object.prototype.hasOwnProperty.call(classRegistry[className].methods, 'constructor'));
-      const cargs = (callee && callee.args) ? callee.args : [];
+      if (callee && callee.type === "Call" && typeof callee.name === "string") className = callee.name;
+      const hasCtor = !!(
+        className &&
+        classRegistry[className] &&
+        classRegistry[className].methods &&
+        Object.prototype.hasOwnProperty.call(classRegistry[className].methods, "constructor")
+      );
+      const cargs = callee && callee.args ? callee.args : [];
       if (!hasCtor) {
-        return { opcode: 'jwClass_new', inputs: [classRefNested] };
+        return { opcode: "jwClass_new", inputs: [classRefNested] };
       }
 
       // Otherwise build an inline stack wrapper that: set tempNew = new CLASS;
       // call constructor via jwClass_getProp + jwLambda_execute; return tempNew
-      const tempName = __pw_newTemp('__new');
+      const tempName = __pw_newTemp("__new");
       // set the tempNew as a thread-scoped temp variable
-      const setTemp = { opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, { opcode: 'jwClass_new', inputs: [classRefNested] }] };
+      const setTemp = {
+        opcode: "SPtempVars_setVar",
+        inputs: ["thread", tempName, { opcode: "jwClass_new", inputs: [classRefNested] }],
+      };
       // attempt to map constructor param names if we have class signature info
       const ctorParamSetters = [];
       //let className = null;
-      if (callee && callee.type === 'Call' && typeof callee.name === 'string') className = callee.name;
-      const ctorParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods['constructor'] ? classRegistry[className].methods['constructor'] : null;
+      if (callee && callee.type === "Call" && typeof callee.name === "string") className = callee.name;
+      const ctorParams =
+        className &&
+        classRegistry[className] &&
+        classRegistry[className].methods &&
+        classRegistry[className].methods["constructor"]
+          ? classRegistry[className].methods["constructor"]
+          : null;
       if (Array.isArray(ctorParams) && ctorParams.length > 0) {
         for (let i = 0; i < ctorParams.length; i++) {
           const pname = ctorParams[i];
-          const argExpr = callee && callee.args && callee.args[i] ? exprToNested(callee.args[i], inMethod, paramMap) : "";
-          ctorParamSetters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+          const argExpr =
+            callee && callee.args && callee.args[i] ? exprToNested(callee.args[i], inMethod, paramMap) : "";
+          ctorParamSetters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
         }
       }
       // build constructor getter chain (constructor property)
       // Use a thread-scoped SPtempVars_getVar for the temporary instance so
       // subsequent getters/readers inside the inline wrapper reference the
       // thread-scoped temp, not a global variable.
-      let receiver = { opcode: 'SPtempVars_getVar', inputs: ['thread', tempName] };
-      const ctorGet = { opcode: 'jwClass_getProp', inputs: ['constructor', receiver] };
+      let receiver = { opcode: "SPtempVars_getVar", inputs: ["thread", tempName] };
+      const ctorGet = { opcode: "jwClass_getProp", inputs: ["constructor", receiver] };
       // If we didn't map constructor params, pass the first arg as fallback
-      const ctorArg = (!Array.isArray(ctorParams) || ctorParams.length === 0) && expr.callee && expr.callee.args && expr.callee.args.length > 0 ? exprToNested(expr.callee.args[0], inMethod, paramMap) : "";
+      const ctorArg =
+        (!Array.isArray(ctorParams) || ctorParams.length === 0) &&
+        expr.callee &&
+        expr.callee.args &&
+        expr.callee.args.length > 0
+          ? exprToNested(expr.callee.args[0], inMethod, paramMap)
+          : "";
       const ctorArgSetters = [];
       if (ctorArg !== "") {
-        const ctorArgTemp = __pw_newArgTemp('value');
-        ctorArgSetters.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', ctorArgTemp, ctorArg] });
+        const ctorArgTemp = __pw_newArgTemp("value");
+        ctorArgSetters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", ctorArgTemp, ctorArg] });
       }
-      const callCtor = { opcode: 'jwLambda_execute', inputs: [ctorGet, ""] };
+      const callCtor = { opcode: "jwLambda_execute", inputs: [ctorGet, ""] };
       // return the thread-scoped temp instance using SPtempVars_getVar
-      const ret = { opcode: 'procedures_return', inputs: [{ opcode: 'SPtempVars_getVar', inputs: ['thread', tempName] }] };
-      const inlineChildren = [setTemp].concat(ctorParamSetters, ctorArgSetters, [callCtor, ret]).filter(Boolean);
-      const inlineBlock = { opcode: 'control_inline_stack_output', inputs: [inlineChildren] };
+      const ret = {
+        opcode: "procedures_return",
+        inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", tempName] }],
+      };
+      const inlineChildren = [setTemp]
+        .concat(ctorParamSetters, ctorArgSetters, [callCtor, ret])
+        .filter(Boolean);
+      const inlineBlock = { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
       return inlineBlock;
     }
     if (expr.type === "Ternary") {
       // Represent ternary using positional args so nested objects are preserved
       return {
         opcode: "control_if_return_else_return",
-        inputs: [exprToNested(expr.cond, inMethod, paramMap), exprToNested(expr.thenExpr, inMethod, paramMap), exprToNested(expr.elseExpr, inMethod, paramMap)]
+        inputs: [
+          exprToNested(expr.cond, inMethod, paramMap),
+          exprToNested(expr.thenExpr, inMethod, paramMap),
+          exprToNested(expr.elseExpr, inMethod, paramMap),
+        ],
       };
     }
     if (expr.type === "Unary") {
@@ -1605,7 +1877,10 @@ if (!nestedInput) {
           return -Number(opd.value);
         }
         // produce args ["", operand] to make NUM1 blank and NUM2 the block
-        return { opcode: generator.mapOpToOpcode(expr.op), inputs: ["", exprToNested(opd, inMethod, paramMap)] };
+        return {
+          opcode: generator.mapOpToOpcode(expr.op),
+          inputs: ["", exprToNested(opd, inMethod, paramMap)],
+        };
       }
       // other unary ops (!, ~)
       const op = generator.mapOpToOpcode(expr.op);
@@ -1626,10 +1901,17 @@ if (!nestedInput) {
         }
         const operands = collectConcatOperands(expr, []);
         const nestedParts = operands.map((o) => exprToNested(o, inMethod, paramMap));
-        return { opcode: "operator_expandablejoininputs", inputs: nestedParts, mutation: { inputcount: String(operands.length) } };
+        return {
+          opcode: "operator_expandablejoininputs",
+          inputs: nestedParts,
+          mutation: { inputcount: String(operands.length) },
+        };
       }
       const op = generator.mapOpToOpcode(expr.op);
-      return { opcode: op, inputs: [exprToNested(expr.left, inMethod, paramMap), exprToNested(expr.right, inMethod, paramMap)] };
+      return {
+        opcode: op,
+        inputs: [exprToNested(expr.left, inMethod, paramMap), exprToNested(expr.right, inMethod, paramMap)],
+      };
     }
     return "";
   }
@@ -1650,7 +1932,7 @@ if (!nestedInput) {
     if (!Array.isArray(arr)) return;
     for (let i = 0; i < arr.length; i++) {
       const e = arr[i];
-      if (e && e.opcode === 'procedures_return' && i !== arr.length - 1) {
+      if (e && e.opcode === "procedures_return" && i !== arr.length - 1) {
         throw new Error("'return' must be the last statement in " + context);
       }
     }
@@ -1669,47 +1951,64 @@ if (!nestedInput) {
     if (stmt.type === "If") {
       const node = { opcode: "if", cases: [] };
       for (const c of stmt.cases) {
-        const thenRaw = (c.thenBlock && c.thenBlock.body) ? c.thenBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+        const thenRaw =
+          c.thenBlock && c.thenBlock.body
+            ? c.thenBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean)
+            : [];
         const thenArr = flattenNestedResults(thenRaw);
-        assertReturnTerminal(thenArr, 'if-then branch');
+        assertReturnTerminal(thenArr, "if-then branch");
         node.cases.push({ cond: exprToNested(c.cond, inMethod, paramMap), then: thenArr });
       }
       if (stmt.elseBlock) {
-        const elseRaw = (stmt.elseBlock && stmt.elseBlock.body) ? stmt.elseBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+        const elseRaw =
+          stmt.elseBlock && stmt.elseBlock.body
+            ? stmt.elseBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean)
+            : [];
         const elseArr = flattenNestedResults(elseRaw);
-        assertReturnTerminal(elseArr, 'if-else branch');
+        assertReturnTerminal(elseArr, "if-else branch");
         node.else = elseArr;
       }
       return node;
     }
-    if (stmt.type === "Call") return { opcode: stmt.name, inputs: (stmt.args || []).map((a) => exprToNested(a, inMethod, paramMap)) };
-    if (stmt.type === 'MemberCall') {
+    if (stmt.type === "Call")
+      return { opcode: stmt.name, inputs: (stmt.args || []).map((a) => exprToNested(a, inMethod, paramMap)) };
+    if (stmt.type === "MemberCall") {
       const chain = stmt.chain || [];
       if (chain.length < 2) return null;
       // Build receiver object nested (stop before final property).
       let objReceiver = null;
       const first = chain[0];
-      if (typeof first === 'string') {
-        objReceiver = (first === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: first };
-      } else if (typeof first === 'object') {
+      if (typeof first === "string") {
+        objReceiver =
+          first === "this"
+            ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+            : { type: "Var", name: first };
+      } else if (typeof first === "object") {
         objReceiver = exprToNested(first, inMethod, paramMap);
       } else {
-        objReceiver = { type: 'Var', name: String(first) };
+        objReceiver = { type: "Var", name: String(first) };
       }
       if (chain.length > 2) {
         for (let i = 1; i < chain.length - 1; i++) {
           const prop = chain[i];
-          if (typeof prop === 'string') objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
-          else objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
+          if (typeof prop === "string")
+            objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
+          else objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
         }
       }
       const methodName = chain[chain.length - 1];
-      const methodGetter = { opcode: 'jwClass_getProp', inputs: [methodName, objReceiver] };
+      const methodGetter = { opcode: "jwClass_getProp", inputs: [methodName, objReceiver] };
 
       // Try to detect class for receiver variable
       let className = null;
-      if (typeof chain[0] === 'string' && varToClass[chain[0]]) className = varToClass[chain[0]];
-      const methodParams = className && classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[methodName] ? classRegistry[className].methods[methodName] : null;
+      if (typeof chain[0] === "string" && varToClass[chain[0]]) className = varToClass[chain[0]];
+      const methodParams =
+        className &&
+        classRegistry[className] &&
+        classRegistry[className].methods &&
+        classRegistry[className].methods[methodName]
+          ? classRegistry[className].methods[methodName]
+          : null;
 
       // If this MemberCall represents a chain of calls (previous call ASTs embedded),
       // flatten it and emit a sequence of stack blocks that set temps for each
@@ -1722,7 +2021,7 @@ if (!nestedInput) {
           if (!n) return;
           const ch = n.chain || [];
           const first = ch[0];
-          if (typeof first === 'object') {
+          if (typeof first === "object") {
             helper(first);
             const method = ch[ch.length - 1];
             steps.push({ methodName: method, args: n.args || [] });
@@ -1730,7 +2029,12 @@ if (!nestedInput) {
           }
           const method = ch[ch.length - 1];
           const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
-          if (receiverChain.length > 0 && typeof receiverChain[0] === 'string' && varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
+          if (
+            receiverChain.length > 0 &&
+            typeof receiverChain[0] === "string" &&
+            varToClass[receiverChain[0]]
+          )
+            baseClassName = varToClass[receiverChain[0]];
           steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
         helper(node);
@@ -1753,52 +2057,83 @@ if (!nestedInput) {
           let receiverRef = null;
           if (si === 0) {
             const recvChain = step.receiverChain || [];
-            if (recvChain.length === 0) receiverRef = objReceiver; else {
-              let r = (recvChain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: recvChain[0] };
-              for (let k = 1; k < recvChain.length; k++) r = { opcode: 'jwClass_getProp', inputs: [recvChain[k], r] };
+            if (recvChain.length === 0) receiverRef = objReceiver;
+            else {
+              let r =
+                recvChain[0] === "this"
+                  ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+                  : { type: "Var", name: recvChain[0] };
+              for (let k = 1; k < recvChain.length; k++)
+                r = { opcode: "jwClass_getProp", inputs: [recvChain[k], r] };
               receiverRef = r;
             }
           } else {
-            receiverRef = { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] };
+            receiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] };
           }
 
           // determine method params if available
           let classNameForStep = null;
           if (si === 0) {
-            if (Array.isArray(step.receiverChain) && step.receiverChain.length > 0 && typeof step.receiverChain[0] === 'string' && varToClass[step.receiverChain[0]]) classNameForStep = varToClass[step.receiverChain[0]];
+            if (
+              Array.isArray(step.receiverChain) &&
+              step.receiverChain.length > 0 &&
+              typeof step.receiverChain[0] === "string" &&
+              varToClass[step.receiverChain[0]]
+            )
+              classNameForStep = varToClass[step.receiverChain[0]];
           } else {
             classNameForStep = baseClassName;
           }
-          const paramsForStep = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[step.methodName] ? classRegistry[classNameForStep].methods[step.methodName] : null;
-          const returnsLambdaArgsForMethod = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns ? classRegistry[classNameForStep].methodReturns[step.methodName] : null;
+          const paramsForStep =
+            classNameForStep &&
+            classRegistry[classNameForStep] &&
+            classRegistry[classNameForStep].methods &&
+            classRegistry[classNameForStep].methods[step.methodName]
+              ? classRegistry[classNameForStep].methods[step.methodName]
+              : null;
+          const returnsLambdaArgsForMethod =
+            classNameForStep &&
+            classRegistry[classNameForStep] &&
+            classRegistry[classNameForStep].methodReturns
+              ? classRegistry[classNameForStep].methodReturns[step.methodName]
+              : null;
 
           if (step.methodName) {
             if (Array.isArray(paramsForStep) && paramsForStep.length > 0) {
               for (let pi = 0; pi < paramsForStep.length; pi++) {
                 const pname = paramsForStep[pi];
-                const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
-                inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+                const argExpr =
+                  step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+                inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
               }
-              const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
-              const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
-              const tempName = __pw_newTemp('__c');
-              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+              const boundMethod = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
+              const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
+              const tempName = __pw_newTemp("__c");
+              inlineChildren.push({
+                opcode: "SPtempVars_setVar",
+                inputs: ["thread", tempName, callReporter],
+              });
               prevTemp = tempName;
-              prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+              prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
+                ? returnsLambdaArgsForMethod.slice()
+                : null;
               prevStepMethodName = step.methodName;
               continue;
             }
-            const argPos = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
-            const boundMethod = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
+            const argPos =
+              step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+            const boundMethod = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
             if (argPos !== "") {
-              const argTemp = __pw_newArgTemp('value');
-              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, argPos] });
+              const argTemp = __pw_newArgTemp("value");
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPos] });
             }
-            const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
-            const tempName = __pw_newTemp('__c');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
+            const tempName = __pw_newTemp("__c");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
             prevTemp = tempName;
-            prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+            prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
+              ? returnsLambdaArgsForMethod.slice()
+              : null;
             prevStepMethodName = step.methodName;
             continue;
           }
@@ -1809,63 +2144,144 @@ if (!nestedInput) {
           // returned object (e.g., num.add(5).add(6)). If the previous call
           // did not return a lambda and we have a prior method name,
           // synthesize a method call on the previous temp.
-          if (!step.methodName && prevStepMethodName && (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) && prevTemp) {
+          if (
+            !step.methodName &&
+            prevStepMethodName &&
+            (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) &&
+            prevTemp
+          ) {
             const fakeMethod = prevStepMethodName;
-            const fakeParams = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methods && classRegistry[classNameForStep].methods[fakeMethod] ? classRegistry[classNameForStep].methods[fakeMethod] : null;
+            const fakeParams =
+              classNameForStep &&
+              classRegistry[classNameForStep] &&
+              classRegistry[classNameForStep].methods &&
+              classRegistry[classNameForStep].methods[fakeMethod]
+                ? classRegistry[classNameForStep].methods[fakeMethod]
+                : null;
             if (Array.isArray(fakeParams) && fakeParams.length > 0) {
               for (let pi = 0; pi < fakeParams.length; pi++) {
                 const pname = fakeParams[pi];
-                const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
-                inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+                const argExpr =
+                  step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+                inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
               }
-              const boundMethod = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
-              const callReporter = { opcode: 'jwLambda_executeR', inputs: [boundMethod, ""] };
-              const tempName = __pw_newTemp('__c');
-              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+              const boundMethod = {
+                opcode: "jwClass_getProp",
+                inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
+              };
+              const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
+              const tempName = __pw_newTemp("__c");
+              inlineChildren.push({
+                opcode: "SPtempVars_setVar",
+                inputs: ["thread", tempName, callReporter],
+              });
               prevTemp = tempName;
-              prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+              prevReturnedLambdaArgs =
+                classNameForStep &&
+                classRegistry[classNameForStep] &&
+                classRegistry[classNameForStep].methodReturns &&
+                classRegistry[classNameForStep].methodReturns[fakeMethod]
+                  ? Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod])
+                    ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice()
+                    : null
+                  : null;
               prevStepMethodName = fakeMethod;
               continue;
             }
-            const fakeArg = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+            const fakeArg =
+              step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
             if (fakeArg !== "") {
-              const argTemp = __pw_newArgTemp('value');
-              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp, fakeArg] });
+              const argTemp = __pw_newArgTemp("value");
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, fakeArg] });
             }
-            const boundMethod2 = { opcode: 'jwClass_getProp', inputs: [fakeMethod, { opcode: 'SPtempVars_getVar', inputs: ['thread', prevTemp] }] };
-            const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [boundMethod2, ""] };
-            const tempName2 = __pw_newTemp('__c');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
+            const boundMethod2 = {
+              opcode: "jwClass_getProp",
+              inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
+            };
+            const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
+            const tempName2 = __pw_newTemp("__c");
+            inlineChildren.push({
+              opcode: "SPtempVars_setVar",
+              inputs: ["thread", tempName2, callReporter2],
+            });
             prevTemp = tempName2;
-            prevReturnedLambdaArgs = classNameForStep && classRegistry[classNameForStep] && classRegistry[classNameForStep].methodReturns && classRegistry[classNameForStep].methodReturns[fakeMethod] ? (Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod]) ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice() : null) : null;
+            prevReturnedLambdaArgs =
+              classNameForStep &&
+              classRegistry[classNameForStep] &&
+              classRegistry[classNameForStep].methodReturns &&
+              classRegistry[classNameForStep].methodReturns[fakeMethod]
+                ? Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod])
+                  ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice()
+                  : null
+                : null;
             prevStepMethodName = fakeMethod;
             continue;
           }
           if (Array.isArray(prevReturnedLambdaArgs) && prevReturnedLambdaArgs.length > 0) {
             for (let pi = 0; pi < prevReturnedLambdaArgs.length; pi++) {
               const pname = prevReturnedLambdaArgs[pi];
-              const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
-              inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', pname, argExpr] });
+              const argExpr =
+                step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
             }
-            const callReporter = { opcode: 'jwLambda_executeR', inputs: [receiverRef, ""] };
-            const tempName = __pw_newTemp('__c');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName, callReporter] });
+            const callReporter = { opcode: "jwLambda_executeR", inputs: [receiverRef, ""] };
+            const tempName = __pw_newTemp("__c");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
             prevTemp = tempName;
             prevReturnedLambdaArgs = null;
+            // Once we've executed a returned-lambda, the prior `methodName`
+            // should no longer be used to synthesize subsequent chained
+            // method calls on the temp — clear it to avoid reusing the
+            // previous method name for later steps (fixes double-invoke).
+            prevStepMethodName = null;
             continue;
           }
 
           // fallback
-          const argPos2 = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
-          const boundMethod2 = { opcode: 'jwClass_getProp', inputs: [step.methodName, receiverRef] };
-          if (argPos2 !== "") {
-            const argTemp2 = __pw_newArgTemp('value');
-            inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', argTemp2, argPos2] });
+          const argPos2 =
+            step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+          // If we have a previously-seen method name (chained call shape) and the
+          // previous call did NOT return a lambda, prefer synthesizing a method
+          // call on the previous temp (jwClass_getProp on SPtempVars_getVar(prevTemp)).
+          if (
+            prevStepMethodName &&
+            (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) &&
+            prevTemp
+          ) {
+            if (argPos2 !== "") {
+              const argTemp2 = __pw_newArgTemp("value");
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp2, argPos2] });
+            }
+            const boundMethod2 = {
+              opcode: "jwClass_getProp",
+              inputs: [prevStepMethodName, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
+            };
+            const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
+            const tempName2 = __pw_newTemp("__c");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] });
+            prevTemp = tempName2;
+            prevReturnedLambdaArgs =
+              classNameForStep &&
+              classRegistry[classNameForStep] &&
+              classRegistry[classNameForStep].methodReturns &&
+              classRegistry[classNameForStep].methodReturns[prevStepMethodName]
+                ? Array.isArray(classRegistry[classNameForStep].methodReturns[prevStepMethodName])
+                  ? classRegistry[classNameForStep].methodReturns[prevStepMethodName].slice()
+                  : null
+                : null;
+            prevStepMethodName = prevStepMethodName;
+          } else {
+            const methodForBound = step.methodName || prevStepMethodName;
+            const boundMethod2 = { opcode: "jwClass_getProp", inputs: [methodForBound, receiverRef] };
+            if (argPos2 !== "") {
+              const argTemp2 = __pw_newArgTemp("value");
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp2, argPos2] });
+            }
+            const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
+            const tempName2 = __pw_newTemp("__c");
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] });
+            prevTemp = tempName2;
           }
-          const callReporter2 = { opcode: 'jwLambda_executeR', inputs: [boundMethod2, ""] };
-          const tempName2 = __pw_newTemp('__c');
-          inlineChildren.push({ opcode: 'SPtempVars_setVar', inputs: ['thread', tempName2, callReporter2] });
-          prevTemp = tempName2;
         }
 
         // Emit the sequence of stack blocks directly (no inline wrapper and no return)
@@ -1874,34 +2290,44 @@ if (!nestedInput) {
 
       // Non-chain or single-step fallback: existing behavior
       if (Array.isArray(methodParams) && methodParams.length > 0) {
-          const setters = [];
-          // Build thread-scoped setters for each declared param
-          for (let i = 0; i < methodParams.length; i++) {
-            const pname = methodParams[i];
-            const argExpr = stmt.args && stmt.args[i] ? exprToNested(stmt.args[i], inMethod, paramMap) : "";
-            setters.push({ opcode: 'SPtempVars_setVar', inputs: ["thread", pname, argExpr] });
-          }
-          // Call the method (no inline wrapper) — emit setters then the call
-          const call = { opcode: 'jwLambda_execute', inputs: [methodGetter, ""] };
-          return [].concat(setters, [call]);
+        const setters = [];
+        // Build thread-scoped setters for each declared param
+        for (let i = 0; i < methodParams.length; i++) {
+          const pname = methodParams[i];
+          const argExpr = stmt.args && stmt.args[i] ? exprToNested(stmt.args[i], inMethod, paramMap) : "";
+          setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
+        }
+        // Call the method (no inline wrapper) — emit setters then the call
+        const call = { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
+        return [].concat(setters, [call]);
       }
 
       // fallback: set a synthetic thread var for the first arg then call
-      const argNested = stmt.args && stmt.args.length > 0 ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
+      const argNested =
+        stmt.args && stmt.args.length > 0 ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
       if (argNested !== "") {
-        const argTempName = __pw_newArgTemp('value');
-        const setter = { opcode: 'SPtempVars_setVar', inputs: ['thread', argTempName, argNested] };
-        const call = { opcode: 'jwLambda_execute', inputs: [methodGetter, ""] };
+        const argTempName = __pw_newArgTemp("value");
+        const setter = { opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] };
+        const call = { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
         return [].concat([setter], [call]);
       }
-      return { opcode: 'jwLambda_execute', inputs: [methodGetter, ""] };
+      return { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
     }
     if (stmt.type === "Declare") {
-      const scope = (inMethod && (stmt.kind === 'let' || stmt.kind === 'const')) ? 'thread' : (stmt.kind === 'thread' ? 'thread' : 'global');
-      if (stmt.value) return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, exprToNested(stmt.value, inMethod, paramMap)] };
+      const scope =
+        inMethod && (stmt.kind === "let" || stmt.kind === "const")
+          ? "thread"
+          : stmt.kind === "thread"
+            ? "thread"
+            : "global";
+      if (stmt.value)
+        return {
+          opcode: "SPtempVars_setVar",
+          inputs: [scope, stmt.name, exprToNested(stmt.value, inMethod, paramMap)],
+        };
       return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, ""] };
     }
-    if (stmt.type === 'Return') {
+    if (stmt.type === "Return") {
       // Only allowed inside class methods or lambdas (inMethod flag)
       if (!inMethod) throw new Error("'return' used outside of a method or lambda is not allowed");
       const val = stmt.value ? exprToNested(stmt.value, inMethod, paramMap) : "";
@@ -1909,22 +2335,27 @@ if (!nestedInput) {
       // block shape is a stack/branch (i.e., not a reporter). Allow
       // reporter-type blocks that may include substack inputs (e.g., lambdas).
       //console.log(val)
-      if (val && typeof val === 'object' && val.opcode) {
-        const meta = blocksMeta[val.opcode] || blocksMeta[val.opcode.replace(/^operator_/, 'operator_')] || null;
+      if (val && typeof val === "object" && val.opcode) {
+        const meta =
+          blocksMeta[val.opcode] || blocksMeta[val.opcode.replace(/^operator_/, "operator_")] || null;
         const shape = meta ? meta[1] : null;
-        if (shape === 'stack' || shape === 'branch') throw new Error("'return' value cannot be a stack/branch block");
+        if (shape === "stack" || shape === "branch")
+          throw new Error("'return' value cannot be a stack/branch block");
       }
-      return { opcode: 'procedures_return', inputs: [val] };
+      return { opcode: "procedures_return", inputs: [val] };
     }
     if (stmt.type === "Assign") {
       // memberChain indicates a member assignment like `obj.prop = val` or `this.prop = val`
       if (stmt.memberChain && Array.isArray(stmt.memberChain) && stmt.memberChain.length >= 2) {
         const chain = stmt.memberChain;
-        let objReceiver = (chain[0] === 'this') ? { opcode: 'jwClass_self', inputs: [], noPlaceholder: true } : { type: 'Var', name: chain[0] };
+        let objReceiver =
+          chain[0] === "this"
+            ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+            : { type: "Var", name: chain[0] };
         if (chain.length > 2) {
           for (let i = 1; i < chain.length - 1; i++) {
             const prop = chain[i];
-            objReceiver = { opcode: 'jwClass_getProp', inputs: [prop, objReceiver] };
+            objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
           }
         }
         const propName = chain[chain.length - 1];
@@ -1933,12 +2364,19 @@ if (!nestedInput) {
         // member access to the same chain so the emitted binary has a proper
         // getter for the existing property value.
         let val = null;
-        if (stmt.value && stmt.value.type === 'Binary' && (stmt.value.left === null || typeof stmt.value.left === 'undefined')) {
+        if (
+          stmt.value &&
+          stmt.value.type === "Binary" &&
+          (stmt.value.left === null || typeof stmt.value.left === "undefined")
+        ) {
           let leftNested = null;
-          if (chain[0] === 'this') {
-            leftNested = { opcode: 'jwClass_getProp', inputs: [propName, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }] };
+          if (chain[0] === "this") {
+            leftNested = {
+              opcode: "jwClass_getProp",
+              inputs: [propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }],
+            };
           } else {
-            leftNested = exprToNested({ type: 'Member', chain: chain.slice() }, inMethod, paramMap);
+            leftNested = exprToNested({ type: "Member", chain: chain.slice() }, inMethod, paramMap);
           }
           const rightNested = exprToNested(stmt.value.right, inMethod, paramMap);
           const op = generator.mapOpToOpcode(stmt.value.op);
@@ -1946,55 +2384,73 @@ if (!nestedInput) {
         } else {
           val = exprToNested(stmt.value, inMethod, paramMap);
         }
-        return { opcode: 'jwClass_setProp', inputs: [propName, objReceiver, val] };
+        return { opcode: "jwClass_setProp", inputs: [propName, objReceiver, val] };
       }
-      return { opcode: "SPtempVars_setVar", inputs: [stmt.kind === "thread" ? "thread" : "global", stmt.name || '', exprToNested(stmt.value, inMethod, paramMap)] };
+      return {
+        opcode: "SPtempVars_setVar",
+        inputs: [
+          stmt.kind === "thread" ? "thread" : "global",
+          stmt.name || "",
+          exprToNested(stmt.value, inMethod, paramMap),
+        ],
+      };
     }
-    if (stmt.type === 'While') {
+    if (stmt.type === "While") {
       const cond = stmt.cond ? exprToNested(stmt.cond, inMethod, paramMap) : false;
-      const raw = stmt.body && stmt.body.body ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+      const raw =
+        stmt.body && stmt.body.body
+          ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean)
+          : [];
       const children = flattenNestedResults(raw);
-      assertReturnTerminal(children, 'while body');
-      return { opcode: 'control_while', inputs: [cond, children] };
+      assertReturnTerminal(children, "while body");
+      return { opcode: "control_while", inputs: [cond, children] };
     }
-    if (stmt.type === 'For') {
+    if (stmt.type === "For") {
       // init -> start, cond -> end, update -> inc
-      let varName = '';
+      let varName = "";
       let start = 0;
       let end = 0;
       let inc = 1;
       if (stmt.init) {
-        if ((stmt.init.type === 'Declare' || stmt.init.type === 'Assign') && stmt.init.name) {
+        if ((stmt.init.type === "Declare" || stmt.init.type === "Assign") && stmt.init.name) {
           varName = stmt.init.name;
           if (stmt.init.value) start = exprToNested(stmt.init.value, inMethod, paramMap);
         }
       }
       if (stmt.cond) {
         // if cond is a Binary comparing var to value, extract the RHS as end
-          if (stmt.cond.type === 'Binary' && stmt.cond.left && stmt.cond.left.type === 'Var' && stmt.cond.left.name === varName) {
+        if (
+          stmt.cond.type === "Binary" &&
+          stmt.cond.left &&
+          stmt.cond.left.type === "Var" &&
+          stmt.cond.left.name === varName
+        ) {
           end = exprToNested(stmt.cond.right, inMethod, paramMap);
         } else {
           end = exprToNested(stmt.cond, inMethod, paramMap);
         }
       }
       if (stmt.update) {
-        if (stmt.update.type === 'Assign' && stmt.update.value && stmt.update.value.type === 'Binary') {
+        if (stmt.update.type === "Assign" && stmt.update.value && stmt.update.value.type === "Binary") {
           const bin = stmt.update.value;
           if (bin.right) inc = exprToNested(bin.right, inMethod, paramMap);
-          if (bin.op === '-') inc = typeof inc === 'number' ? -inc : inc;
+          if (bin.op === "-") inc = typeof inc === "number" ? -inc : inc;
         } else {
           inc = exprToNested(stmt.update, inMethod, paramMap);
         }
       }
-      const raw = stmt.body && stmt.body.body ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : [];
+      const raw =
+        stmt.body && stmt.body.body
+          ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean)
+          : [];
       const body = flattenNestedResults(raw);
-      assertReturnTerminal(body, 'for body');
-      return { opcode: 'SPtempVars_forVar', inputs: ['thread', varName, start, end, body, inc] };
+      assertReturnTerminal(body, "for body");
+      return { opcode: "SPtempVars_forVar", inputs: ["thread", varName, start, end, body, inc] };
     }
-    if (stmt.type === 'Break') {
-      return { opcode: 'control_exitLoop' };
+    if (stmt.type === "Break") {
+      return { opcode: "control_exitLoop" };
     }
-    if (stmt.type === 'Class') {
+    if (stmt.type === "Class") {
       // Create a class object and assign to a temp/global variable with the class name
       // Build jwClass_class nested block with NAME and SUBSTACK setting methods
       const className = stmt.name;
@@ -2003,13 +2459,19 @@ if (!nestedInput) {
       for (const m of stmt.members || []) {
         // If the member is a normal method declaration (visitClassMember),
         // `m` will be a Method node with `name`, `params`, and `body`.
-        if (m && m.type === 'Method') {
+        if (m && m.type === "Method") {
           // Use pre-collected tagged param names when available so
           // method declarations and call-sites agree on the thread-var names.
-          const taggedParams = classRegistry[className] && classRegistry[className].methods && classRegistry[className].methods[m.name] ? classRegistry[className].methods[m.name] : null;
+          const taggedParams =
+            classRegistry[className] &&
+            classRegistry[className].methods &&
+            classRegistry[className].methods[m.name]
+              ? classRegistry[className].methods[m.name]
+              : null;
           let lambdaArg = null;
           if (Array.isArray(taggedParams) && taggedParams.length > 0) lambdaArg = taggedParams.slice();
-          else if (m.params && m.params.length > 0) lambdaArg = (m.params.length === 1) ? m.params[0] : m.params.slice();
+          else if (m.params && m.params.length > 0)
+            lambdaArg = m.params.length === 1 ? m.params[0] : m.params.slice();
           else lambdaArg = { opcode: "jwLambda_arg", shadow: true, noPlaceholder: true };
 
           // Build a methodParamMap mapping original param names -> tagged names
@@ -2025,8 +2487,18 @@ if (!nestedInput) {
           // If this method has a recorded returned-lambda, merge its param mappings
           // into the methodParamMap so inner returned-lambda params are emitted
           // using the same tagged names inside the method body.
-          const retOrig = classRegistry[className] && classRegistry[className].methodReturnOriginals && classRegistry[className].methodReturnOriginals[m.name] ? classRegistry[className].methodReturnOriginals[m.name] : null;
-          const retTagged = classRegistry[className] && classRegistry[className].methodReturns && classRegistry[className].methodReturns[m.name] ? classRegistry[className].methodReturns[m.name] : null;
+          const retOrig =
+            classRegistry[className] &&
+            classRegistry[className].methodReturnOriginals &&
+            classRegistry[className].methodReturnOriginals[m.name]
+              ? classRegistry[className].methodReturnOriginals[m.name]
+              : null;
+          const retTagged =
+            classRegistry[className] &&
+            classRegistry[className].methodReturns &&
+            classRegistry[className].methodReturns[m.name]
+              ? classRegistry[className].methodReturns[m.name]
+              : null;
           if (Array.isArray(retOrig) && Array.isArray(retTagged) && retOrig.length === retTagged.length) {
             if (!methodParamMap) methodParamMap = {};
             for (let i = 0; i < retOrig.length; i++) {
@@ -2042,15 +2514,18 @@ if (!nestedInput) {
             methodBody = flattenNestedResults(raw);
             assertReturnTerminal(methodBody, `method '${m.name}' body`);
           }
-          const lambdaBlock = { opcode: 'jwLambda_newLambda', inputs: [ lambdaArg, methodBody ] };
-          const setProp = { opcode: 'jwClass_setProp', inputs: [m.name, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }, lambdaBlock] };
+          const lambdaBlock = { opcode: "jwLambda_newLambda", inputs: [lambdaArg, methodBody] };
+          const setProp = {
+            opcode: "jwClass_setProp",
+            inputs: [m.name, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }, lambdaBlock],
+          };
           substackBlocks.push(setProp);
           continue;
         }
 
         // If the member is an assignment inside the class body (e.g., `this.foo = ...;`),
         // convert it into a jwClass_setProp attaching the value to the class (SELF).
-        if (m && m.type === 'Assign' && Array.isArray(m.memberChain) && m.memberChain.length >= 2) {
+        if (m && m.type === "Assign" && Array.isArray(m.memberChain) && m.memberChain.length >= 2) {
           const chain = m.memberChain;
           const propName = chain[chain.length - 1];
           // Workaround: some parser output produces a Binary RHS with a null
@@ -2058,30 +2533,47 @@ if (!nestedInput) {
           // In that case synthesize the left operand as a getter for the same
           // memberChain so the binary op becomes (this.prop + X).
           let val = null;
-          if (m.value && m.value.type === 'Binary' && (m.value.left === null || typeof m.value.left === 'undefined')) {
+          if (
+            m.value &&
+            m.value.type === "Binary" &&
+            (m.value.left === null || typeof m.value.left === "undefined")
+          ) {
             let leftNested = null;
             const propNameLocal = propName;
-            if (chain[0] === 'this') {
-              leftNested = { opcode: 'jwClass_getProp', inputs: [propNameLocal, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }] };
+            if (chain[0] === "this") {
+              leftNested = {
+                opcode: "jwClass_getProp",
+                inputs: [propNameLocal, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }],
+              };
             } else {
-              leftNested = exprToNested({ type: 'Member', chain: chain.slice() }, inMethod, paramMap);
+              leftNested = exprToNested({ type: "Member", chain: chain.slice() }, inMethod, paramMap);
             }
             const rightNested = exprToNested(m.value.right, inMethod, paramMap);
             const op = generator.mapOpToOpcode(m.value.op);
-            val = { opcode: op, inputs: [ leftNested, rightNested ] };
+            val = { opcode: op, inputs: [leftNested, rightNested] };
           } else {
             val = exprToNested(m.value, inMethod, paramMap);
           }
-          const setProp = { opcode: 'jwClass_setProp', inputs: [propName, { opcode: 'jwClass_self', inputs: [], noPlaceholder: true }, val] };
+          const setProp = {
+            opcode: "jwClass_setProp",
+            inputs: [propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }, val],
+          };
           substackBlocks.push(setProp);
           continue;
         }
 
         // Other member shapes can be ignored or handled in future (e.g., declarations).
       }
-      const classBlock = { opcode: 'jwClass_class', inputs: [className, { opcode: 'jwClass_self', inputs: [], shadow: true, noPlaceholder: true }, substackBlocks] };
+      const classBlock = {
+        opcode: "jwClass_class",
+        inputs: [
+          className,
+          { opcode: "jwClass_self", inputs: [], shadow: true, noPlaceholder: true },
+          substackBlocks,
+        ],
+      };
       // assign into temp/global var using SPtempVars_setVar (simplified inputs form)
-      return { opcode: 'SPtempVars_setVar', inputs: ["global", className, classBlock] };
+      return { opcode: "SPtempVars_setVar", inputs: ["global", className, classBlock] };
     }
     // If stmt.type is missing/undefined, skip emitting a block for it.
     if (!stmt.type) return null;
@@ -2107,12 +2599,14 @@ if (!nestedInput) {
         default:
           opcode = s.event;
       }
-      const rawChildren = (s.body && s.body.body ? s.body.body.map((c) => stmtToNested(c, false)).filter(Boolean) : []);
-        const children = [];
-        for (const c of rawChildren) {
-          if (Array.isArray(c)) children.push(...c); else children.push(c);
-        }
-        nestedInput.push({ opcode, children });
+      const rawChildren =
+        s.body && s.body.body ? s.body.body.map((c) => stmtToNested(c, false)).filter(Boolean) : [];
+      const children = [];
+      for (const c of rawChildren) {
+        if (Array.isArray(c)) children.push(...c);
+        else children.push(c);
+      }
+      nestedInput.push({ opcode, children });
     } else {
       const node = stmtToNested(s);
       if (!node) continue;
@@ -2125,39 +2619,44 @@ if (!nestedInput) {
   }
 }
 
-  // Now always use nested input for generation
-  let emitResult;
+// Now always use nested input for generation
+let emitResult;
+try {
+  // DEBUG: dump nested representation to inspect emitted class/new/method shapes
   try {
-    // DEBUG: dump nested representation to inspect emitted class/new/method shapes
-    try {
-      fs.writeFileSync('/tmp/pang_nested_debug.json', JSON.stringify(nestedInput, null, 2), 'utf8');
-    } catch (e) {}
-    //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
-    emitResult = generator.generateFromNested(nestedInput);
-    // quick validation: ensure emitted pseudocode blocks look reasonable
-    try {
-      if (emitResult && Array.isArray(emitResult.blocks)) {
-        for (let i = 0; i < emitResult.blocks.length; i++) {
-          const b = emitResult.blocks[i];
-          if (!b || typeof b !== 'object' || !b.opcode) console.error('BAD_PSEUDO_BLOCK', i, JSON.stringify(b, null, 2));
-        }
-      } else {
-        console.error('EMIT_RESULT_BLOCKS', typeof emitResult.blocks, JSON.stringify(emitResult.blocks, null, 2));
+    fs.writeFileSync("/tmp/pang_nested_debug.json", JSON.stringify(nestedInput, null, 2), "utf8");
+  } catch (e) {}
+  //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
+  emitResult = generator.generateFromNested(nestedInput);
+  // quick validation: ensure emitted pseudocode blocks look reasonable
+  try {
+    if (emitResult && Array.isArray(emitResult.blocks)) {
+      for (let i = 0; i < emitResult.blocks.length; i++) {
+        const b = emitResult.blocks[i];
+        if (!b || typeof b !== "object" || !b.opcode)
+          console.error("BAD_PSEUDO_BLOCK", i, JSON.stringify(b, null, 2));
       }
-    } catch (e) {
-      console.error('EmitResult validation error', e && e.message);
-    }
-    // dump emitResult to temp file for debugging malformed pseudocode
-    try {
-      fs.writeFileSync('/tmp/pang_emit_debug.json', JSON.stringify(emitResult, null, 2), 'utf8');
-    } catch (e) {
-      // ignore write errors
+    } else {
+      console.error(
+        "EMIT_RESULT_BLOCKS",
+        typeof emitResult.blocks,
+        JSON.stringify(emitResult.blocks, null, 2),
+      );
     }
   } catch (e) {
-    console.error("Emit error:", (e && e.message) || e);
-    if (e && e.stack) console.error(e.stack);
-    process.exit(1);
+    console.error("EmitResult validation error", e && e.message);
   }
+  // dump emitResult to temp file for debugging malformed pseudocode
+  try {
+    fs.writeFileSync("/tmp/pang_emit_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
+  } catch (e) {
+    // ignore write errors
+  }
+} catch (e) {
+  console.error("Emit error:", (e && e.message) || e);
+  if (e && e.stack) console.error(e.stack);
+  process.exit(1);
+}
 
 // If the AST/path-based detection didn't mark classes as used, also
 // inspect the nested input / pseudocode for any jwClass opcodes so we
@@ -2169,9 +2668,9 @@ function nestedContainsOpcode(obj, prefix) {
     for (const el of obj) if (nestedContainsOpcode(el, prefix)) return true;
     return false;
   }
-    if (typeof obj === 'object') {
-    if (obj.opcode && typeof obj.opcode === 'string' && obj.opcode.startsWith(prefix)) return true;
-    if (obj.name && typeof obj.name === 'string' && obj.name.startsWith(prefix)) return true;
+  if (typeof obj === "object") {
+    if (obj.opcode && typeof obj.opcode === "string" && obj.opcode.startsWith(prefix)) return true;
+    if (obj.name && typeof obj.name === "string" && obj.name.startsWith(prefix)) return true;
     if (obj.children && nestedContainsOpcode(obj.children, prefix)) return true;
     if (obj.inputs && nestedContainsOpcode(obj.inputs, prefix)) return true;
     // Check properties recursively (safe guard for nested shapes)
@@ -2183,21 +2682,23 @@ function nestedContainsOpcode(obj, prefix) {
 }
 
 if (!usedClasses) {
-  if (nestedContainsOpcode(nestedInput, 'jwClass') || (emitResult && nestedContainsOpcode(emitResult.blocks || [], 'jwClass'))) {
+  if (
+    nestedContainsOpcode(nestedInput, "jwClass") ||
+    (emitResult && nestedContainsOpcode(emitResult.blocks || [], "jwClass"))
+  ) {
     usedClasses = true;
   }
 }
 
 // Convert pseudocode blocks into a real project.json `blocks` object
-const pseudoConverter = require('./lib/pseudocodeToProject');
+const pseudoConverter = require("./lib/pseudocodeToProject");
 const projectBlocks = pseudoConverter.convert(emitResult);
 // projectBlocks is an object keyed by id — place into out.targets[1].blocks later
 
-
 // Produce final project JSON, preserving exact skeleton
 const out = JSON.parse(JSON.stringify(TEMPLATE));
-  out.targets[1].blocks = projectBlocks;
-  //console.log(JSON.stringify(projectBlocks, null, 2));
+out.targets[1].blocks = projectBlocks;
+//console.log(JSON.stringify(projectBlocks, null, 2));
 // Never emit native target variables; always use SPtempVars extension for variables.
 out.targets[1].variables = {};
 // Also remove any template stage variables so the output contains no builtin variables.
@@ -2220,48 +2721,48 @@ if (emitResult && emitResult.askUsed) {
 }
 
 // Add pmOperatorsExpansion if strict equality '===' or other pmOperatorsExpansion ops were used
-if (emitResult && (emitResult.pmOperatorsExpansion_used)) {
+if (emitResult && emitResult.pmOperatorsExpansion_used) {
   out.extensions = out.extensions || [];
   if (!out.extensions.includes("pmOperatorsExpansion")) out.extensions.push("pmOperatorsExpansion");
 }
 //console.log(usedClasses);
 if (usedClasses) {
-    out.extensions = out.extensions || [];
-    if (!out.extensions.includes("jwClass")) {
-        out.extensions.push("jwClass");
-        out.extensionURLs = out.extensionURLs || {};
-        out.extensionURLs.jwClass =
-        out.extensionURLs.jwClass || // jwClass backported from port to old compiler non core extension(unsandboxed)
-        "data:text/javascript;charset=utf-8;base64,KGZ1bmN0aW9uIChTY3JhdGNoKSB7DQogICAgJ3VzZSBzdHJpY3QnOw0KIA0KICAgIGlmICghU2NyYXRjaC5leHRlbnNpb25zLnVuc2FuZGJveGVkKSB7DQogICAgICAgIHRocm93IG5ldyBFcnJvcignandDbGFzcyBtdXN0IGJlIGxvYWRlZCBhcyBhbiB1bnNhbmRib3hlZCBUdXJib1dhcnAgZXh0ZW5zaW9uLicpOw0KICAgIH0NCiANCiAgICBjb25zdCB2bSA9IFNjcmF0Y2gudm07DQogICAgY29uc3QgcnVudGltZSA9IHZtLnJ1bnRpbWU7DQogDQogICAgY29uc3QgQmxvY2tUeXBlID0gU2NyYXRjaC5CbG9ja1R5cGU7DQogICAgY29uc3QgQXJndW1lbnRUeXBlID0gU2NyYXRjaC5Bcmd1bWVudFR5cGU7DQogICAgY29uc3QgQmxvY2tTaGFwZSA9IFNjcmF0Y2guQmxvY2tTaGFwZSB8fCB7DQogICAgICAgIFNRVUFSRTogJ3NxdWFyZScsDQogICAgICAgIFRJQ0tFVDogJ3RpY2tldCcNCiAgICB9Ow0KIA0KICAgIGNvbnN0IHBtU3ltYm9sID0gU2NyYXRjaC5wbVN5bWJvbCB8fCB7DQogICAgICAgIGVxdWFsczogU3ltYm9sLmZvcigncG0uZXF1YWxzJykNCiAgICB9Ow0KIA0KICAgIGNvbnN0IGVzY2FwZUhUTUwgPSB1bnNhZmUgPT4gew0KICAgICAgICByZXR1cm4gU3RyaW5nKHVuc2FmZSkNCiAgICAgICAgICAgIC5yZXBsYWNlQWxsKCcmJywgJyZhbXA7JykNCiAgICAgICAgICAgIC5yZXBsYWNlQWxsKCc8JywgJyZsdDsnKQ0KICAgICAgICAgICAgLnJlcGxhY2VBbGwoJz4nLCAnJmd0OycpDQogICAgICAgICAgICAucmVwbGFjZUFsbCgnIicsICcmcXVvdDsnKQ0KICAgICAgICAgICAgLnJlcGxhY2VBbGwoIiciLCAnJiMwMzk7Jyk7DQogICAgfTsNCiANCiAgICBjb25zdCBjbGFzc1N5bWJvbCA9IFN5bWJvbCgnY2xhc3MnKTsNCiANCiAgICBsZXQgZG9nZWlzY3V0T2JqZWN0ID0gew0KICAgICAgICBUeXBlOiBjbGFzcyB7fSwNCiAgICAgICAgQmxvY2s6IHt9LA0KICAgICAgICBBcmd1bWVudDoge30NCiAgICB9Ow0KIA0KICAgIGxldCBqd1BvaW50ZXIgPSB7DQogICAgICAgIFR5cGU6IGNsYXNzIHt9LA0KICAgICAgICBCbG9jazoge30sDQogICAgICAgIEFyZ3VtZW50OiB7fQ0KICAgIH07DQogDQogICAgY29uc3QgcmVmcmVzaERlcHMgPSAoKSA9PiB7DQogICAgICAgIGlmICh2bS5kb2dlaXNjdXRPYmplY3QpIGRvZ2Vpc2N1dE9iamVjdCA9IHZtLmRvZ2Vpc2N1dE9iamVjdDsNCiAgICAgICAgaWYgKHZtLmp3UG9pbnRlcikgandQb2ludGVyID0gdm0uandQb2ludGVyOw0KICAgIH07DQogDQogICAgY2xhc3MgQ2xhc3NUeXBlIHsNCiAgICAgICAgY29uc3RydWN0b3IoY29uc3RydWN0ID0gZnVuY3Rpb24qICgpIHt9LCBuYW1lID0gJycsIGV4dGVuc2lvbiA9IG51bGwsIHByb2MgPSBudWxsKSB7DQogICAgICAgICAgICB0aGlzLmNvbnN0cnVjdCA9IGNvbnN0cnVjdDsNCiAgICAgICAgICAgIHRoaXMubmFtZSA9IG5hbWU7DQogICAgICAgICAgICB0aGlzLmV4dGVuc2lvbiA9IGV4dGVuc2lvbjsNCiAgICAgICAgICAgIHRoaXMucHJvYyA9IHByb2MgPz8ge307DQogICAgICAgIH0NCiANCiAgICAgICAgdG9TdHJpbmcoKSB7DQogICAgICAgICAgICByZXR1cm4gdGhpcy5uYW1lLmxlbmd0aCA+IDAgPyBgQ2xhc3M8JHt0aGlzLm5hbWV9PmAgOiAnQ2xhc3MnOw0KICAgICAgICB9DQogDQogICAgICAgIGp3QXJyYXlIYW5kbGVyKCkgew0KICAgICAgICAgICAgcmV0dXJuIGVzY2FwZUhUTUwodGhpcy50b1N0cmluZygpKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBzdGF0aWMgdG9DbGFzcyh2KSB7DQogICAgICAgICAgICBpZiAodiBpbnN0YW5jZW9mIENsYXNzVHlwZSkgcmV0dXJuIHY7DQogICAgICAgICAgICByZXR1cm4gbmV3IENsYXNzVHlwZSgpOw0KICAgICAgICB9DQogDQogICAgICAgIGNyZWF0ZUluc3RhbmNlID0gZnVuY3Rpb24qICh0aHJlYWQsIHRhcmdldCkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiANCiAgICAgICAgICAgIGlmICh0aGlzLnByb2MpIHRocmVhZC5wcm9jZWR1cmVzID0geyAuLi50aGlzLnByb2MsIC4uLnRocmVhZC5wcm9jZWR1cmVzIH07DQogDQogICAgICAgICAgICBpZiAoIXRoaXMuZXh0ZW5zaW9uKSB7DQogICAgICAgICAgICAgICAgbGV0IG9iamVjdCA9IG5ldyBkb2dlaXNjdXRPYmplY3QuVHlwZSgpOw0KICAgICAgICAgICAgICAgIG9iamVjdC5tYXAuc2V0KGNsYXNzU3ltYm9sLCB0aGlzKTsNCiAgICAgICAgICAgICAgICBsZXQgcG9pbnRlciA9IGp3UG9pbnRlci5UeXBlLmNyZWF0ZSgpOw0KICAgICAgICAgICAgICAgIHBvaW50ZXIudmFsdWUgPSBvYmplY3Q7DQogICAgICAgICAgICAgICAgeWllbGQqIHRoaXMuY29uc3RydWN0KHBvaW50ZXIsIHRocmVhZCwgdGFyZ2V0KTsNCiAgICAgICAgICAgICAgICByZXR1cm4gcG9pbnRlcjsNCiAgICAgICAgICAgIH0gZWxzZSB7DQogICAgICAgICAgICAgICAgbGV0IHBvaW50ZXIgPSB5aWVsZCogdGhpcy5leHRlbnNpb24uY3JlYXRlSW5zdGFuY2UodGhyZWFkLCB0YXJnZXQpOw0KICAgICAgICAgICAgICAgIGxldCBvYmplY3QgPSBwb2ludGVyLnZhbHVlOw0KICAgICAgICAgICAgICAgIGlmIChvYmplY3QgaW5zdGFuY2VvZiBkb2dlaXNjdXRPYmplY3QuVHlwZSkgb2JqZWN0Lm1hcC5zZXQoY2xhc3NTeW1ib2wsIHRoaXMpOw0KICAgICAgICAgICAgICAgIHlpZWxkKiB0aGlzLmNvbnN0cnVjdChwb2ludGVyLCB0aHJlYWQsIHRhcmdldCk7DQogICAgICAgICAgICAgICAgcmV0dXJuIHBvaW50ZXI7DQogICAgICAgICAgICB9DQogICAgICAgIH07DQogDQogICAgICAgIGV4dGVuZChleHRlbnNpb24pIHsNCiAgICAgICAgICAgIHJldHVybiBuZXcgQ2xhc3NUeXBlKHRoaXMuY29uc3RydWN0LCB0aGlzLm5hbWUsIGV4dGVuc2lvbiwgdGhpcy5wcm9jKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBbcG1TeW1ib2wuZXF1YWxzXShvdGhlcikgew0KICAgICAgICAgICAgcmV0dXJuIHRoaXMgPT09IG90aGVyOw0KICAgICAgICB9DQogICAgfQ0KIA0KICAgIGNvbnN0IGp3Q2xhc3MgPSB7DQogICAgICAgIFR5cGU6IENsYXNzVHlwZSwNCiAgICAgICAgQmxvY2s6IHsNCiAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLlJFUE9SVEVSLA0KICAgICAgICAgICAgYmxvY2tTaGFwZTogQmxvY2tTaGFwZS5USUNLRVQsDQogICAgICAgICAgICBmb3JjZU91dHB1dFR5cGU6ICdqd0NsYXNzJywNCiAgICAgICAgICAgIGRpc2FibGVNb25pdG9yOiB0cnVlDQogICAgICAgIH0sDQogICAgICAgIEFyZ3VtZW50OiB7DQogICAgICAgICAgICBzaGFwZTogQmxvY2tTaGFwZS5USUNLRVQsDQogICAgICAgICAgICBjaGVjazogWydqd0NsYXNzJ10NCiAgICAgICAgfSwNCiANCiAgICAgICAgY2xhc3NTeW1ib2wsDQogDQogICAgICAgIHNldFByb3AobmFtZSwgcG9pbnRlciwgdmFsdWUpIHsNCiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7DQogICAgICAgICAgICBpZiAoIShwb2ludGVyIGluc3RhbmNlb2YgandQb2ludGVyLlR5cGUpKSByZXR1cm47DQogICAgICAgICAgICBpZiAoIShwb2ludGVyLnZhbHVlIGluc3RhbmNlb2YgZG9nZWlzY3V0T2JqZWN0LlR5cGUpKSByZXR1cm47DQogICAgICAgICAgICBwb2ludGVyLnZhbHVlID0gZG9nZWlzY3V0T2JqZWN0LlR5cGUudG9PYmplY3QocG9pbnRlci52YWx1ZSk7IC8vIGNsb25lDQogICAgICAgICAgICBwb2ludGVyLnZhbHVlLm1hcC5zZXQobmFtZSwgdmFsdWUpOw0KICAgICAgICB9LA0KIA0KICAgICAgICBnZXRQcm9wKG5hbWUsIHBvaW50ZXIpIHsNCiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7DQogICAgICAgICAgICBpZiAoIShwb2ludGVyIGluc3RhbmNlb2YgandQb2ludGVyLlR5cGUpKSByZXR1cm4gbnVsbDsNCiAgICAgICAgICAgIGlmICghKHBvaW50ZXIudmFsdWUgaW5zdGFuY2VvZiBkb2dlaXNjdXRPYmplY3QuVHlwZSkpIHJldHVybiBudWxsOw0KICAgICAgICAgICAgcmV0dXJuIHBvaW50ZXIudmFsdWUubWFwLmdldChuYW1lKTsNCiAgICAgICAgfSwNCiANCiAgICAgICAgaW5zdGFuY2VPZihwb2ludGVyLCBvdGhlckNsYXNzKSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgbGV0IF9fY2xhc3NfXyA9IGp3Q2xhc3MuZ2V0UHJvcChjbGFzc1N5bWJvbCwgcG9pbnRlcik7DQogICAgICAgICAgICB3aGlsZSAoX19jbGFzc19fKSB7DQogICAgICAgICAgICAgICAgaWYgKF9fY2xhc3NfXyA9PT0gb3RoZXJDbGFzcykgcmV0dXJuIHRydWU7DQogICAgICAgICAgICAgICAgX19jbGFzc19fID0gX19jbGFzc19fLmV4dGVuc2lvbjsNCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIHJldHVybiBmYWxzZTsNCiAgICAgICAgfQ0KICAgIH07DQogDQogICAgY2xhc3MgRXh0ZW5zaW9uIHsNCiAgICAgICAgY29uc3RydWN0b3IoKSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KIA0KICAgICAgICAgICAgdHJ5IHsNCiAgICAgICAgICAgICAgICBpZiAocnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25VUkwpIHsNCiAgICAgICAgICAgICAgICAgICAgY29uc3QgbG9hZGVkID0gcnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25VUkwoDQogICAgICAgICAgICAgICAgICAgICAgICAnaHR0cHM6Ly9leHRlbnNpb25zLnBlbmd1aW5tb2QuY29tL2V4dGVuc2lvbnMvRG9nZWlzQ3V0L2RvZ2Vpc2N1dE9iamVjdC5qcycNCiAgICAgICAgICAgICAgICAgICAgKTsNCiAgICAgICAgICAgICAgICAgICAgaWYgKGxvYWRlZCAmJiB0eXBlb2YgbG9hZGVkLnRoZW4gPT09ICdmdW5jdGlvbicpIHsNCiAgICAgICAgICAgICAgICAgICAgICAgIGxvYWRlZC50aGVuKHJlZnJlc2hEZXBzKS5jYXRjaCgoKSA9PiB7fSk7DQogICAgICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICB9IGNhdGNoIChlKSB7fQ0KIA0KICAgICAgICAgICAgdHJ5IHsNCiAgICAgICAgICAgICAgICBpZiAocnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25JZFN5bmMpIHsNCiAgICAgICAgICAgICAgICAgICAgcnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25JZFN5bmMoJ2p3UG9pbnRlcicpO3J1bnRpbWUuZXh0ZW5zaW9uTWFuYWdlci5sb2FkRXh0ZW5zaW9uSWRTeW5jKCdqd0xhbWJkYScpOw0KICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgIH0gY2F0Y2ggKGUpIHt9DQogDQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KIA0KICAgICAgICAgICAgdm0uandDbGFzcyA9IGp3Q2xhc3M7DQogDQogICAgICAgICAgICBydW50aW1lLnJlZ2lzdGVyU2VyaWFsaXplcigNCiAgICAgICAgICAgICAgICAnandDbGFzcycsDQogICAgICAgICAgICAgICAgdiA9PiB2Lm5hbWUsDQogICAgICAgICAgICAgICAgdiA9PiBuZXcgandDbGFzcy5UeXBlKGZ1bmN0aW9uKiAoKSB7fSwgdi5uYW1lKQ0KICAgICAgICAgICAgKTsNCiANCiAgICAgICAgICAgIGlmIChydW50aW1lLnJlZ2lzdGVyQ29tcGlsZWRFeHRlbnNpb25CbG9ja3MpIHsNCiAgICAgICAgICAgICAgICBydW50aW1lLnJlZ2lzdGVyQ29tcGlsZWRFeHRlbnNpb25CbG9ja3MoJ2p3Q2xhc3MnLCB0aGlzLmdldENvbXBpbGVJbmZvKCkpOw0KICAgICAgICAgICAgfQ0KICAgICAgICB9DQogDQogICAgICAgIGdldEluZm8oKSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KIA0KICAgICAgICAgICAgcmV0dXJuIHsNCiAgICAgICAgICAgICAgICBpZDogJ2p3Q2xhc3MnLA0KICAgICAgICAgICAgICAgIG5hbWU6ICdDbGFzc2VzJywNCiAgICAgICAgICAgICAgICBjb2xvcjE6ICcjNGJiZjU2JywNCiAgICAgICAgICAgICAgICBtZW51SWNvblVSSTogJ2RhdGE6aW1hZ2Uvc3ZnK3htbDtiYXNlNjQsUEhOMlp5QjRiV3h1Y3owaWFIUjBjRG92TDNkM2R5NTNNeTV2Y21jdk1qQXdNQzl6ZG1jaUlIWnBaWGRDYjNnOUlqQWdNQ0F5TUNBeU1DSStDaUFnUEdWc2JHbHdjMlVnYzNSNWJHVTlJbk4wY205clpUb2djbWRpS0RZd0xDQXhOVE1zSURZNUtUc2dabWxzYkRvZ2NtZGlLRGMxTENBeE9URXNJRGcyS1RzaUlHTjRQU0l4TUNJZ1kzazlJakV3SWlCeWVEMGlPUzQxSWlCeWVUMGlPUzQxSWo0OEwyVnNiR2x3YzJVK0NpQWdQR2MrQ2lBZ0lDQThjR0YwYUNCa1BTSk5JRFl1T1RjNElEVXVOVEUySUVNZ05DNDNNellnT0M0MU1EVWdOQzQzTXpZZ01URXVORGswSURZdU9UYzRJREUwTGpRNE5DSWdjM1J5YjJ0bFBTSWpabVptSWlCbWFXeHNQU0p1YjI1bElpQnpkSGxzWlQwaWMzUnliMnRsTFd4cGJtVnFiMmx1T2lCeWIzVnVaRHNnYzNSeWIydGxMV3hwYm1WallYQTZJSEp2ZFc1a095QnpkSEp2YTJVdGQybGtkR2c2SURJN0lqNDhMM0JoZEdnK0NpQWdJQ0E4Y0dGMGFDQmtQU0pOSURFMExqY3dNeUF4TkM0ME9EUWdReUF4TWk0ME5qRWdNVEV1TkRrMUlERXlMalEyTVNBNExqVXdOaUF4TkM0M01ETWdOUzQxTVRZaUlITjBjbTlyWlQwaUkyWm1aaUlnWm1sc2JEMGlibTl1WlNJZ2MzUjViR1U5SW5OMGNtOXJaUzFzYVc1bGFtOXBiam9nY205MWJtUTdJSE4wY205clpTMXNhVzVsWTJGd09pQnliM1Z1WkRzZ2MzUnliMnRsTFhkcFpIUm9PaUF5T3lCMGNtRnVjMlp2Y20wdFltOTRPaUJtYVd4c0xXSnZlRHNnZEhKaGJuTm1iM0p0TFc5eWFXZHBiam9nTlRBbElEVXdKVHNpSUhSeVlXNXpabTl5YlQwaWJXRjBjbWw0S0MweExDQXdMQ0F3TENBdE1Td2dMVEF1TURBd01EQXlMQ0F3S1NJK1BDOXdZWFJvUGdvZ0lEd3ZaejRLUEM5emRtYysnLA0KICAgICAgICAgICAgICAgIGJsb2NrczogWw0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdjbGFzcycsDQogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiAnY2xhc3MgW05BTUVdIFtTRUxGXScsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBOQU1FOiB7DQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHR5cGU6IEFyZ3VtZW50VHlwZS5TVFJJTkcsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRlZmF1bHRWYWx1ZTogJycNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIFNFTEY6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZmlsbEluOiAnc2VsZicNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgYnJhbmNoZXM6IFt7fV0sDQogICAgICAgICAgICAgICAgICAgICAgICAuLi5qd0NsYXNzLkJsb2NrDQogICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgIHsNCiAgICAgICAgICAgICAgICAgICAgICAgIG9wY29kZTogJ3NlbGYnLA0KICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ3NlbGYnLA0KICAgICAgICAgICAgICAgICAgICAgICAgaGlkZUZyb21QYWxldHRlOiB0cnVlLA0KICAgICAgICAgICAgICAgICAgICAgICAgY2FuRHJhZ0R1cGxpY2F0ZTogdHJ1ZSwNCiAgICAgICAgICAgICAgICAgICAgICAgIC4uLmp3UG9pbnRlci5CbG9jaw0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdleHRlbmQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ1tDTEFTU10gZXh0ZW5kcyBbRVhURU5TSU9OXScsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudCwNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBFWFRFTlNJT046IGp3Q2xhc3MuQXJndW1lbnQNCiAgICAgICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgICAgICAuLi5qd0NsYXNzLkJsb2NrDQogICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgICctLS0nLA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdzZXRQcm9wJywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdzZXQgW05BTUVdIG9uIFtQT0lOVEVSXSB0byBbVkFMVUVdJywNCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLkNPTU1BTkQsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBOQU1FOiB7DQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHR5cGU6IEFyZ3VtZW50VHlwZS5TVFJJTkcsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRlZmF1bHRWYWx1ZTogJ2ZvbycNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIFBPSU5URVI6IGp3UG9pbnRlci5Bcmd1bWVudCwNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBWQUxVRTogew0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0eXBlOiBBcmd1bWVudFR5cGUuU1RSSU5HLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBkZWZhdWx0VmFsdWU6ICdiYXInDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdnZXRQcm9wJywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdnZXQgW05BTUVdIG9uIFtQT0lOVEVSXScsDQogICAgICAgICAgICAgICAgICAgICAgICBibG9ja1R5cGU6IEJsb2NrVHlwZS5SRVBPUlRFUiwNCiAgICAgICAgICAgICAgICAgICAgICAgIGFyZ3VtZW50czogew0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIE5BTUU6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHlwZTogQXJndW1lbnRUeXBlLlNUUklORywNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZGVmYXVsdFZhbHVlOiAnZm9vJw0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgUE9JTlRFUjogandQb2ludGVyLkFyZ3VtZW50DQogICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgYWxsb3dEcm9wQW55d2hlcmU6IHRydWUNCiAgICAgICAgICAgICAgICAgICAgfSwNCiAgICAgICAgICAgICAgICAgICAgew0KICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnZ2V0Q2xhc3MnLA0KICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ2dldCBjbGFzcyBvZiBbUE9JTlRFUl0nLA0KICAgICAgICAgICAgICAgICAgICAgICAgYXJndW1lbnRzOiB7DQogICAgICAgICAgICAgICAgICAgICAgICAgICAgUE9JTlRFUjogandQb2ludGVyLkFyZ3VtZW50DQogICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgLi4uandDbGFzcy5CbG9jaw0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAnLS0tJywNCiAgICAgICAgICAgICAgICAgICAgew0KICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnbmV3JywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICduZXcgW0NMQVNTXScsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudA0KICAgICAgICAgICAgICAgICAgICAgICAgfSwNCiAgICAgICAgICAgICAgICAgICAgICAgIC4uLmp3UG9pbnRlci5CbG9jaw0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdnZXROYW1lJywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICduYW1lIG9mIFtDTEFTU10nLA0KICAgICAgICAgICAgICAgICAgICAgICAgYmxvY2tUeXBlOiBCbG9ja1R5cGUuUkVQT1JURVIsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudA0KICAgICAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAnLS0tJywNCiAgICAgICAgICAgICAgICAgICAgew0KICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnaW5zdGFuY2VvZicsDQogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiAnaXMgW1BPSU5URVJdIGluc3RhbmNlIG9mIFtDTEFTU10/JywNCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLkJPT0xFQU4sDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBQT0lOVEVSOiBqd1BvaW50ZXIuQXJndW1lbnQsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgQ0xBU1M6IGp3Q2xhc3MuQXJndW1lbnQNCiAgICAgICAgICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgIF0NCiAgICAgICAgICAgIH07DQogICAgICAgIH0NCiANCiAgICAgICAgZ2V0Q29tcGlsZUluZm8oKSB7DQogICAgICAgICAgICByZXR1cm4gew0KICAgICAgICAgICAgICAgIGlyOiB7DQogICAgICAgICAgICAgICAgICAgIGNsYXNzOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgZ2VuZXJhdG9yLnNjcmlwdC55aWVsZHMgPSB0cnVlOw0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIG5hbWU6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnTkFNRScpLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN1YnN0YWNrOiBnZW5lcmF0b3IuZGVzY2VuZFN1YnN0YWNrKGJsb2NrLCAnU1VCU1RBQ0snKQ0KICAgICAgICAgICAgICAgICAgICAgICAgfTsNCiAgICAgICAgICAgICAgICAgICAgfSwNCiANCiAgICAgICAgICAgICAgICAgICAgc2VsZjogKCkgPT4gKHsNCiAgICAgICAgICAgICAgICAgICAgICAgIGtpbmQ6ICdpbnB1dCcNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGV4dGVuZDogKGdlbmVyYXRvciwgYmxvY2spID0+ICh7DQogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgY2xhc3M6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnQ0xBU1MnKSwNCiAgICAgICAgICAgICAgICAgICAgICAgIGV4dGVuc2lvbjogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdFWFRFTlNJT04nKQ0KICAgICAgICAgICAgICAgICAgICB9KSwNCiANCiAgICAgICAgICAgICAgICAgICAgc2V0UHJvcDogKGdlbmVyYXRvciwgYmxvY2spID0+ICh7DQogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnc3RhY2snLA0KICAgICAgICAgICAgICAgICAgICAgICAgbmFtZTogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdOQU1FJyksDQogICAgICAgICAgICAgICAgICAgICAgICBwb2ludGVyOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1BPSU5URVInKSwNCiAgICAgICAgICAgICAgICAgICAgICAgIHZhbHVlOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1ZBTFVFJykNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGdldFByb3A6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoew0KICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywNCiAgICAgICAgICAgICAgICAgICAgICAgIG5hbWU6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnTkFNRScpLA0KICAgICAgICAgICAgICAgICAgICAgICAgcG9pbnRlcjogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdQT0lOVEVSJykNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGdldENsYXNzOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gKHsNCiAgICAgICAgICAgICAgICAgICAgICAgIGtpbmQ6ICdpbnB1dCcsDQogICAgICAgICAgICAgICAgICAgICAgICBwb2ludGVyOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1BPSU5URVInKQ0KICAgICAgICAgICAgICAgICAgICB9KSwNCiANCiAgICAgICAgICAgICAgICAgICAgbmV3OiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgZ2VuZXJhdG9yLnNjcmlwdC55aWVsZHMgPSB0cnVlOw0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJykNCiAgICAgICAgICAgICAgICAgICAgICAgIH07DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIGdldE5hbWU6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoew0KICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywNCiAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJykNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGluc3RhbmNlb2Y6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoew0KICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywNCiAgICAgICAgICAgICAgICAgICAgICAgIHBvaW50ZXI6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnUE9JTlRFUicpLA0KICAgICAgICAgICAgICAgICAgICAgICAgY2xhc3M6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnQ0xBU1MnKQ0KICAgICAgICAgICAgICAgICAgICB9KQ0KICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAganM6IHsNCiAgICAgICAgICAgICAgICAgICAgY2xhc3M6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgY29uc3QgdGVtcCA9IGNvbXBpbGVyLnNvdXJjZTsNCiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLnNvdXJjZSA9ICcobmV3IHZtLmp3Q2xhc3MuVHlwZShmdW5jdGlvbiooX2p3Q2xhc3NTZWxmLCB0aHJlYWQsIHRhcmdldCkge1xuJzsNCiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLmRlc2NlbmRTdGFjayhub2RlLnN1YnN0YWNrLCBuZXcgaW1wb3J0cy5GcmFtZShmYWxzZSwgdW5kZWZpbmVkLCB0cnVlKSk7DQogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgKz0gYH0sICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUubmFtZSkuYXNVbmtub3duKCl9LCBudWxsLCB0aHJlYWQucHJvY2VkdXJlcykpYDsNCiAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IHJldHVybnMgPSBjb21waWxlci5zb3VyY2U7DQogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgPSB0ZW1wOw0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIG5ldyBpbXBvcnRzLlR5cGVkSW5wdXQocmV0dXJucywgaW1wb3J0cy5UWVBFX1VOS05PV04pOw0KICAgICAgICAgICAgICAgICAgICB9LA0KIA0KICAgICAgICAgICAgICAgICAgICBzZWxmOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsNCiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICcodHlwZW9mIF9qd0NsYXNzU2VsZiAhPT0gInVuZGVmaW5lZCIgPyBfandDbGFzc1NlbGYgOiBuZXcgdm0uandQb2ludGVyLlR5cGUoMCkpJywNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpbXBvcnRzLlRZUEVfVU5LTk9XTg0KICAgICAgICAgICAgICAgICAgICAgICAgKTsNCiAgICAgICAgICAgICAgICAgICAgfSwNCiANCiAgICAgICAgICAgICAgICAgICAgZXh0ZW5kOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsNCiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGB2bS5qd0NsYXNzLlR5cGUudG9DbGFzcygke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmNsYXNzKS5hc1Vua25vd24oKX0pLmV4dGVuZCgke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmV4dGVuc2lvbikuYXNVbmtub3duKCl9KWAsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgaW1wb3J0cy5UWVBFX1VOS05PV04NCiAgICAgICAgICAgICAgICAgICAgICAgICk7DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIHNldFByb3A6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgY29tcGlsZXIuc291cmNlICs9IGB2bS5qd0NsYXNzLnNldFByb3AoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5uYW1lKS5hc1Vua25vd24oKX0sICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUucG9pbnRlcikuYXNVbmtub3duKCl9LCAke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLnZhbHVlKS5hc1Vua25vd24oKX0pO1xuYDsNCiAgICAgICAgICAgICAgICAgICAgfSwNCiANCiAgICAgICAgICAgICAgICAgICAgZ2V0UHJvcDogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7DQogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgdm0uandDbGFzcy5nZXRQcm9wKCR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUubmFtZSkuYXNVbmtub3duKCl9LCAke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLnBvaW50ZXIpLmFzVW5rbm93bigpfSlgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9VTktOT1dODQogICAgICAgICAgICAgICAgICAgICAgICApOw0KICAgICAgICAgICAgICAgICAgICB9LA0KIA0KICAgICAgICAgICAgICAgICAgICBnZXRDbGFzczogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7DQogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgdm0uandDbGFzcy5nZXRQcm9wKHZtLmp3Q2xhc3MuY2xhc3NTeW1ib2wsICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUucG9pbnRlcikuYXNVbmtub3duKCl9KWAsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgaW1wb3J0cy5UWVBFX1VOS05PV04NCiAgICAgICAgICAgICAgICAgICAgICAgICk7DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIG5ldzogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7DQogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgKHlpZWxkKiB2bS5qd0NsYXNzLlR5cGUudG9DbGFzcygke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmNsYXNzKS5hc1Vua25vd24oKX0pLmNyZWF0ZUluc3RhbmNlKHRocmVhZCwgdGFyZ2V0KSlgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9VTktOT1dODQogICAgICAgICAgICAgICAgICAgICAgICApOw0KICAgICAgICAgICAgICAgICAgICB9LA0KIA0KICAgICAgICAgICAgICAgICAgICBnZXROYW1lOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsNCiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGB2bS5qd0NsYXNzLlR5cGUudG9DbGFzcygke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmNsYXNzKS5hc1Vua25vd24oKX0pLm5hbWVgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9TVFJJTkcNCiAgICAgICAgICAgICAgICAgICAgICAgICk7DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIGluc3RhbmNlb2Y6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIG5ldyBpbXBvcnRzLlR5cGVkSW5wdXQoDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgYHZtLmp3Q2xhc3MuaW5zdGFuY2VPZigke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLnBvaW50ZXIpLmFzVW5rbm93bigpfSwgdm0uandDbGFzcy5UeXBlLnRvQ2xhc3MoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5jbGFzcykuYXNVbmtub3duKCl9KSlgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9CT09MRUFODQogICAgICAgICAgICAgICAgICAgICAgICApOw0KICAgICAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgfTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBjbGFzcyh7IE5BTUUsIFNFTEYgfSwgdXRpbCkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBuZXcgandDbGFzcy5UeXBlKGZ1bmN0aW9uKiAoX2p3Q2xhc3NTZWxmLCB0aHJlYWQsIHRhcmdldCkge30sIE5BTUUsIG51bGwsIHV0aWwudGhyZWFkPy5wcm9jZWR1cmVzKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBzZWxmKCkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBuZXcgandQb2ludGVyLlR5cGUoMCk7DQogICAgICAgIH0NCiANCiAgICAgICAgZXh0ZW5kKHsgQ0xBU1MsIEVYVEVOU0lPTiB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgQ0xBU1MgPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhDTEFTUyk7DQogICAgICAgICAgICBFWFRFTlNJT04gPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhFWFRFTlNJT04pOw0KICAgICAgICAgICAgcmV0dXJuIENMQVNTLmV4dGVuZChFWFRFTlNJT04pOw0KICAgICAgICB9DQogDQogICAgICAgIHNldFByb3AoeyBOQU1FLCBQT0lOVEVSLCBWQUxVRSB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgandDbGFzcy5zZXRQcm9wKE5BTUUsIFBPSU5URVIsIFZBTFVFKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBnZXRQcm9wKHsgTkFNRSwgUE9JTlRFUiB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgcmV0dXJuIGp3Q2xhc3MuZ2V0UHJvcChOQU1FLCBQT0lOVEVSKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBnZXRDbGFzcyh7IFBPSU5URVIgfSkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBqd0NsYXNzLmdldFByb3AoY2xhc3NTeW1ib2wsIFBPSU5URVIpOw0KICAgICAgICB9DQogDQogICAgICAgIG5ldyh7IENMQVNTIH0sIHV0aWwpIHsNCiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7DQogICAgICAgICAgICBDTEFTUyA9IGp3Q2xhc3MuVHlwZS50b0NsYXNzKENMQVNTKTsNCiAgICAgICAgICAgIHJldHVybiBDTEFTUy5jcmVhdGVJbnN0YW5jZSh1dGlsLnRocmVhZCwgdXRpbC50YXJnZXQpOw0KICAgICAgICB9DQogDQogICAgICAgIGdldE5hbWUoeyBDTEFTUyB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgQ0xBU1MgPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhDTEFTUyk7DQogICAgICAgICAgICByZXR1cm4gQ0xBU1MubmFtZTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBpbnN0YW5jZW9mKHsgUE9JTlRFUiwgQ0xBU1MgfSkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBqd0NsYXNzLmluc3RhbmNlT2YoUE9JTlRFUiwgandDbGFzcy5UeXBlLnRvQ2xhc3MoQ0xBU1MpKTsNCiAgICAgICAgfQ0KICAgIH0NCiANCiAgICBTY3JhdGNoLmV4dGVuc2lvbnMucmVnaXN0ZXIobmV3IEV4dGVuc2lvbigpKTsNCn0pKFNjcmF0Y2gpOw==";
-    }
+  out.extensions = out.extensions || [];
+  if (!out.extensions.includes("jwClass")) {
+    out.extensions.push("jwClass");
+    out.extensionURLs = out.extensionURLs || {};
+    out.extensionURLs.jwClass =
+      out.extensionURLs.jwClass || // jwClass backported from port to old compiler non core extension(unsandboxed)
+      "data:text/javascript;charset=utf-8;base64,KGZ1bmN0aW9uIChTY3JhdGNoKSB7DQogICAgJ3VzZSBzdHJpY3QnOw0KIA0KICAgIGlmICghU2NyYXRjaC5leHRlbnNpb25zLnVuc2FuZGJveGVkKSB7DQogICAgICAgIHRocm93IG5ldyBFcnJvcignandDbGFzcyBtdXN0IGJlIGxvYWRlZCBhcyBhbiB1bnNhbmRib3hlZCBUdXJib1dhcnAgZXh0ZW5zaW9uLicpOw0KICAgIH0NCiANCiAgICBjb25zdCB2bSA9IFNjcmF0Y2gudm07DQogICAgY29uc3QgcnVudGltZSA9IHZtLnJ1bnRpbWU7DQogDQogICAgY29uc3QgQmxvY2tUeXBlID0gU2NyYXRjaC5CbG9ja1R5cGU7DQogICAgY29uc3QgQXJndW1lbnRUeXBlID0gU2NyYXRjaC5Bcmd1bWVudFR5cGU7DQogICAgY29uc3QgQmxvY2tTaGFwZSA9IFNjcmF0Y2guQmxvY2tTaGFwZSB8fCB7DQogICAgICAgIFNRVUFSRTogJ3NxdWFyZScsDQogICAgICAgIFRJQ0tFVDogJ3RpY2tldCcNCiAgICB9Ow0KIA0KICAgIGNvbnN0IHBtU3ltYm9sID0gU2NyYXRjaC5wbVN5bWJvbCB8fCB7DQogICAgICAgIGVxdWFsczogU3ltYm9sLmZvcigncG0uZXF1YWxzJykNCiAgICB9Ow0KIA0KICAgIGNvbnN0IGVzY2FwZUhUTUwgPSB1bnNhZmUgPT4gew0KICAgICAgICByZXR1cm4gU3RyaW5nKHVuc2FmZSkNCiAgICAgICAgICAgIC5yZXBsYWNlQWxsKCcmJywgJyZhbXA7JykNCiAgICAgICAgICAgIC5yZXBsYWNlQWxsKCc8JywgJyZsdDsnKQ0KICAgICAgICAgICAgLnJlcGxhY2VBbGwoJz4nLCAnJmd0OycpDQogICAgICAgICAgICAucmVwbGFjZUFsbCgnIicsICcmcXVvdDsnKQ0KICAgICAgICAgICAgLnJlcGxhY2VBbGwoIiciLCAnJiMwMzk7Jyk7DQogICAgfTsNCiANCiAgICBjb25zdCBjbGFzc1N5bWJvbCA9IFN5bWJvbCgnY2xhc3MnKTsNCiANCiAgICBsZXQgZG9nZWlzY3V0T2JqZWN0ID0gew0KICAgICAgICBUeXBlOiBjbGFzcyB7fSwNCiAgICAgICAgQmxvY2s6IHt9LA0KICAgICAgICBBcmd1bWVudDoge30NCiAgICB9Ow0KIA0KICAgIGxldCBqd1BvaW50ZXIgPSB7DQogICAgICAgIFR5cGU6IGNsYXNzIHt9LA0KICAgICAgICBCbG9jazoge30sDQogICAgICAgIEFyZ3VtZW50OiB7fQ0KICAgIH07DQogDQogICAgY29uc3QgcmVmcmVzaERlcHMgPSAoKSA9PiB7DQogICAgICAgIGlmICh2bS5kb2dlaXNjdXRPYmplY3QpIGRvZ2Vpc2N1dE9iamVjdCA9IHZtLmRvZ2Vpc2N1dE9iamVjdDsNCiAgICAgICAgaWYgKHZtLmp3UG9pbnRlcikgandQb2ludGVyID0gdm0uandQb2ludGVyOw0KICAgIH07DQogDQogICAgY2xhc3MgQ2xhc3NUeXBlIHsNCiAgICAgICAgY29uc3RydWN0b3IoY29uc3RydWN0ID0gZnVuY3Rpb24qICgpIHt9LCBuYW1lID0gJycsIGV4dGVuc2lvbiA9IG51bGwsIHByb2MgPSBudWxsKSB7DQogICAgICAgICAgICB0aGlzLmNvbnN0cnVjdCA9IGNvbnN0cnVjdDsNCiAgICAgICAgICAgIHRoaXMubmFtZSA9IG5hbWU7DQogICAgICAgICAgICB0aGlzLmV4dGVuc2lvbiA9IGV4dGVuc2lvbjsNCiAgICAgICAgICAgIHRoaXMucHJvYyA9IHByb2MgPz8ge307DQogICAgICAgIH0NCiANCiAgICAgICAgdG9TdHJpbmcoKSB7DQogICAgICAgICAgICByZXR1cm4gdGhpcy5uYW1lLmxlbmd0aCA+IDAgPyBgQ2xhc3M8JHt0aGlzLm5hbWV9PmAgOiAnQ2xhc3MnOw0KICAgICAgICB9DQogDQogICAgICAgIGp3QXJyYXlIYW5kbGVyKCkgew0KICAgICAgICAgICAgcmV0dXJuIGVzY2FwZUhUTUwodGhpcy50b1N0cmluZygpKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBzdGF0aWMgdG9DbGFzcyh2KSB7DQogICAgICAgICAgICBpZiAodiBpbnN0YW5jZW9mIENsYXNzVHlwZSkgcmV0dXJuIHY7DQogICAgICAgICAgICByZXR1cm4gbmV3IENsYXNzVHlwZSgpOw0KICAgICAgICB9DQogDQogICAgICAgIGNyZWF0ZUluc3RhbmNlID0gZnVuY3Rpb24qICh0aHJlYWQsIHRhcmdldCkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiANCiAgICAgICAgICAgIGlmICh0aGlzLnByb2MpIHRocmVhZC5wcm9jZWR1cmVzID0geyAuLi50aGlzLnByb2MsIC4uLnRocmVhZC5wcm9jZWR1cmVzIH07DQogDQogICAgICAgICAgICBpZiAoIXRoaXMuZXh0ZW5zaW9uKSB7DQogICAgICAgICAgICAgICAgbGV0IG9iamVjdCA9IG5ldyBkb2dlaXNjdXRPYmplY3QuVHlwZSgpOw0KICAgICAgICAgICAgICAgIG9iamVjdC5tYXAuc2V0KGNsYXNzU3ltYm9sLCB0aGlzKTsNCiAgICAgICAgICAgICAgICBsZXQgcG9pbnRlciA9IGp3UG9pbnRlci5UeXBlLmNyZWF0ZSgpOw0KICAgICAgICAgICAgICAgIHBvaW50ZXIudmFsdWUgPSBvYmplY3Q7DQogICAgICAgICAgICAgICAgeWllbGQqIHRoaXMuY29uc3RydWN0KHBvaW50ZXIsIHRocmVhZCwgdGFyZ2V0KTsNCiAgICAgICAgICAgICAgICByZXR1cm4gcG9pbnRlcjsNCiAgICAgICAgICAgIH0gZWxzZSB7DQogICAgICAgICAgICAgICAgbGV0IHBvaW50ZXIgPSB5aWVsZCogdGhpcy5leHRlbnNpb24uY3JlYXRlSW5zdGFuY2UodGhyZWFkLCB0YXJnZXQpOw0KICAgICAgICAgICAgICAgIGxldCBvYmplY3QgPSBwb2ludGVyLnZhbHVlOw0KICAgICAgICAgICAgICAgIGlmIChvYmplY3QgaW5zdGFuY2VvZiBkb2dlaXNjdXRPYmplY3QuVHlwZSkgb2JqZWN0Lm1hcC5zZXQoY2xhc3NTeW1ib2wsIHRoaXMpOw0KICAgICAgICAgICAgICAgIHlpZWxkKiB0aGlzLmNvbnN0cnVjdChwb2ludGVyLCB0aHJlYWQsIHRhcmdldCk7DQogICAgICAgICAgICAgICAgcmV0dXJuIHBvaW50ZXI7DQogICAgICAgICAgICB9DQogICAgICAgIH07DQogDQogICAgICAgIGV4dGVuZChleHRlbnNpb24pIHsNCiAgICAgICAgICAgIHJldHVybiBuZXcgQ2xhc3NUeXBlKHRoaXMuY29uc3RydWN0LCB0aGlzLm5hbWUsIGV4dGVuc2lvbiwgdGhpcy5wcm9jKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBbcG1TeW1ib2wuZXF1YWxzXShvdGhlcikgew0KICAgICAgICAgICAgcmV0dXJuIHRoaXMgPT09IG90aGVyOw0KICAgICAgICB9DQogICAgfQ0KIA0KICAgIGNvbnN0IGp3Q2xhc3MgPSB7DQogICAgICAgIFR5cGU6IENsYXNzVHlwZSwNCiAgICAgICAgQmxvY2s6IHsNCiAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLlJFUE9SVEVSLA0KICAgICAgICAgICAgYmxvY2tTaGFwZTogQmxvY2tTaGFwZS5USUNLRVQsDQogICAgICAgICAgICBmb3JjZU91dHB1dFR5cGU6ICdqd0NsYXNzJywNCiAgICAgICAgICAgIGRpc2FibGVNb25pdG9yOiB0cnVlDQogICAgICAgIH0sDQogICAgICAgIEFyZ3VtZW50OiB7DQogICAgICAgICAgICBzaGFwZTogQmxvY2tTaGFwZS5USUNLRVQsDQogICAgICAgICAgICBjaGVjazogWydqd0NsYXNzJ10NCiAgICAgICAgfSwNCiANCiAgICAgICAgY2xhc3NTeW1ib2wsDQogDQogICAgICAgIHNldFByb3AobmFtZSwgcG9pbnRlciwgdmFsdWUpIHsNCiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7DQogICAgICAgICAgICBpZiAoIShwb2ludGVyIGluc3RhbmNlb2YgandQb2ludGVyLlR5cGUpKSByZXR1cm47DQogICAgICAgICAgICBpZiAoIShwb2ludGVyLnZhbHVlIGluc3RhbmNlb2YgZG9nZWlzY3V0T2JqZWN0LlR5cGUpKSByZXR1cm47DQogICAgICAgICAgICBwb2ludGVyLnZhbHVlID0gZG9nZWlzY3V0T2JqZWN0LlR5cGUudG9PYmplY3QocG9pbnRlci52YWx1ZSk7IC8vIGNsb25lDQogICAgICAgICAgICBwb2ludGVyLnZhbHVlLm1hcC5zZXQobmFtZSwgdmFsdWUpOw0KICAgICAgICB9LA0KIA0KICAgICAgICBnZXRQcm9wKG5hbWUsIHBvaW50ZXIpIHsNCiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7DQogICAgICAgICAgICBpZiAoIShwb2ludGVyIGluc3RhbmNlb2YgandQb2ludGVyLlR5cGUpKSByZXR1cm4gbnVsbDsNCiAgICAgICAgICAgIGlmICghKHBvaW50ZXIudmFsdWUgaW5zdGFuY2VvZiBkb2dlaXNjdXRPYmplY3QuVHlwZSkpIHJldHVybiBudWxsOw0KICAgICAgICAgICAgcmV0dXJuIHBvaW50ZXIudmFsdWUubWFwLmdldChuYW1lKTsNCiAgICAgICAgfSwNCiANCiAgICAgICAgaW5zdGFuY2VPZihwb2ludGVyLCBvdGhlckNsYXNzKSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgbGV0IF9fY2xhc3NfXyA9IGp3Q2xhc3MuZ2V0UHJvcChjbGFzc1N5bWJvbCwgcG9pbnRlcik7DQogICAgICAgICAgICB3aGlsZSAoX19jbGFzc19fKSB7DQogICAgICAgICAgICAgICAgaWYgKF9fY2xhc3NfXyA9PT0gb3RoZXJDbGFzcykgcmV0dXJuIHRydWU7DQogICAgICAgICAgICAgICAgX19jbGFzc19fID0gX19jbGFzc19fLmV4dGVuc2lvbjsNCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIHJldHVybiBmYWxzZTsNCiAgICAgICAgfQ0KICAgIH07DQogDQogICAgY2xhc3MgRXh0ZW5zaW9uIHsNCiAgICAgICAgY29uc3RydWN0b3IoKSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KIA0KICAgICAgICAgICAgdHJ5IHsNCiAgICAgICAgICAgICAgICBpZiAocnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25VUkwpIHsNCiAgICAgICAgICAgICAgICAgICAgY29uc3QgbG9hZGVkID0gcnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25VUkwoDQogICAgICAgICAgICAgICAgICAgICAgICAnaHR0cHM6Ly9leHRlbnNpb25zLnBlbmd1aW5tb2QuY29tL2V4dGVuc2lvbnMvRG9nZWlzQ3V0L2RvZ2Vpc2N1dE9iamVjdC5qcycNCiAgICAgICAgICAgICAgICAgICAgKTsNCiAgICAgICAgICAgICAgICAgICAgaWYgKGxvYWRlZCAmJiB0eXBlb2YgbG9hZGVkLnRoZW4gPT09ICdmdW5jdGlvbicpIHsNCiAgICAgICAgICAgICAgICAgICAgICAgIGxvYWRlZC50aGVuKHJlZnJlc2hEZXBzKS5jYXRjaCgoKSA9PiB7fSk7DQogICAgICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICB9IGNhdGNoIChlKSB7fQ0KIA0KICAgICAgICAgICAgdHJ5IHsNCiAgICAgICAgICAgICAgICBpZiAocnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25JZFN5bmMpIHsNCiAgICAgICAgICAgICAgICAgICAgcnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25JZFN5bmMoJ2p3UG9pbnRlcicpO3J1bnRpbWUuZXh0ZW5zaW9uTWFuYWdlci5sb2FkRXh0ZW5zaW9uSWRTeW5jKCdqd0xhbWJkYScpOw0KICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgIH0gY2F0Y2ggKGUpIHt9DQogDQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KIA0KICAgICAgICAgICAgdm0uandDbGFzcyA9IGp3Q2xhc3M7DQogDQogICAgICAgICAgICBydW50aW1lLnJlZ2lzdGVyU2VyaWFsaXplcigNCiAgICAgICAgICAgICAgICAnandDbGFzcycsDQogICAgICAgICAgICAgICAgdiA9PiB2Lm5hbWUsDQogICAgICAgICAgICAgICAgdiA9PiBuZXcgandDbGFzcy5UeXBlKGZ1bmN0aW9uKiAoKSB7fSwgdi5uYW1lKQ0KICAgICAgICAgICAgKTsNCiANCiAgICAgICAgICAgIGlmIChydW50aW1lLnJlZ2lzdGVyQ29tcGlsZWRFeHRlbnNpb25CbG9ja3MpIHsNCiAgICAgICAgICAgICAgICBydW50aW1lLnJlZ2lzdGVyQ29tcGlsZWRFeHRlbnNpb25CbG9ja3MoJ2p3Q2xhc3MnLCB0aGlzLmdldENvbXBpbGVJbmZvKCkpOw0KICAgICAgICAgICAgfQ0KICAgICAgICB9DQogDQogICAgICAgIGdldEluZm8oKSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KIA0KICAgICAgICAgICAgcmV0dXJuIHsNCiAgICAgICAgICAgICAgICBpZDogJ2p3Q2xhc3MnLA0KICAgICAgICAgICAgICAgIG5hbWU6ICdDbGFzc2VzJywNCiAgICAgICAgICAgICAgICBjb2xvcjE6ICcjNGJiZjU2JywNCiAgICAgICAgICAgICAgICBtZW51SWNvblVSSTogJ2RhdGE6aW1hZ2Uvc3ZnK3htbDtiYXNlNjQsUEhOMlp5QjRiV3h1Y3owaWFIUjBjRG92TDNkM2R5NTNNeTV2Y21jdk1qQXdNQzl6ZG1jaUlIWnBaWGRDYjNnOUlqQWdNQ0F5TUNBeU1DSStDaUFnUEdWc2JHbHdjMlVnYzNSNWJHVTlJbk4wY205clpUb2djbWRpS0RZd0xDQXhOVE1zSURZNUtUc2dabWxzYkRvZ2NtZGlLRGMxTENBeE9URXNJRGcyS1RzaUlHTjRQU0l4TUNJZ1kzazlJakV3SWlCeWVEMGlPUzQxSWlCeWVUMGlPUzQxSWo0OEwyVnNiR2x3YzJVK0NpQWdQR2MrQ2lBZ0lDQThjR0YwYUNCa1BTSk5JRFl1T1RjNElEVXVOVEUySUVNZ05DNDNNellnT0M0MU1EVWdOQzQzTXpZZ01URXVORGswSURZdU9UYzRJREUwTGpRNE5DSWdjM1J5YjJ0bFBTSWpabVptSWlCbWFXeHNQU0p1YjI1bElpQnpkSGxzWlQwaWMzUnliMnRsTFd4cGJtVnFiMmx1T2lCeWIzVnVaRHNnYzNSeWIydGxMV3hwYm1WallYQTZJSEp2ZFc1a095QnpkSEp2YTJVdGQybGtkR2c2SURJN0lqNDhMM0JoZEdnK0NpQWdJQ0E4Y0dGMGFDQmtQU0pOSURFMExqY3dNeUF4TkM0ME9EUWdReUF4TWk0ME5qRWdNVEV1TkRrMUlERXlMalEyTVNBNExqVXdOaUF4TkM0M01ETWdOUzQxTVRZaUlITjBjbTlyWlQwaUkyWm1aaUlnWm1sc2JEMGlibTl1WlNJZ2MzUjViR1U5SW5OMGNtOXJaUzFzYVc1bGFtOXBiam9nY205MWJtUTdJSE4wY205clpTMXNhVzVsWTJGd09pQnliM1Z1WkRzZ2MzUnliMnRsTFhkcFpIUm9PaUF5T3lCMGNtRnVjMlp2Y20wdFltOTRPaUJtYVd4c0xXSnZlRHNnZEhKaGJuTm1iM0p0TFc5eWFXZHBiam9nTlRBbElEVXdKVHNpSUhSeVlXNXpabTl5YlQwaWJXRjBjbWw0S0MweExDQXdMQ0F3TENBdE1Td2dMVEF1TURBd01EQXlMQ0F3S1NJK1BDOXdZWFJvUGdvZ0lEd3ZaejRLUEM5emRtYysnLA0KICAgICAgICAgICAgICAgIGJsb2NrczogWw0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdjbGFzcycsDQogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiAnY2xhc3MgW05BTUVdIFtTRUxGXScsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBOQU1FOiB7DQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHR5cGU6IEFyZ3VtZW50VHlwZS5TVFJJTkcsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRlZmF1bHRWYWx1ZTogJycNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIFNFTEY6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZmlsbEluOiAnc2VsZicNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgYnJhbmNoZXM6IFt7fV0sDQogICAgICAgICAgICAgICAgICAgICAgICAuLi5qd0NsYXNzLkJsb2NrDQogICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgIHsNCiAgICAgICAgICAgICAgICAgICAgICAgIG9wY29kZTogJ3NlbGYnLA0KICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ3NlbGYnLA0KICAgICAgICAgICAgICAgICAgICAgICAgaGlkZUZyb21QYWxldHRlOiB0cnVlLA0KICAgICAgICAgICAgICAgICAgICAgICAgY2FuRHJhZ0R1cGxpY2F0ZTogdHJ1ZSwNCiAgICAgICAgICAgICAgICAgICAgICAgIC4uLmp3UG9pbnRlci5CbG9jaw0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdleHRlbmQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ1tDTEFTU10gZXh0ZW5kcyBbRVhURU5TSU9OXScsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudCwNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBFWFRFTlNJT046IGp3Q2xhc3MuQXJndW1lbnQNCiAgICAgICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgICAgICAuLi5qd0NsYXNzLkJsb2NrDQogICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgICctLS0nLA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdzZXRQcm9wJywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdzZXQgW05BTUVdIG9uIFtQT0lOVEVSXSB0byBbVkFMVUVdJywNCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLkNPTU1BTkQsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBOQU1FOiB7DQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHR5cGU6IEFyZ3VtZW50VHlwZS5TVFJJTkcsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRlZmF1bHRWYWx1ZTogJ2ZvbycNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIFBPSU5URVI6IGp3UG9pbnRlci5Bcmd1bWVudCwNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBWQUxVRTogew0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0eXBlOiBBcmd1bWVudFR5cGUuU1RSSU5HLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBkZWZhdWx0VmFsdWU6ICdiYXInDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdnZXRQcm9wJywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdnZXQgW05BTUVdIG9uIFtQT0lOVEVSXScsDQogICAgICAgICAgICAgICAgICAgICAgICBibG9ja1R5cGU6IEJsb2NrVHlwZS5SRVBPUlRFUiwNCiAgICAgICAgICAgICAgICAgICAgICAgIGFyZ3VtZW50czogew0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIE5BTUU6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHlwZTogQXJndW1lbnRUeXBlLlNUUklORywNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZGVmYXVsdFZhbHVlOiAnZm9vJw0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0sDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgUE9JTlRFUjogandQb2ludGVyLkFyZ3VtZW50DQogICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgYWxsb3dEcm9wQW55d2hlcmU6IHRydWUNCiAgICAgICAgICAgICAgICAgICAgfSwNCiAgICAgICAgICAgICAgICAgICAgew0KICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnZ2V0Q2xhc3MnLA0KICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ2dldCBjbGFzcyBvZiBbUE9JTlRFUl0nLA0KICAgICAgICAgICAgICAgICAgICAgICAgYXJndW1lbnRzOiB7DQogICAgICAgICAgICAgICAgICAgICAgICAgICAgUE9JTlRFUjogandQb2ludGVyLkFyZ3VtZW50DQogICAgICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAgICAgLi4uandDbGFzcy5CbG9jaw0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAnLS0tJywNCiAgICAgICAgICAgICAgICAgICAgew0KICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnbmV3JywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICduZXcgW0NMQVNTXScsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudA0KICAgICAgICAgICAgICAgICAgICAgICAgfSwNCiAgICAgICAgICAgICAgICAgICAgICAgIC4uLmp3UG9pbnRlci5CbG9jaw0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICB7DQogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdnZXROYW1lJywNCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICduYW1lIG9mIFtDTEFTU10nLA0KICAgICAgICAgICAgICAgICAgICAgICAgYmxvY2tUeXBlOiBCbG9ja1R5cGUuUkVQT1JURVIsDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudA0KICAgICAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICB9LA0KICAgICAgICAgICAgICAgICAgICAnLS0tJywNCiAgICAgICAgICAgICAgICAgICAgew0KICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnaW5zdGFuY2VvZicsDQogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiAnaXMgW1BPSU5URVJdIGluc3RhbmNlIG9mIFtDTEFTU10/JywNCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLkJPT0xFQU4sDQogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBQT0lOVEVSOiBqd1BvaW50ZXIuQXJndW1lbnQsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgQ0xBU1M6IGp3Q2xhc3MuQXJndW1lbnQNCiAgICAgICAgICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgIF0NCiAgICAgICAgICAgIH07DQogICAgICAgIH0NCiANCiAgICAgICAgZ2V0Q29tcGlsZUluZm8oKSB7DQogICAgICAgICAgICByZXR1cm4gew0KICAgICAgICAgICAgICAgIGlyOiB7DQogICAgICAgICAgICAgICAgICAgIGNsYXNzOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgZ2VuZXJhdG9yLnNjcmlwdC55aWVsZHMgPSB0cnVlOw0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIG5hbWU6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnTkFNRScpLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN1YnN0YWNrOiBnZW5lcmF0b3IuZGVzY2VuZFN1YnN0YWNrKGJsb2NrLCAnU1VCU1RBQ0snKQ0KICAgICAgICAgICAgICAgICAgICAgICAgfTsNCiAgICAgICAgICAgICAgICAgICAgfSwNCiANCiAgICAgICAgICAgICAgICAgICAgc2VsZjogKCkgPT4gKHsNCiAgICAgICAgICAgICAgICAgICAgICAgIGtpbmQ6ICdpbnB1dCcNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGV4dGVuZDogKGdlbmVyYXRvciwgYmxvY2spID0+ICh7DQogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgY2xhc3M6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnQ0xBU1MnKSwNCiAgICAgICAgICAgICAgICAgICAgICAgIGV4dGVuc2lvbjogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdFWFRFTlNJT04nKQ0KICAgICAgICAgICAgICAgICAgICB9KSwNCiANCiAgICAgICAgICAgICAgICAgICAgc2V0UHJvcDogKGdlbmVyYXRvciwgYmxvY2spID0+ICh7DQogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnc3RhY2snLA0KICAgICAgICAgICAgICAgICAgICAgICAgbmFtZTogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdOQU1FJyksDQogICAgICAgICAgICAgICAgICAgICAgICBwb2ludGVyOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1BPSU5URVInKSwNCiAgICAgICAgICAgICAgICAgICAgICAgIHZhbHVlOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1ZBTFVFJykNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGdldFByb3A6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoew0KICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywNCiAgICAgICAgICAgICAgICAgICAgICAgIG5hbWU6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnTkFNRScpLA0KICAgICAgICAgICAgICAgICAgICAgICAgcG9pbnRlcjogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdQT0lOVEVSJykNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGdldENsYXNzOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gKHsNCiAgICAgICAgICAgICAgICAgICAgICAgIGtpbmQ6ICdpbnB1dCcsDQogICAgICAgICAgICAgICAgICAgICAgICBwb2ludGVyOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1BPSU5URVInKQ0KICAgICAgICAgICAgICAgICAgICB9KSwNCiANCiAgICAgICAgICAgICAgICAgICAgbmV3OiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgZ2VuZXJhdG9yLnNjcmlwdC55aWVsZHMgPSB0cnVlOw0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJykNCiAgICAgICAgICAgICAgICAgICAgICAgIH07DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIGdldE5hbWU6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoew0KICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywNCiAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJykNCiAgICAgICAgICAgICAgICAgICAgfSksDQogDQogICAgICAgICAgICAgICAgICAgIGluc3RhbmNlb2Y6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoew0KICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywNCiAgICAgICAgICAgICAgICAgICAgICAgIHBvaW50ZXI6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnUE9JTlRFUicpLA0KICAgICAgICAgICAgICAgICAgICAgICAgY2xhc3M6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnQ0xBU1MnKQ0KICAgICAgICAgICAgICAgICAgICB9KQ0KICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAganM6IHsNCiAgICAgICAgICAgICAgICAgICAgY2xhc3M6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgY29uc3QgdGVtcCA9IGNvbXBpbGVyLnNvdXJjZTsNCiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLnNvdXJjZSA9ICcobmV3IHZtLmp3Q2xhc3MuVHlwZShmdW5jdGlvbiooX2p3Q2xhc3NTZWxmLCB0aHJlYWQsIHRhcmdldCkge1xuJzsNCiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLmRlc2NlbmRTdGFjayhub2RlLnN1YnN0YWNrLCBuZXcgaW1wb3J0cy5GcmFtZShmYWxzZSwgdW5kZWZpbmVkLCB0cnVlKSk7DQogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgKz0gYH0sICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUubmFtZSkuYXNVbmtub3duKCl9LCBudWxsLCB0aHJlYWQucHJvY2VkdXJlcykpYDsNCiAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IHJldHVybnMgPSBjb21waWxlci5zb3VyY2U7DQogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgPSB0ZW1wOw0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIG5ldyBpbXBvcnRzLlR5cGVkSW5wdXQocmV0dXJucywgaW1wb3J0cy5UWVBFX1VOS05PV04pOw0KICAgICAgICAgICAgICAgICAgICB9LA0KIA0KICAgICAgICAgICAgICAgICAgICBzZWxmOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsNCiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICcodHlwZW9mIF9qd0NsYXNzU2VsZiAhPT0gInVuZGVmaW5lZCIgPyBfandDbGFzc1NlbGYgOiBuZXcgdm0uandQb2ludGVyLlR5cGUoMCkpJywNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpbXBvcnRzLlRZUEVfVU5LTk9XTg0KICAgICAgICAgICAgICAgICAgICAgICAgKTsNCiAgICAgICAgICAgICAgICAgICAgfSwNCiANCiAgICAgICAgICAgICAgICAgICAgZXh0ZW5kOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsNCiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGB2bS5qd0NsYXNzLlR5cGUudG9DbGFzcygke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmNsYXNzKS5hc1Vua25vd24oKX0pLmV4dGVuZCgke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmV4dGVuc2lvbikuYXNVbmtub3duKCl9KWAsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgaW1wb3J0cy5UWVBFX1VOS05PV04NCiAgICAgICAgICAgICAgICAgICAgICAgICk7DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIHNldFByb3A6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgY29tcGlsZXIuc291cmNlICs9IGB2bS5qd0NsYXNzLnNldFByb3AoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5uYW1lKS5hc1Vua25vd24oKX0sICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUucG9pbnRlcikuYXNVbmtub3duKCl9LCAke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLnZhbHVlKS5hc1Vua25vd24oKX0pO1xuYDsNCiAgICAgICAgICAgICAgICAgICAgfSwNCiANCiAgICAgICAgICAgICAgICAgICAgZ2V0UHJvcDogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7DQogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgdm0uandDbGFzcy5nZXRQcm9wKCR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUubmFtZSkuYXNVbmtub3duKCl9LCAke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLnBvaW50ZXIpLmFzVW5rbm93bigpfSlgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9VTktOT1dODQogICAgICAgICAgICAgICAgICAgICAgICApOw0KICAgICAgICAgICAgICAgICAgICB9LA0KIA0KICAgICAgICAgICAgICAgICAgICBnZXRDbGFzczogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7DQogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgdm0uandDbGFzcy5nZXRQcm9wKHZtLmp3Q2xhc3MuY2xhc3NTeW1ib2wsICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUucG9pbnRlcikuYXNVbmtub3duKCl9KWAsDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgaW1wb3J0cy5UWVBFX1VOS05PV04NCiAgICAgICAgICAgICAgICAgICAgICAgICk7DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIG5ldzogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7DQogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgKHlpZWxkKiB2bS5qd0NsYXNzLlR5cGUudG9DbGFzcygke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmNsYXNzKS5hc1Vua25vd24oKX0pLmNyZWF0ZUluc3RhbmNlKHRocmVhZCwgdGFyZ2V0KSlgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9VTktOT1dODQogICAgICAgICAgICAgICAgICAgICAgICApOw0KICAgICAgICAgICAgICAgICAgICB9LA0KIA0KICAgICAgICAgICAgICAgICAgICBnZXROYW1lOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsNCiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGB2bS5qd0NsYXNzLlR5cGUudG9DbGFzcygke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmNsYXNzKS5hc1Vua25vd24oKX0pLm5hbWVgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9TVFJJTkcNCiAgICAgICAgICAgICAgICAgICAgICAgICk7DQogICAgICAgICAgICAgICAgICAgIH0sDQogDQogICAgICAgICAgICAgICAgICAgIGluc3RhbmNlb2Y6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gew0KICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIG5ldyBpbXBvcnRzLlR5cGVkSW5wdXQoDQogICAgICAgICAgICAgICAgICAgICAgICAgICAgYHZtLmp3Q2xhc3MuaW5zdGFuY2VPZigke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLnBvaW50ZXIpLmFzVW5rbm93bigpfSwgdm0uandDbGFzcy5UeXBlLnRvQ2xhc3MoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5jbGFzcykuYXNVbmtub3duKCl9KSlgLA0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9CT09MRUFODQogICAgICAgICAgICAgICAgICAgICAgICApOw0KICAgICAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgfTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBjbGFzcyh7IE5BTUUsIFNFTEYgfSwgdXRpbCkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBuZXcgandDbGFzcy5UeXBlKGZ1bmN0aW9uKiAoX2p3Q2xhc3NTZWxmLCB0aHJlYWQsIHRhcmdldCkge30sIE5BTUUsIG51bGwsIHV0aWwudGhyZWFkPy5wcm9jZWR1cmVzKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBzZWxmKCkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBuZXcgandQb2ludGVyLlR5cGUoMCk7DQogICAgICAgIH0NCiANCiAgICAgICAgZXh0ZW5kKHsgQ0xBU1MsIEVYVEVOU0lPTiB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgQ0xBU1MgPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhDTEFTUyk7DQogICAgICAgICAgICBFWFRFTlNJT04gPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhFWFRFTlNJT04pOw0KICAgICAgICAgICAgcmV0dXJuIENMQVNTLmV4dGVuZChFWFRFTlNJT04pOw0KICAgICAgICB9DQogDQogICAgICAgIHNldFByb3AoeyBOQU1FLCBQT0lOVEVSLCBWQUxVRSB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgandDbGFzcy5zZXRQcm9wKE5BTUUsIFBPSU5URVIsIFZBTFVFKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBnZXRQcm9wKHsgTkFNRSwgUE9JTlRFUiB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgcmV0dXJuIGp3Q2xhc3MuZ2V0UHJvcChOQU1FLCBQT0lOVEVSKTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBnZXRDbGFzcyh7IFBPSU5URVIgfSkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBqd0NsYXNzLmdldFByb3AoY2xhc3NTeW1ib2wsIFBPSU5URVIpOw0KICAgICAgICB9DQogDQogICAgICAgIG5ldyh7IENMQVNTIH0sIHV0aWwpIHsNCiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7DQogICAgICAgICAgICBDTEFTUyA9IGp3Q2xhc3MuVHlwZS50b0NsYXNzKENMQVNTKTsNCiAgICAgICAgICAgIHJldHVybiBDTEFTUy5jcmVhdGVJbnN0YW5jZSh1dGlsLnRocmVhZCwgdXRpbC50YXJnZXQpOw0KICAgICAgICB9DQogDQogICAgICAgIGdldE5hbWUoeyBDTEFTUyB9KSB7DQogICAgICAgICAgICByZWZyZXNoRGVwcygpOw0KICAgICAgICAgICAgQ0xBU1MgPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhDTEFTUyk7DQogICAgICAgICAgICByZXR1cm4gQ0xBU1MubmFtZTsNCiAgICAgICAgfQ0KIA0KICAgICAgICBpbnN0YW5jZW9mKHsgUE9JTlRFUiwgQ0xBU1MgfSkgew0KICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsNCiAgICAgICAgICAgIHJldHVybiBqd0NsYXNzLmluc3RhbmNlT2YoUE9JTlRFUiwgandDbGFzcy5UeXBlLnRvQ2xhc3MoQ0xBU1MpKTsNCiAgICAgICAgfQ0KICAgIH0NCiANCiAgICBTY3JhdGNoLmV4dGVuc2lvbnMucmVnaXN0ZXIobmV3IEV4dGVuc2lvbigpKTsNCn0pKFNjcmF0Y2gpOw==";
+  }
 }
 
 // Write to file or package as .pmp (zip)
-if (String(outJSONLocation).toLowerCase().endsWith('.pmp')) {
+if (String(outJSONLocation).toLowerCase().endsWith(".pmp")) {
   const pmpPath = outJSONLocation;
-  const assetsDir = path.join(__dirname, 'startingAssets');
+  const assetsDir = path.join(__dirname, "startingAssets");
 
   // create output stream for zip
   const output = fs.createWriteStream(pmpPath);
-  const archive = ensureArchiver()('zip', { zlib: { level: 9 } });
+  const archive = ensureArchiver()("zip", { zlib: { level: 9 } });
 
-  output.on('close', () => {
+  output.on("close", () => {
     console.log(`✅ ${path.basename(pmpPath)} written (${archive.pointer()} bytes)`);
     //console.log(Object.keys(emitResult.blocks).length, 'blocks included in project.json.');
   });
 
-  archive.on('warning', (err) => {
-    if (err.code === 'ENOENT') console.warn(err.message);
+  archive.on("warning", (err) => {
+    if (err.code === "ENOENT") console.warn(err.message);
     else throw err;
   });
-  archive.on('error', (err) => {
+  archive.on("error", (err) => {
     throw err;
   });
 
   archive.pipe(output);
 
   // Add project.json from memory
-  archive.append(JSON.stringify(out, null, 2), { name: 'project.json' });
+  archive.append(JSON.stringify(out, null, 2), { name: "project.json" });
 
   // Add startingAssets directory contents (preserve relative paths)
   if (fs.existsSync(assetsDir)) {
@@ -2273,15 +2774,17 @@ if (String(outJSONLocation).toLowerCase().endsWith('.pmp')) {
         if (it.isDirectory()) addFilesRecursive(full, nameInArchive);
         else if (it.isFile()) archive.file(full, { name: nameInArchive });
       }
-    })(assetsDir, '');
+    })(assetsDir, "");
   } else {
-    console.warn(`⚠️ startingAssets directory not found at ${assetsDir} — .pmp will only contain project.json`);
+    console.warn(
+      `⚠️ startingAssets directory not found at ${assetsDir} — .pmp will only contain project.json`,
+    );
   }
 
   // Also write companion project.json next to the .pmp so file on disk
   // matches the packaged project (helpful for inspection/debugging).
-  const companionJson = path.join(path.dirname(pmpPath), 'project.json');
-  fs.writeFileSync(companionJson, JSON.stringify(out, null, 2), 'utf8');
+  const companionJson = path.join(path.dirname(pmpPath), "project.json");
+  fs.writeFileSync(companionJson, JSON.stringify(out, null, 2), "utf8");
   console.log(`✅ ${path.basename(companionJson)} written next to ${path.basename(pmpPath)}`);
 
   archive.finalize();
@@ -2290,6 +2793,6 @@ if (String(outJSONLocation).toLowerCase().endsWith('.pmp')) {
   console.log(
     `✅ ${outJSONLocation.split(path.sep).pop()} written with`,
     Object.keys(emitResult.blocks).length,
-    "blocks."
+    "blocks.",
   );
 }
