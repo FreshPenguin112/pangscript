@@ -443,6 +443,16 @@ class AstBuilder extends PangVisitor {
     return ids;
   }
 
+  visitArrayLiteral(ctx) {
+    const exprs = ctx.expr ? (Array.isArray(ctx.expr()) ? ctx.expr() : [ctx.expr()]) : [];
+    const elements = [];
+    for (let i = 0; i < exprs.length; i++) {
+      const e = exprs[i];
+      if (e) elements.push(this.visit(e));
+    }
+    return { type: 'Array', elements };
+  }
+
   visitClassDecl(ctx) {
     // class IDENT ( 'extends' IDENT )? '{' classMember* '}'
     const idNodes = ctx.IDENT ? ctx.IDENT() : [];
@@ -804,6 +814,7 @@ class AstBuilder extends PangVisitor {
       return { type: "Lambda", params: [], body };
     }
     if (ctx.arrowFunction && ctx.arrowFunction()) return this.visit(ctx.arrowFunction());
+    if (ctx.arrayLiteral && ctx.arrayLiteral()) return this.visit(ctx.arrayLiteral());
     if (ctx.functionCall && ctx.functionCall()) return this.visit(ctx.functionCall());
     // allow member expressions (e.g., this.x or obj.prop) as primary expressions
     if (ctx.memberExpr && ctx.memberExpr()) {
@@ -1313,6 +1324,12 @@ if (!nestedInput) {
       return { opcode: "jwLambda_newLambda", inputs: [lambdaArg, lambdaBody] };
     }
     if (expr.type === "Literal") return expr.value;
+    if (expr.type === "Array") {
+      // Convert array AST to a plain JS array of nested inputs so the generator
+      // treats it as a RawArray/substack-like input.
+      const els = Array.isArray(expr.elements) ? expr.elements : [];
+      return els.map((e) => (e ? exprToNested(e, inMethod, paramMap) : ""));
+    }
     if (expr.type === "Var") {
       // If this variable name shadows a param in current paramMap, emit the tagged name
       if (paramMap && expr.name && Object.prototype.hasOwnProperty.call(paramMap, expr.name))
@@ -1767,6 +1784,42 @@ if (!nestedInput) {
     }
     if (expr.type === "Call") {
       const name = expr.name;
+      // Map convenient function names to jwArray opcodes so source can use
+      // push/append/get/length/set/concat/join/sum as regular calls.
+      if (name === "push" || name === "append") {
+        const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const valArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+        return { opcode: "jwArray_append", inputs: [valArg, arrArg] };
+      }
+      if (name === "length") {
+        const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        return { opcode: "jwArray_length", inputs: [arrArg] };
+      }
+      if (name === "get") {
+        const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const idxArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+        return { opcode: "jwArray_get", inputs: [idxArg, arrArg] };
+      }
+      if (name === "set") {
+        const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const idxArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+        const valArg = expr.args && expr.args[2] ? exprToNested(expr.args[2], inMethod, paramMap) : "";
+        return { opcode: "jwArray_set", inputs: [idxArg, arrArg, valArg] };
+      }
+      if (name === "concat") {
+        const a1 = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const a2 = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+        return { opcode: "jwArray_concat", inputs: [a1, a2] };
+      }
+      if (name === "join") {
+        const a1 = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const div = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+        return { opcode: "jwArray_join", inputs: [a1, div] };
+      }
+      if (name === "sum") {
+        const a1 = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        return { opcode: "jwArray_sum", inputs: [a1] };
+      }
       // Lookup block metadata to learn param ordering and shape
       const meta = blocksMeta[name] || blocksMeta[name.replace(/^operator_/, "operator_")] || null;
       const params = meta ? meta[0] : null;

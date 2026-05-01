@@ -389,6 +389,116 @@ Object.assign(module.exports.processedBlocks, {
         { name: 'LAMBDA', type: 1 }
     ], 'reporter']
 });
+// jwArray extension blocks metadata
+Object.assign(module.exports.processedBlocks, {
+    jwArray_blank: [[
+    ], 'reporter'],
+    jwArray_blankLength: [[
+        { name: 'LENGTH', type: 'number' }
+    ], 'reporter'],
+    jwArray_fromList: [[
+        { name: 'LIST', type: 1 }
+    ], 'reporter'],
+    jwArray_parse: [[
+        { name: 'INPUT', type: 1 }
+    ], 'reporter'],
+    jwArray_split: [[
+        { name: 'STRING', type: 1 },
+        { name: 'DIVIDER', type: 1 }
+    ], 'reporter'],
+    jwArray_builder: [[
+        { name: 'SHADOW', type: 1 },
+        { name: 'SUBSTACK', type: 'substack' }
+    ], 'reporter_with_substack'],
+    jwArray_builderCurrent: [[
+    ], 'reporter'],
+    jwArray_builderAppend: [[
+        { name: 'VALUE', type: 1 }
+    ], 'stack'],
+    jwArray_builderSet: [[
+        { name: 'ARRAY', type: 1 }
+    ], 'stack'],
+    jwArray_get: [[
+        { name: 'INDEX', type: 'number' },
+        { name: 'ARRAY', type: 1 }
+    ], 'reporter'],
+    jwArray_items: [[
+        { name: 'X', type: 'number' },
+        { name: 'Y', type: 'number' },
+        { name: 'ARRAY', type: 1 }
+    ], 'reporter'],
+    jwArray_index: [[
+        { name: 'VALUE', type: 1 },
+        { name: 'ARRAY', type: 1 }
+    ], 'reporter'],
+    jwArray_has: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], 'reporter'],
+    jwArray_length: [[
+        { name: 'ARRAY', type: 1 }
+    ], 'reporter'],
+    jwArray_set: [[
+        { name: 'INDEX', type: 'number' },
+        { name: 'ARRAY', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], 'reporter'],
+    jwArray_append: [[
+        { name: 'VALUE', type: 1 },
+        { name: 'ARRAY', type: 1 }
+    ], 'reporter'],
+    jwArray_concat: [[
+        { name: 'ONE', type: 1 },
+        { name: 'TWO', type: 1 }
+    ], 'reporter'],
+    jwArray_fill: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'VALUE', type: 1 }
+    ], 'reporter'],
+    jwArray_reverse: [[
+        { name: 'ARRAY', type: 1 }
+    ], 'reporter'],
+    jwArray_splice: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'INDEX', type: 'number' },
+        { name: 'ITEMS', type: 'number' }
+    ], 'reporter'],
+    jwArray_repeat: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'TIMES', type: 'number' }
+    ], 'reporter'],
+    jwArray_flat: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'DEPTH', type: 'number' }
+    ], 'reporter'],
+    jwArray_toString: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'FORMAT', type: 1 }
+    ], 'reporter'],
+    jwArray_join: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'DIVIDER', type: 1 }
+    ], 'reporter'],
+    jwArray_sum: [[
+        { name: 'ARRAY', type: 1 }
+    ], 'reporter'],
+    jwArray_forEachI: [[
+    ], 'reporter'],
+    jwArray_forEachV: [[
+    ], 'reporter'],
+    jwArray_forEach: [[
+        { name: 'I', type: 1 },
+        { name: 'V', type: 1 },
+        { name: 'ARRAY', type: 1 },
+        { name: 'SUBSTACK', type: 'substack' }
+    ], 'branch'],
+    jwArray_basicSort: [[
+        { name: 'ARRAY', type: 1 },
+        { name: 'I', type: 1 },
+        { name: 'V', type: 1 },
+        { name: 'VALUE', type: 'number' }
+    ], 'reporter']
+});
 Object.assign(module.exports.processedBlocks, {
     procedures_return: [[
         { name: 'return', type: 1 }

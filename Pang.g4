@@ -128,7 +128,12 @@ primary
     | printCall
     | functionCall
     | memberExpr
+    | arrayLiteral
     | '(' expr ')'
+    ;
+
+arrayLiteral
+    : '[' (expr (',' expr)*)? ','? ']'
     ;
 // have to use options_ since options is a reserved word in ANTLR
 // options_ accepts a simple JSON-like object with string keys (quoted or unquoted)
