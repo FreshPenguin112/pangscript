@@ -672,7 +672,19 @@ class AstBuilder extends PangVisitor {
         operators.push(n.children[1].getText());
         helper(n.expr(1));
       } else {
+        // no-op: keep helper focused on atomic node handling
         // atomic node: handle primary/function/print/ident/number/string specially
+        // If the node is a raw terminal containing a numeric string (e.g., '-2'),
+        // treat it as a numeric literal. Some lexer shapes produce a single
+        // terminal token for negative numbers in certain contexts.
+        if (n && n.getText && typeof n.getText === 'function') {
+          const txt = n.getText();
+          if (/^-?\d+(?:\.\d+)?$/.test(txt)) {
+            operands.push({ type: "Literal", litType: "number", value: Number(txt) });
+            return;
+          }
+        }
+
         if (typeof n.primary === "function" && n.primary()) {
           operands.push(self.visit(n.primary()));
           return;
@@ -704,7 +716,7 @@ class AstBuilder extends PangVisitor {
           return;
         }
         //console.log(n)
-        if (n.THIS) {
+        if (n.THIS && typeof n.THIS === "function" && n.THIS()) {
           operands.push({ type: "This" });
           return;
         }
@@ -770,6 +782,7 @@ class AstBuilder extends PangVisitor {
       }
     }
 
+    
     return values[0] || null;
   }
   visitPrimary(ctx) {
@@ -1268,6 +1281,12 @@ if (!nestedInput) {
   }
   collectVarAssignments(ast);
 
+  // When emitting class method bodies we set this to the current class
+  // name so `this` receiver lookups can be resolved to the proper
+  // `classRegistry` entry (ensures `this.add(...)` uses the same
+  // tagged param names as external calls like `num.add(...)`).
+  let emittingClass = null;
+
   // Convert AST to nested JSON form (canonical representation generator expects)
   function exprToNested(expr, inMethod = false, paramMap = null) {
     if (!expr) return "";
@@ -1443,12 +1462,10 @@ if (!nestedInput) {
           // base case: a string-based chain like ['obj','prop','method']
           const method = ch[ch.length - 1];
           const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
-          if (
-            receiverChain.length > 0 &&
-            typeof receiverChain[0] === "string" &&
-            varToClass[receiverChain[0]]
-          )
-            baseClassName = varToClass[receiverChain[0]];
+          if (receiverChain.length > 0 && typeof receiverChain[0] === "string") {
+            if (receiverChain[0] === "this" && emittingClass) baseClassName = emittingClass;
+            else if (varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
+          }
           steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
         helper(node);
@@ -1463,7 +1480,12 @@ if (!nestedInput) {
       if (steps.length <= 1) {
         // attempt to detect method params from varToClass/classRegistry
         let className = null;
-        if (typeof chain[0] === "string" && varToClass[chain[0]]) className = varToClass[chain[0]];
+        if (typeof chain[0] === "string") {
+          if (chain[0] === "this" && emittingClass) className = emittingClass;
+          else if (varToClass[chain[0]]) className = varToClass[chain[0]];
+        } else if (baseClassName) {
+          className = baseClassName;
+        }
         const methodParams =
           className &&
           classRegistry[className] &&
@@ -1500,7 +1522,20 @@ if (!nestedInput) {
         const argNested =
           expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
         if (argNested !== "") {
-          const argTempName = __pw_newArgTemp("value");
+          // Prefer a tagged param name when available so calls like
+          // `this.add(...)` reuse the same arg id as the method
+          // declaration. Fall back to a synthetic arg temp otherwise.
+          let argTempName = null;
+          if (Array.isArray(methodParams) && methodParams.length > 0) argTempName = methodParams[0];
+          else if (
+            className &&
+            classRegistry[className] &&
+            classRegistry[className].methods &&
+            Array.isArray(classRegistry[className].methods[methodName]) &&
+            classRegistry[className].methods[methodName].length > 0
+          )
+            argTempName = classRegistry[className].methods[methodName][0];
+          else argTempName = __pw_newArgTemp("value");
           const setters2 = [{ opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] }];
           const callMethod2 = { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
           const ret2 = { opcode: "procedures_return", inputs: [callMethod2] };
@@ -1549,10 +1584,11 @@ if (!nestedInput) {
           if (
             Array.isArray(step.receiverChain) &&
             step.receiverChain.length > 0 &&
-            typeof step.receiverChain[0] === "string" &&
-            varToClass[step.receiverChain[0]]
-          )
-            classNameForStep = varToClass[step.receiverChain[0]];
+            typeof step.receiverChain[0] === "string"
+          ) {
+            if (step.receiverChain[0] === "this" && emittingClass) classNameForStep = emittingClass;
+            else if (varToClass[step.receiverChain[0]]) classNameForStep = varToClass[step.receiverChain[0]];
+          }
         } else {
           classNameForStep = baseClassName;
         }
@@ -1999,16 +2035,11 @@ if (!nestedInput) {
       const methodName = chain[chain.length - 1];
       const methodGetter = { opcode: "jwClass_getProp", inputs: [methodName, objReceiver] };
 
-      // Try to detect class for receiver variable
-      let className = null;
-      if (typeof chain[0] === "string" && varToClass[chain[0]]) className = varToClass[chain[0]];
-      const methodParams =
-        className &&
-        classRegistry[className] &&
-        classRegistry[className].methods &&
-        classRegistry[className].methods[methodName]
-          ? classRegistry[className].methods[methodName]
-          : null;
+      // Class detection and method param lookup deferred until after
+      // the member-call flattening so we can consider `baseClassName` when
+      // the receiver is an expression rather than a simple identifier.
+      // DEBUG: inspect member-call class/param resolution
+      // console.error("DEBUG_MEMBERCALL_STMT", { chain, className, methodName, methodParams });
 
       // If this MemberCall represents a chain of calls (previous call ASTs embedded),
       // flatten it and emit a sequence of stack blocks that set temps for each
@@ -2029,12 +2060,10 @@ if (!nestedInput) {
           }
           const method = ch[ch.length - 1];
           const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
-          if (
-            receiverChain.length > 0 &&
-            typeof receiverChain[0] === "string" &&
-            varToClass[receiverChain[0]]
-          )
-            baseClassName = varToClass[receiverChain[0]];
+          if (receiverChain.length > 0 && typeof receiverChain[0] === "string") {
+            if (receiverChain[0] === "this" && emittingClass) baseClassName = emittingClass;
+            else if (varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
+          }
           steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
         helper(node);
@@ -2044,6 +2073,25 @@ if (!nestedInput) {
       const flat = flattenMemberCallStmt(stmt);
       const steps = flat.steps || [];
       const baseClassName = flat.baseClassName || null;
+
+      // attempt to detect method params from varToClass/classRegistry
+      // Prefer `this` resolution via emittingClass, otherwise use
+      // varToClass or the flattened baseClassName when the receiver
+      // is an expression rather than a plain identifier.
+      let className = null;
+      if (typeof chain[0] === "string") {
+        if (chain[0] === "this" && emittingClass) className = emittingClass;
+        else if (varToClass[chain[0]]) className = varToClass[chain[0]];
+      } else if (baseClassName) {
+        className = baseClassName;
+      }
+      const methodParams =
+        className &&
+        classRegistry[className] &&
+        classRegistry[className].methods &&
+        classRegistry[className].methods[methodName]
+          ? classRegistry[className].methods[methodName]
+          : null;
 
       // If we have a true chain (more than one step), emit stack-level temps
       if (steps.length > 1) {
@@ -2306,7 +2354,19 @@ if (!nestedInput) {
       const argNested =
         stmt.args && stmt.args.length > 0 ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
       if (argNested !== "") {
-        const argTempName = __pw_newArgTemp("value");
+        // Prefer tagged param name when available so internal class
+        // calls reuse the same thread-var id as the method declaration.
+        let argTempName = null;
+        if (Array.isArray(methodParams) && methodParams.length > 0) argTempName = methodParams[0];
+        else if (
+          className &&
+          classRegistry[className] &&
+          classRegistry[className].methods &&
+          Array.isArray(classRegistry[className].methods[methodName]) &&
+          classRegistry[className].methods[methodName].length > 0
+        )
+          argTempName = classRegistry[className].methods[methodName][0];
+        else argTempName = __pw_newArgTemp("value");
         const setter = { opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] };
         const call = { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
         return [].concat([setter], [call]);
@@ -2456,6 +2516,9 @@ if (!nestedInput) {
       const className = stmt.name;
       // build substack array: each method becomes a jwClass_setProp block
       const substackBlocks = [];
+      // set emittingClass for the duration of emitting this class's members
+      const _prevEmittingClass = emittingClass;
+      emittingClass = className;
       for (const m of stmt.members || []) {
         // If the member is a normal method declaration (visitClassMember),
         // `m` will be a Method node with `name`, `params`, and `body`.
@@ -2564,6 +2627,9 @@ if (!nestedInput) {
 
         // Other member shapes can be ignored or handled in future (e.g., declarations).
       }
+      // restore previous emittingClass context
+      emittingClass = _prevEmittingClass;
+
       const classBlock = {
         opcode: "jwClass_class",
         inputs: [

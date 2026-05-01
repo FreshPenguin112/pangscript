@@ -3,6 +3,7 @@ on("flag", *{
         constructor(num) {
             this.num = num;
             this.add(1);
+            print(-2 >>> 1);
         }
         add(value) {
             this.num = this.num + value;
