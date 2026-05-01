@@ -1,0 +1,28 @@
+on("flag", *{
+    // Array literal basics
+    let a = [1, 2, 3];
+    print(length(a), {seconds: 1});
+    print(get(a, 0), {seconds: 2});
+
+    // push/append modifies the array
+    push(a, 4);
+    //print(length(a), {seconds: 1});
+
+    // concat + join
+    let b = [5, 6];
+    let c = concat(a, b);
+    print(join(c, ", "), {seconds: 3});
+
+    // set/get
+    //set(a, 1, 99);
+    print(get(a, 1), {seconds: 4});
+
+    /*// sum on a literal
+    print(sum([1, 2, 3, 4]), {seconds: 1});
+
+    // nested arrays, trailing commas, and empty arrays
+    let nested = [[1, 2], [3, 4,],];
+    print(length(nested), {seconds: 1});*/
+    //let empty = [];
+    //print(length(empty), {seconds: 5});
+});
