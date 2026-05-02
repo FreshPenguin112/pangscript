@@ -1,5 +1,7 @@
 on("flag", *{
     // Array literal basics
+    let test = [() => {return () => {return 5}}];
+    print(get(test, 0)()());
     let a = [1, 2, 3];
     print(length(a), {seconds: 1});
     print(get(a, 0), {seconds: 2});
@@ -17,12 +19,12 @@ on("flag", *{
     //set(a, 1, 99);
     print(get(a, 1), {seconds: 4});
 
-    /*// sum on a literal
+    // sum on a literal
     print(sum([1, 2, 3, 4]), {seconds: 1});
 
     // nested arrays, trailing commas, and empty arrays
     let nested = [[1, 2], [3, 4,],];
-    print(length(nested), {seconds: 1});*/
+    print(length(nested), {seconds: 1});
     //let empty = [];
     //print(length(empty), {seconds: 5});
 });
