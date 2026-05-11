@@ -117,7 +117,14 @@ function getTaggedArgName(scopeKey, origName) {
 function __pw_newTemp(prefix = "temp") {
   __pw_temp_counter += 1;
   const clean = String(prefix).replace(/^_+/, "");
-  return `__${genRandomUid()}_${clean}${__pw_temp_counter}`;
+  const name = `__${genRandomUid()}_${clean}${__pw_temp_counter}`;
+  try {
+    // record a placeholder origin for this temp in the global map so
+    // local origin-resolution helpers can consult it as a fallback.
+    if (typeof globalTempOriginMap === "undefined") globalTempOriginMap = Object.create(null);
+    globalTempOriginMap[name] = globalTempOriginMap[name] || null;
+  } catch (e) {}
+  return name;
 }
 
 // If a scopeKey is provided, reuse a UID for that key so the generated
@@ -968,9 +975,6 @@ if (!nestedInput) {
     ast = parseWithAntlr(cleaned);
     //console.log('AST built (ANTLR)');
     //console.error("DEBUG_AST:\n" + JSON.stringify(ast, null, 2));
-    try {
-      fs.writeFileSync("/tmp/pang_ast_debug.json", JSON.stringify(ast, null, 2), "utf8");
-    } catch (e) {}
     // Normalize odd array-shaped nodes that sometimes appear from the
     // ANTLR visitor (e.g., [null, expr] representing a return). This
     // ensures downstream passes see a consistent AST shape.
@@ -1015,9 +1019,6 @@ if (!nestedInput) {
     }
     try {
       normalizeAstArrays(ast);
-      try {
-        fs.writeFileSync("/tmp/pang_ast_debug_normalized.json", JSON.stringify(ast, null, 2), "utf8");
-      } catch (e) {}
     } catch (e) {
       // non-fatal; continue with original ast
     }
@@ -1211,14 +1212,72 @@ if (!nestedInput) {
             p ? __pw_newArgTemp(p, `class:${name}:${m.name}:param:${i}:${p}`) : p,
           );
           classRegistry[name].methods[m.name] = tagged;
-          // Detect if this method returns a lambda at the top level of its body
+          // Detect if this method returns a lambda at the top level of its body.
+          // Prefer discovering the first inner returned lambda that actually
+          // declares parameters (e.g., method returns a lambda which returns
+          // another lambda that declares args). This lets call-sites set the
+          // correct thread-var names for those params.
           let retLambdaParams = null;
+          function detectLambdaNodeInStmt(st) {
+            if (!st) return null;
+            // pattern: [null, expr]
+            if (Array.isArray(st) && st.length > 1) {
+              const expr = st[1];
+              if (expr && expr.type === "Lambda") return expr;
+            }
+            // explicit return: Return { value: { type: 'Lambda' } }
+            if (st && st.type === "Return" && st.value && st.value.type === "Lambda") {
+              return st.value;
+            }
+            // nested forms: Return with array value [null, Lambda]
+            if (st && st.type === "Return" && Array.isArray(st.value) && st.value.length > 1) {
+              const expr = st.value[1];
+              if (expr && expr.type === "Lambda") return expr;
+            }
+            return null;
+          }
+
+          function findFirstInnerLambdaWithParams(lambdaNode) {
+            if (!lambdaNode) return null;
+            // If this lambda itself has params, prefer those.
+            if (Array.isArray(lambdaNode.params) && lambdaNode.params.length > 0) return lambdaNode.params.slice();
+            // Otherwise descend into returned-lambda chain to find the first inner
+            // lambda that declares params.
+            let cur = lambdaNode;
+            while (cur && cur.body && Array.isArray(cur.body.body)) {
+              let next = null;
+              for (const st of cur.body.body) {
+                if (!st) continue;
+                if (Array.isArray(st) && st.length > 1 && st[1] && st[1].type === "Lambda") {
+                  next = st[1];
+                  break;
+                }
+                if (st.type === "Return") {
+                  if (st.value && st.value.type === "Lambda") {
+                    next = st.value;
+                    break;
+                  }
+                  if (Array.isArray(st.value) && st.value.length > 1 && st.value[1] && st.value[1].type === "Lambda") {
+                    next = st.value[1];
+                    break;
+                  }
+                }
+              }
+              if (!next) break;
+              if (Array.isArray(next.params) && next.params.length > 0) return next.params.slice();
+              cur = next;
+            }
+            // No inner lambda with params found; return the immediate lambda's params (may be []/null)
+            return Array.isArray(lambdaNode.params) ? lambdaNode.params.slice() : lambdaNode.params ? [lambdaNode.params] : [];
+          }
+
           if (m && m.body && Array.isArray(m.body.body)) {
             for (const st of m.body.body) {
-              if (st && st.type === "Return" && st.value && st.value.type === "Lambda") {
-                const lp = st.value.params;
-                if (Array.isArray(lp)) retLambdaParams = lp.slice();
-                else if (lp) retLambdaParams = [lp];
+              const node = detectLambdaNodeInStmt(st);
+              if (node != null) {
+                const found = findFirstInnerLambdaWithParams(node);
+                if (found != null) retLambdaParams = found.slice();
+                else retLambdaParams = [];
                 break;
               }
             }
@@ -1243,7 +1302,15 @@ if (!nestedInput) {
     }
     walk(root);
   }
-  collectClasses(ast);
+    collectClasses(ast);
+    // debug: print classRegistry for inspection when running locally
+    try {
+      // only print small summary
+      const cr = {};
+      for (const k of Object.keys(classRegistry || {})) {
+        cr[k] = { methods: Object.keys(classRegistry[k].methods || {}), methodReturns: classRegistry[k].methodReturns };
+      }
+    } catch (e) {}
   // Map local variables that are assigned `new ClassName(...)` so we can
   // later identify the class of a receiver variable when emitting method calls.
   const varToClass = {};
@@ -1260,15 +1327,39 @@ if (!nestedInput) {
           varToClass[node.name] = callee.name;
         }
       }
-      // Track variables initialized to lambda expressions so we know their arg names
+      // Track variables initialized to lambda expressions or to arrays
+      // whose first element is a lambda. Store a structured record so
+      // callers can obtain original param order, tagged names, and a map.
+      function makeLambdaMeta(origParams, name, hint) {
+        if (!origParams) return { orig: [], tagged: [], map: {} };
+        const orig = Array.isArray(origParams) ? origParams.slice() : [origParams];
+        const tagged = [];
+        const map = {};
+        for (let i = 0; i < orig.length; i++) {
+          const p = orig[i];
+          const tag = p ? __pw_newArgTemp(p, `var:${name}:${hint}:param:${i}:${p}`) : p;
+          tagged.push(tag);
+          if (p) map[p] = tag;
+        }
+        return { orig, tagged, map };
+      }
       if (node.type === "Declare" && node.value && node.value.type === "Lambda") {
-        const lp = node.value.params;
-        if (Array.isArray(lp))
-          varToLambda[node.name] = lp.map((p, i) =>
-            p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p,
-          );
-        else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];
-        else varToLambda[node.name] = [];
+        varToLambda[node.name] = makeLambdaMeta(node.value.params, node.name, "param");
+      }
+      if (node.type === "Assign" && node.value && node.value.type === "Lambda") {
+        varToLambda[node.name] = makeLambdaMeta(node.value.params, node.name, "param");
+      }
+      if (node.type === "Declare" && node.value && node.value.type === "Array") {
+        const els = node.value.elements || [];
+        if (els.length > 0 && els[0] && els[0].type === "Lambda") {
+          varToLambda[node.name] = makeLambdaMeta(els[0].params, node.name, "element");
+        }
+      }
+      if (node.type === "Assign" && node.value && node.value.type === "Array") {
+        const els = node.value.elements || [];
+        if (els.length > 0 && els[0] && els[0].type === "Lambda") {
+          varToLambda[node.name] = makeLambdaMeta(els[0].params, node.name, "element");
+        }
       }
       if (node.type === "Assign" && node.value && node.value.type === "New") {
         const callee = node.value.callee;
@@ -1276,15 +1367,7 @@ if (!nestedInput) {
           varToClass[node.name] = callee.name;
         }
       }
-      if (node.type === "Assign" && node.value && node.value.type === "Lambda") {
-        const lp = node.value.params;
-        if (Array.isArray(lp))
-          varToLambda[node.name] = lp.map((p, i) =>
-            p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p,
-          );
-        else if (lp) varToLambda[node.name] = [__pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`)];
-        else varToLambda[node.name] = [];
-      }
+      
       if (node.type === "Block" && Array.isArray(node.body)) return walk(node.body);
       if (node.type === "On" && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
       if (node.body && Array.isArray(node.body)) return walk(node.body);
@@ -1310,19 +1393,513 @@ if (!nestedInput) {
     return { opcode: "operator_add", inputs: [idxNested, 1] };
   }
 
+  
+
+  // Prefer storing the raw getter or temp-ref when possible instead of
+  // pre-executing with `jwLambda_executeR`. This avoids producing
+  // the two-step pattern (pre-execute then re-execute) at emit time.
+  function makeSetForCallReporter(scope, tempName, callReporter) {
+    if (!callReporter || callReporter.opcode !== "jwLambda_executeR" || !Array.isArray(callReporter.inputs))
+      return { opcode: "SPtempVars_setVar", inputs: [scope, tempName, callReporter] };
+    const target = callReporter.inputs[0];
+    if (target && target.opcode === "jwClass_getProp" && Array.isArray(target.inputs)) {
+      const sn = { opcode: "SPtempVars_setVar", inputs: [scope, tempName, target] };
+      sn.__origin = { type: "boundGetProp", method: target.inputs[0], receiver: target.inputs[1] };
+      return sn;
+    }
+    if (target && target.opcode === "SPtempVars_getVar" && Array.isArray(target.inputs)) {
+      const sn = { opcode: "SPtempVars_setVar", inputs: [scope, tempName, target] };
+      sn.__origin = { type: "boundTempRef", referenced: target.inputs[1] };
+      return sn;
+    }
+    // Handle array-get targets (emit raw array-get instead of pre-executing)
+    if (target && target.opcode === "jwArray_get" && Array.isArray(target.inputs)) {
+      const sn = { opcode: "SPtempVars_setVar", inputs: [scope, tempName, target] };
+      sn.__origin = { type: "boundArrayGet", arr: target.inputs[0], index: target.inputs[1] };
+      return sn;
+    }
+    // Handle inline-stack reporters as direct values (avoid pre-execution)
+    if (target && target.opcode === "control_inline_stack_output" && Array.isArray(target.inputs)) {
+      const sn = { opcode: "SPtempVars_setVar", inputs: [scope, tempName, target] };
+      sn.__origin = { type: "boundInline" };
+      return sn;
+    }
+    try {
+      console.error("DEBUG makeSetForCallReporter: fallback storing callReporter for", tempName, JSON.stringify(callReporter && callReporter.inputs && callReporter.inputs[0] ? callReporter.inputs[0] : callReporter));
+    } catch (e) {}
+    return { opcode: "SPtempVars_setVar", inputs: [scope, tempName, callReporter] };
+  }
+
+  // Normalize inline child sets that accidentally store a jwLambda_executeR
+  // directly. This transforms them (when possible) into storing the raw
+  // getter or temp-ref using makeSetForCallReporter so we don't emit
+  // pre-executed call results and later re-execute them.
+  function normalizeInlineSetCallReporters(inlineChildren) {
+    if (!Array.isArray(inlineChildren)) return;
+    // First pass: record indices of direct execute stores (potential pre-execs)
+    const execStores = Object.create(null); // tempName -> index
+    for (let i = 0; i < inlineChildren.length; i++) {
+      const node = inlineChildren[i];
+      if (!node || node.opcode !== "SPtempVars_setVar" || !Array.isArray(node.inputs)) continue;
+      const val = node.inputs[2];
+      if (!val || val.opcode !== "jwLambda_executeR" || !Array.isArray(val.inputs)) continue;
+      execStores[node.inputs[1]] = i;
+    }
+    // Second pass: find re-exec patterns that reference an earlier temp and
+    // only normalize the _earlier_ store. This avoids stripping execute
+    // reporters that are meant to run now while fixing the pre-exec case.
+    for (let j = 0; j < inlineChildren.length; j++) {
+      const node = inlineChildren[j];
+      if (!node || !Array.isArray(node.inputs)) continue;
+      const val = node.inputs[2];
+      if (!val || val.opcode !== "jwLambda_executeR" || !Array.isArray(val.inputs)) continue;
+      const arg0 = val.inputs[0];
+      if (arg0 && arg0.opcode === "SPtempVars_getVar" && Array.isArray(arg0.inputs)) {
+        const referenced = arg0.inputs[1];
+        const earlierIdx = execStores[referenced];
+        if (earlierIdx !== undefined && earlierIdx < j) {
+          const preNode = inlineChildren[earlierIdx];
+          const scope = preNode.inputs[0] || "thread";
+          const tempName = preNode.inputs[1];
+          try {
+            inlineChildren[earlierIdx] = makeSetForCallReporter(scope, tempName, preNode.inputs[2]);
+          } catch (e) {}
+        }
+      }
+    }
+  }
+
+  // Flatten nested control_inline_stack_output wrappers into a single
+  // inline-child sequence. When an outer SPtempVars_setVar stores a
+  // control_inline_stack_output, splice that inner sequence into the
+  // parent and replace inner `procedures_return` nodes with a
+  // `SPtempVars_setVar` that writes into the outer temp. This produces
+  // one big wrapper that continuously writes to temps rather than
+  // nesting sub-wrappers with early returns.
+  function flattenInlineWrappers(inlineChildren, wrapperTemp) {
+    if (!Array.isArray(inlineChildren)) return inlineChildren;
+    // Choose wrapper temp: prefer the first temp assigned in the sequence
+    let chosenWrapper = wrapperTemp;
+    if (!chosenWrapper) {
+      for (const n of inlineChildren) {
+        if (n && n.opcode === "SPtempVars_setVar" && Array.isArray(n.inputs) && typeof n.inputs[1] === "string") {
+          chosenWrapper = n.inputs[1];
+          break;
+        }
+      }
+    }
+    if (!chosenWrapper) {
+      chosenWrapper = __pw_newTemp("__c");
+      try {
+        if (typeof globalTempOriginMap !== "undefined") globalTempOriginMap[chosenWrapper] = globalTempOriginMap[chosenWrapper] || null;
+      } catch (e) {}
+    }
+
+    const out = [];
+    // Pre-scan inlineChildren to detect trivial temp-copy assignments
+    // that simply copy a named variable into a temp but are only used
+    // once (or not at all). We'll remove those sets and replace uses
+    // of the temp with a direct `SPtempVars_getVar` of the original
+    // variable to avoid emitting needless `set` blocks.
+    const lastSetIndex = {};
+    const usageIndices = {};
+    function collectGetVarUsages(node, idx) {
+      if (!node || typeof node !== "object") return;
+      if (node.opcode === "SPtempVars_getVar" && Array.isArray(node.inputs)) {
+        const tn = node.inputs[1];
+        usageIndices[tn] = usageIndices[tn] || [];
+        usageIndices[tn].push(idx);
+        return;
+      }
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (Array.isArray(v)) for (const el of v) collectGetVarUsages(el, idx);
+        else if (typeof v === "object" && v !== null) collectGetVarUsages(v, idx);
+      }
+    }
+    for (let i = 0; i < inlineChildren.length; i++) {
+      const n = inlineChildren[i];
+      if (!n) continue;
+      if (n.opcode === "SPtempVars_setVar" && Array.isArray(n.inputs)) {
+        const tn = n.inputs[1];
+        lastSetIndex[tn] = i;
+      }
+      collectGetVarUsages(n, i);
+    }
+    const candidateRemap = {}; // temp -> { replacement, origin }
+    const removableSetIndices = new Set();
+    for (let i = 0; i < inlineChildren.length; i++) {
+      const n = inlineChildren[i];
+      if (!n || n.opcode !== "SPtempVars_setVar" || !Array.isArray(n.inputs)) continue;
+      const tempName = n.inputs[1];
+      const val = n.inputs[2];
+      // consider simple var-copy: either a direct Var node or a SPtempVars_getVar
+      if (val && typeof val === "object" && (val.type === "Var" || (val.opcode === "SPtempVars_getVar" && Array.isArray(val.inputs)))) {
+        // only consider removable if this is the last assignment to the temp
+        if (lastSetIndex[tempName] !== i) continue;
+        let varName = null;
+        let destType = "global";
+        if (val.type === "Var") {
+          varName = val.name;
+          destType = typeof varName === "string" && varName.startsWith("__") ? "thread" : "global";
+        } else if (val.opcode === "SPtempVars_getVar") {
+          destType = val.inputs[0] || "global";
+          varName = val.inputs[1];
+        }
+        if (typeof varName === "string" && varName.length > 0) {
+          candidateRemap[tempName] = { replacement: { opcode: "SPtempVars_getVar", inputs: [destType, varName] }, origin: n.__origin };
+          removableSetIndices.add(i);
+        }
+      }
+    }
+
+    // Helper: recursively replace SPtempVars_getVar references to remapped temps
+    function replaceRemapped(node) {
+      if (node === undefined || node === null) return node;
+      if (Array.isArray(node)) return node.map(replaceRemapped);
+      if (typeof node !== "object") return node;
+      if (node.opcode === "SPtempVars_getVar" && Array.isArray(node.inputs)) {
+        const tn = node.inputs[1];
+        if (candidateRemap[tn]) {
+          const rep = candidateRemap[tn].replacement;
+          // attach origin metadata to the replacement if available
+          if (candidateRemap[tn].origin) rep.__origin = candidateRemap[tn].origin;
+          return rep;
+        }
+        return { opcode: "SPtempVars_getVar", inputs: [node.inputs[0], tn] };
+      }
+      const outNode = {};
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (Array.isArray(v)) outNode[k] = v.map(replaceRemapped);
+        else if (typeof v === "object" && v !== null) outNode[k] = replaceRemapped(v);
+        else outNode[k] = v;
+      }
+      return outNode;
+    }
+
+    // small helper for stable fingerprinting after replacement
+    function safeFingerprint(obj) {
+      try {
+        return JSON.stringify(obj === undefined ? null : obj);
+      } catch (e) {
+        return String(obj);
+      }
+    }
+
+    let lastWrapperFingerprint = null;
+    function pushWrapperIfChanged(scope, expr, origin) {
+      const replaced = replaceRemapped(expr);
+      const fp = safeFingerprint(replaced);
+      if (fp === lastWrapperFingerprint) return;
+      lastWrapperFingerprint = fp;
+      const setNode = { opcode: "SPtempVars_setVar", inputs: [scope || "thread", chosenWrapper, replaced] };
+      if (origin) setNode.__origin = origin;
+      out.push(setNode);
+    }
+
+    // Only update wrapper on explicit `procedures_return` or when a node
+    // assigns directly to the chosen wrapper. This avoids redundant
+    // intermediary writes for simple temp shuffling.
+    for (let i = 0; i < inlineChildren.length; i++) {
+      const node = inlineChildren[i];
+      if (!node) continue;
+
+      // Skip trivial removable sets that only copy a named var into a temp
+      if (removableSetIndices.has(i)) {
+        // we intentionally drop this set; its uses will be replaced
+        continue;
+      }
+
+      // Splice inner inline-set wrapper sequences
+      if (node.opcode === "SPtempVars_setVar" && Array.isArray(node.inputs)) {
+        const scope = node.inputs[0] || "thread";
+        const tempName = node.inputs[1];
+        const val = node.inputs[2];
+        if (val && val.opcode === "control_inline_stack_output" && Array.isArray(val.inputs) && Array.isArray(val.inputs[0])) {
+          const inner = val.inputs[0];
+          const flatInner = flattenInlineWrappers(inner, chosenWrapper);
+          for (const inNode of flatInner) {
+            if (!inNode) continue;
+            if (inNode.opcode === "procedures_return") {
+              const retVal = Array.isArray(inNode.inputs) ? inNode.inputs[0] : undefined;
+              // Preserve original temp assignment only if not removable; otherwise skip
+              if (!removableSetIndices.has(i)) {
+                const setNode = { opcode: "SPtempVars_setVar", inputs: [scope, tempName, replaceRemapped(retVal)] };
+                if (node.__origin) setNode.__origin = node.__origin;
+                out.push(setNode);
+              }
+              // Update wrapper once to reference this temp's value but replace remapped temps
+              const refExpr = replaceRemapped({ opcode: "SPtempVars_getVar", inputs: ["thread", tempName] });
+              const origin = (retVal && retVal.__origin) || node.__origin || undefined;
+              pushWrapperIfChanged(scope, refExpr, origin);
+            } else {
+              out.push(replaceRemapped(inNode));
+            }
+          }
+          continue;
+        }
+      }
+
+      // Inline bare inline wrappers
+      if (node.opcode === "control_inline_stack_output" && Array.isArray(node.inputs) && Array.isArray(node.inputs[0])) {
+        const flatInner = flattenInlineWrappers(node.inputs[0], chosenWrapper);
+        for (const inNode of flatInner) if (inNode) out.push(replaceRemapped(inNode));
+        continue;
+      }
+
+      // Convert returns into writing the wrapper only once per return
+      if (node.opcode === "procedures_return") {
+        const retVal = Array.isArray(node.inputs) ? node.inputs[0] : undefined;
+        const origin = (retVal && retVal.__origin) || undefined;
+        pushWrapperIfChanged("thread", replaceRemapped(retVal), origin);
+        continue;
+      }
+
+      // Default: keep node. Only if this node sets the chosen wrapper do
+      // we record that assignment (to avoid duplicating trivial moves).
+      // Apply remapping to any nested getter references within the node
+      // so copies of global getters are replaced with the original getter
+      // and not left as intermediate thread-temp copies.
+      out.push(replaceRemapped(node));
+      if (node.opcode === "SPtempVars_setVar" && Array.isArray(node.inputs)) {
+        const scope = node.inputs[0] || "thread";
+        const tempName = node.inputs[1];
+        const expr = node.inputs[2];
+        if (tempName === chosenWrapper) {
+          // explicit write to wrapper - keep as-is
+        }
+      }
+    }
+
+    // Final pass: canonicalize simple temp-copy chains in `out` so that
+    // thread temps that merely mirror a global var/getter are replaced
+    // by the original global getter. This collapse resolves chains like:
+    //   set t1 = SPtempVars_getVar global arr
+    //   set t2 = SPtempVars_getVar thread t1
+    //   return t2
+    // into a direct return of SPtempVars_getVar global arr.
+    try {
+      const defs = {}; // temp -> { idx, rhs, origin }
+      for (let i = 0; i < out.length; i++) {
+        const n = out[i];
+        if (!n || typeof n !== "object") continue;
+        if (n.opcode === "SPtempVars_setVar" && Array.isArray(n.inputs)) {
+          const tn = n.inputs[1];
+          defs[tn] = { idx: i, rhs: n.inputs[2], origin: n.__origin };
+        }
+      }
+      const memo = {};
+      function resolveToGlobal(temp, seen = new Set()) {
+        if (memo.hasOwnProperty(temp)) return memo[temp];
+        if (seen.has(temp)) return (memo[temp] = null);
+        seen.add(temp);
+        const def = defs[temp];
+        if (!def) return (memo[temp] = null);
+        const rhs = def.rhs;
+        if (!rhs) return (memo[temp] = null);
+        if (rhs.type === "Var") {
+          const vn = rhs.name;
+          const destType = typeof vn === "string" && vn.startsWith("__") ? "thread" : "global";
+          const res = { opcode: "SPtempVars_getVar", inputs: [destType, vn], __origin: def.origin || rhs.__origin || null };
+          return (memo[temp] = res);
+        }
+        if (rhs.opcode === "SPtempVars_getVar" && Array.isArray(rhs.inputs)) {
+          const scope = rhs.inputs[0] || "global";
+          const name = rhs.inputs[1];
+          if (scope === "global") {
+            const res = { opcode: "SPtempVars_getVar", inputs: [scope, name], __origin: def.origin || rhs.__origin || null };
+            return (memo[temp] = res);
+          }
+          if (scope === "thread") {
+            const inner = name;
+            const innerRes = resolveToGlobal(inner, seen);
+            if (innerRes) return (memo[temp] = innerRes);
+            return (memo[temp] = null);
+          }
+        }
+        return (memo[temp] = null);
+      }
+      const canonical = {};
+      for (const t of Object.keys(defs)) {
+        const c = resolveToGlobal(t);
+        if (c) canonical[t] = c;
+      }
+      if (Object.keys(canonical).length > 0) {
+        function replaceCanon(node) {
+          if (node === undefined || node === null) return node;
+          if (Array.isArray(node)) return node.map(replaceCanon);
+          if (typeof node !== "object") return node;
+          if (node.opcode === "SPtempVars_getVar" && Array.isArray(node.inputs)) {
+            const tn = node.inputs[1];
+            if (canonical[tn]) return canonical[tn];
+            return { opcode: "SPtempVars_getVar", inputs: [node.inputs[0], tn] };
+          }
+          const nn = {};
+          for (const k of Object.keys(node)) {
+            const v = node[k];
+            if (Array.isArray(v)) nn[k] = v.map(replaceCanon);
+            else if (typeof v === "object" && v !== null) nn[k] = replaceCanon(v);
+            else nn[k] = v;
+          }
+          if (node.opcode) nn.opcode = node.opcode;
+          return nn;
+        }
+        const newOut = [];
+        for (let i = 0; i < out.length; i++) {
+          const n = out[i];
+          if (n && n.opcode === "SPtempVars_setVar" && Array.isArray(n.inputs)) {
+            const tn = n.inputs[1];
+            if (canonical[tn]) continue;
+          }
+          newOut.push(replaceCanon(n));
+        }
+        out.length = 0;
+        for (const x of newOut) out.push(x);
+      }
+    } catch (e) {}
+
+    // Prefer returning the last *computed* temp (the most recent temp that
+    // was assigned from an execution/getter) rather than accidentally
+    // returning a trivial copy temp that may reference a global var like
+    // `arr`. Scan backwards for the last SPtempVars_setVar whose RHS is
+    // a function/array/class getter or an exec reporter; use that temp for
+    // the final return. Fall back to the chosenWrapper when none found.
+    try {
+      let lastComputedTemp = null;
+      const interestingOps = new Set([
+        "jwLambda_executeR",
+        "jwLambda_execute",
+        "jwArray_get",
+        "jwClass_getProp",
+        "jwArray_append",
+        "jwArray_set",
+        "jwClass_new",
+      ]);
+      for (let i = out.length - 1; i >= 0; i--) {
+        const n = out[i];
+        if (!n || n.opcode !== "SPtempVars_setVar" || !Array.isArray(n.inputs)) continue;
+        const rhs = n.inputs[2];
+        const origin = n.__origin || (rhs && rhs.__origin) || null;
+        if (
+          (rhs && typeof rhs === "object" && rhs.opcode && interestingOps.has(rhs.opcode)) ||
+          (origin && (origin.type === "execTempCall" || origin.type === "execGetProp" || origin.type === "boundArrayGet" || origin.type === "boundGetProp" || origin.type === "boundTempRef"))
+        ) {
+          lastComputedTemp = n.inputs[1];
+          break;
+        }
+      }
+      // Remove any existing procedures_return nodes — we'll append a single final return
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (out[i] && out[i].opcode === "procedures_return") out.splice(i, 1);
+      }
+      const returnTemp = lastComputedTemp || chosenWrapper;
+      // Attempt to canonicalize the return expression: if `returnTemp` was
+      // merely a thread-temp copy of a global getter/Var, return the
+      // original global getter instead of the thread temp.
+      function resolveReturnExpr(tempName) {
+        if (!tempName) return null;
+        // Find the set node that defines this temp
+        for (let i = out.length - 1; i >= 0; i--) {
+          const n = out[i];
+          if (!n || n.opcode !== "SPtempVars_setVar" || !Array.isArray(n.inputs)) continue;
+          if (n.inputs[1] === tempName) {
+            let rhs = n.inputs[2];
+            // unwind thread-temp chains: SPtempVars_getVar -> find its definition
+            let safety = 0;
+            while (rhs && rhs.opcode === "SPtempVars_getVar" && Array.isArray(rhs.inputs) && rhs.inputs[0] === "thread" && safety < 20) {
+              const innerTemp = rhs.inputs[1];
+              // find the set that created innerTemp
+              const def = out.find((m) => m && m.opcode === "SPtempVars_setVar" && Array.isArray(m.inputs) && m.inputs[1] === innerTemp);
+              if (!def) break;
+              rhs = def.inputs[2];
+              safety++;
+            }
+            if (!rhs) return null;
+            // If rhs is a simple Var node, convert to SPtempVars_getVar
+            if (rhs.type === "Var") {
+              const vn = rhs.name;
+              const destType = typeof vn === "string" && vn.startsWith("__") ? "thread" : "global";
+              return { opcode: "SPtempVars_getVar", inputs: [destType, vn] };
+            }
+            // If rhs is an SPtempVars_getVar of a global, return it directly
+            if (rhs.opcode === "SPtempVars_getVar" && Array.isArray(rhs.inputs) && rhs.inputs[0] === "global") {
+              return { opcode: "SPtempVars_getVar", inputs: [rhs.inputs[0], rhs.inputs[1]] };
+            }
+            // Otherwise fall back to returning the thread temp
+            break;
+          }
+        }
+        return null;
+      }
+
+      const canonical = resolveReturnExpr(returnTemp);
+      if (canonical) out.push({ opcode: "procedures_return", inputs: [canonical] });
+      else out.push({ opcode: "procedures_return", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", returnTemp] }] });
+    } catch (e) {
+      const hasReturn = out.some((n) => n && n.opcode === "procedures_return");
+      if (!hasReturn) out.push({ opcode: "procedures_return", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", chosenWrapper] }] });
+    }
+    return out;
+  }
+
+  // Helper to create an inline block while ensuring any accidental
+  // direct-store executeR nodes are normalized. Centralizing inline
+  // block creation here guarantees normalization is always applied
+  // at emit time (avoids post-emit rewrites).
+  function createInlineBlock(inlineChildren) {
+    if (!Array.isArray(inlineChildren)) return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
+    normalizeInlineSetCallReporters(inlineChildren);
+    const flat = flattenInlineWrappers(inlineChildren);
+    return { opcode: "control_inline_stack_output", inputs: [flat] };
+  }
+
+  // Recursively normalize any SPtempVars_setVar nodes across the entire
+  // nested tree that store a jwLambda_executeR reporter. This ensures
+  // all such stores are routed through makeSetForCallReporter so they
+  // become origin-tagged getters/temp-refs instead of pre-executed
+  // jwLambda_executeR reporters (eliminates double-exec emission).
+  function normalizeAllSetCallReporters(node) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      // Treat this array as a potential inline-child sequence and only
+      // perform the targeted normalization there. Then recurse into each
+      // item so nested arrays/objects are handled.
+      try {
+        normalizeInlineSetCallReporters(node);
+      } catch (e) {}
+      for (let i = 0; i < node.length; i++) normalizeAllSetCallReporters(node[i]);
+      return;
+    }
+    if (typeof node === "object" && node !== null) {
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (Array.isArray(v) || (typeof v === "object" && v !== null)) normalizeAllSetCallReporters(v);
+      }
+    }
+  }
+
   // Convert AST to nested JSON form (canonical representation generator expects)
-  function exprToNested(expr, inMethod = false, paramMap = null, opts = {}) {
-    const suppressExec = opts && opts.suppressExecution;
+  function exprToNested(expr, inMethod = false, paramMap = null) {
+    let prevTempOrigin = null;
+    const tempOriginMap = {};
     if (!expr) return "";
     // Lambda expressions (arrow functions) -> emit jwLambda_newLambda nested block
     if (expr.type === "Lambda") {
       lambdasUsed = true;
       const origParams = Array.isArray(expr.params) ? expr.params.slice() : expr.params ? [expr.params] : [];
-      // reuse provided paramMap (from class/var precollection) or allocate fresh tagged names
-      let localParamMap = paramMap || null;
-      if (!localParamMap) {
-        localParamMap = {};
-        for (const p of origParams) if (p) localParamMap[p] = __pw_newArgTemp(p);
+      // reuse provided paramMap (from class/var precollection) but ensure
+      // every declared param has a tagged name. Missing entries are
+      // synthesized so nested lambdas never reference plain global vars.
+      const localParamMap = {};
+      if (paramMap && typeof paramMap === "object") {
+        for (const k of Object.keys(paramMap)) localParamMap[k] = paramMap[k];
+      }
+      for (const p of origParams) {
+        if (!p) continue;
+        if (!Object.prototype.hasOwnProperty.call(localParamMap, p) || localParamMap[p] === undefined) {
+          localParamMap[p] = __pw_newArgTemp(p);
+        }
       }
       let lambdaArg;
       if (!origParams || origParams.length === 0)
@@ -1408,7 +1985,8 @@ if (!nestedInput) {
                 }
                 // replace the procedures_return value with property getter
                 inlineChildren[i] = { opcode: "procedures_return", inputs: [propGet] };
-                return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
+                normalizeInlineSetCallReporters(inlineChildren);
+                return createInlineBlock(inlineChildren);
               }
               // If return value is not a temp getter, fallback to wrapping the return value
               // with property getters by producing a new procedures_return that
@@ -1421,7 +1999,8 @@ if (!nestedInput) {
                 else propGetAlt = { opcode: "jwClass_getProp", inputs: [pname, propGetAlt] };
               }
               inlineChildren[i] = { opcode: "procedures_return", inputs: [propGetAlt] };
-              return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
+              normalizeInlineSetCallReporters(inlineChildren);
+              return createInlineBlock(inlineChildren);
             }
           }
         }
@@ -1534,6 +2113,13 @@ if (!nestedInput) {
           classRegistry[className].methods[methodName]
             ? classRegistry[className].methods[methodName]
             : null;
+        const returnsLambdaForMethod =
+          className &&
+          classRegistry[className] &&
+          classRegistry[className].methodReturns &&
+          classRegistry[className].methodReturns[methodName]
+            ? classRegistry[className].methodReturns[methodName]
+            : null;
         if (Array.isArray(methodParams) && methodParams.length > 0) {
           const setters = [];
           let receiverTempName = null;
@@ -1541,6 +2127,7 @@ if (!nestedInput) {
           const needTempForReceiver = !(objReceiver && objReceiver.opcode === "jwClass_self");
           if (needTempForReceiver) {
             receiverTempName = __pw_newTemp("__m");
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[receiverTempName] = tempOriginMap[receiverTempName] || null;
             const setTemp = {
               opcode: "SPtempVars_setVar",
               inputs: ["thread", receiverTempName, objReceiver],
@@ -1554,15 +2141,11 @@ if (!nestedInput) {
             setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
           }
           const boundMethodGetter = { opcode: "jwClass_getProp", inputs: [methodName, receiverRef] };
-          if (suppressExec) {
-            const ret = { opcode: "procedures_return", inputs: [boundMethodGetter] };
-            const inlineChildren = [].concat(setters, [ret]);
-            return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
-          }
           const callMethod = { opcode: "jwLambda_executeR", inputs: [boundMethodGetter, ""] };
-          const ret = { opcode: "procedures_return", inputs: [callMethod] };
+          const ret = { opcode: "procedures_return", inputs: [Array.isArray(returnsLambdaForMethod) && returnsLambdaForMethod.length > 0 ? boundMethodGetter : callMethod] };
           const inlineChildren = [].concat(setters, [ret]);
-          return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
+          normalizeInlineSetCallReporters(inlineChildren);
+          return createInlineBlock(inlineChildren);
         }
         // fallback: single-step — set thread var for positional arg then return result
         const argNested =
@@ -1583,18 +2166,13 @@ if (!nestedInput) {
             argTempName = classRegistry[className].methods[methodName][0];
           else argTempName = __pw_newArgTemp("value");
           const setters2 = [{ opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] }];
-          if (suppressExec) {
-            const ret2 = { opcode: "procedures_return", inputs: [methodGetter] };
-            const inlineChildren2 = [].concat(setters2, [ret2]);
-            return { opcode: "control_inline_stack_output", inputs: [inlineChildren2] };
-          }
           const callMethod2 = { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
-          const ret2 = { opcode: "procedures_return", inputs: [callMethod2] };
+          const ret2 = { opcode: "procedures_return", inputs: [Array.isArray(returnsLambdaForMethod) && returnsLambdaForMethod.length > 0 ? methodGetter : callMethod2] };
           const inlineChildren2 = [].concat(setters2, [ret2]);
+          normalizeInlineSetCallReporters(inlineChildren2);
           return { opcode: "control_inline_stack_output", inputs: [inlineChildren2] };
         }
-        if (suppressExec) return methodGetter;
-        return { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
+        return Array.isArray(returnsLambdaForMethod) && returnsLambdaForMethod.length > 0 ? methodGetter : { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
       }
 
       // Multi-step chain: create temps for each intermediate call result
@@ -1602,12 +2180,27 @@ if (!nestedInput) {
       let prevTemp = null;
       // track arg names for a lambda returned by the previous call (if known)
       let prevReturnedLambdaArgs = null;
-      // remember the last seen method name so we can recover chained calls
-      // where the AST emitted a `null` method slot for the subsequent call
-      // (e.g., num.add(5).add(6) sometimes appears as inner/outer nodes
-      // with a null method on the outer node). Use this only when the
-      // previous call did not return a lambda (i.e., it's an object).
+      // remember the last seen method name for fallback chained calls
       let prevStepMethodName = null;
+      // Track the origin of the previous temp so we can avoid re-looking-up
+      // properties on a value that was itself produced by executing a
+      // previously-bound method (this is the root cause of double-exec).
+      const resolveOriginForTemp = (temp) => {
+          let origin = tempOriginMap && temp ? tempOriginMap[temp] : null;
+          if ((!origin || origin === null) && typeof globalTempOriginMap !== "undefined") origin = globalTempOriginMap[temp] || null;
+          let safety = 0;
+          while (
+            origin &&
+            origin.type === "execTempCall" &&
+            origin.referenced &&
+            ((tempOriginMap && tempOriginMap[origin.referenced]) || (typeof globalTempOriginMap !== "undefined" && globalTempOriginMap[origin.referenced])) &&
+            safety < 20
+          ) {
+            origin = (tempOriginMap && tempOriginMap[origin.referenced]) || (typeof globalTempOriginMap !== "undefined" && globalTempOriginMap[origin.referenced]);
+            safety++;
+          }
+          return origin || null;
+      };
       for (let si = 0; si < steps.length; si++) {
         const step = steps[si];
         // determine receiverRef: for first step use receiverChain -> build nested receiver
@@ -1656,6 +2249,38 @@ if (!nestedInput) {
             ? classRegistry[classNameForStep].methodReturns[step.methodName]
             : null;
 
+        // If the previous step returned a lambda, this step is most
+        // commonly a call of that returned lambda rather than a fresh
+        // method lookup on the returned object. Prefer treating it as
+        // a lambda invocation using the tagged arg names we collected
+        // earlier, which avoids re-looking-up the same property and
+        // executing functions multiple times.
+        if (si > 0 && prevTemp && Array.isArray(prevReturnedLambdaArgs) && prevReturnedLambdaArgs.length > 0) {
+          for (let pi = 0; pi < prevReturnedLambdaArgs.length; pi++) {
+            const pname = prevReturnedLambdaArgs[pi];
+            const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
+          }
+          const oldPrev = prevTemp;
+          const callReporter = { opcode: "jwLambda_executeR", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldPrev] }, ""] };
+          const tempName = __pw_newTemp("__c");
+          if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+          let setNode;
+          if (callReporter && callReporter.opcode === "jwLambda_executeR") {
+            setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] };
+          } else {
+            setNode = makeSetForCallReporter("thread", tempName, callReporter);
+          }
+          if (!setNode.__origin) setNode.__origin = { type: "execTempCall", referenced: oldPrev };
+          inlineChildren.push(setNode);
+          prevTemp = tempName;
+          prevTempOrigin = setNode.__origin || null;
+          tempOriginMap[prevTemp] = prevTempOrigin;
+          prevReturnedLambdaArgs = null;
+          prevStepMethodName = null;
+          continue;
+        }
+
         // If this step is a normal method call (methodName present)
         if (step.methodName) {
           // set thread vars for params if we know their names
@@ -1666,47 +2291,111 @@ if (!nestedInput) {
                 step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
             }
-            // call method via jwLambda_executeR on the bound getter and store into temp
-            const boundMethod = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
-            if (suppressExec) {
-              const tempName = __pw_newTemp("__c");
-              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, boundMethod] });
-              prevTemp = tempName;
-            } else {
-              const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
-              const tempName = __pw_newTemp("__c");
-              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
-              prevTemp = tempName;
+            // Prefer executing a stored function value when the receiverRef
+            // refers to the previous temp which itself was produced by
+            // executing the same method getter. This avoids re-looking-up
+            // the property and executing it twice.
+            let executeTarget = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
+            if (
+              receiverRef &&
+              receiverRef.opcode === "SPtempVars_getVar" &&
+              Array.isArray(receiverRef.inputs) &&
+              prevTemp &&
+              receiverRef.inputs[1] === prevTemp
+            ) {
+              const resolved = resolveOriginForTemp(prevTemp) || prevTempOrigin;
+              try {
+                console.error("DEBUG methodName check:", step.methodName, prevTemp, JSON.stringify(resolved), JSON.stringify(prevTempOrigin));
+              } catch (e) {}
+              if (resolved && (resolved.type === "execGetProp" || resolved.type === "boundGetProp") && resolved.method === step.methodName) {
+                executeTarget = { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] };
+              } else {
+                try {
+                  console.error("DEBUG methodName no-collapse:", step.methodName, prevTemp, JSON.stringify(resolved), JSON.stringify(prevTempOrigin));
+                } catch (e) {}
+              }
             }
-            // remember if this method is known to return a lambda and its arg names
-            prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
-              ? returnsLambdaArgsForMethod.slice()
-              : null;
-            prevStepMethodName = step.methodName;
-            continue;
+            const tempName = __pw_newTemp("__c");
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+            let setNode;
+            if (executeTarget && executeTarget.opcode === "jwClass_getProp") {
+              // In a multi-step chain, store the raw getter to avoid pre-executing it
+              setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, executeTarget] };
+              if (Array.isArray(executeTarget.inputs)) setNode.__origin = { type: "boundGetProp", method: executeTarget.inputs[0], receiver: executeTarget.inputs[1] };
+            } else if (executeTarget && executeTarget.opcode === "SPtempVars_getVar") {
+              // Store the temp-ref (function value) instead of pre-executing it
+              setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, executeTarget] };
+              setNode.__origin = { type: "boundTempRef", referenced: executeTarget.inputs[1] };
+            } else {
+              const callReporter = { opcode: "jwLambda_executeR", inputs: [executeTarget, ""] };
+              if (callReporter && callReporter.opcode === "jwLambda_executeR") {
+                setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] };
+              } else {
+                setNode = makeSetForCallReporter("thread", tempName, callReporter);
+              }
+            }
+              inlineChildren.push(setNode);
+              prevTemp = tempName;
+              prevTempOrigin = setNode.__origin || null;
+              tempOriginMap[prevTemp] = prevTempOrigin;
+              // remember if this method is known to return a lambda and its arg names
+              prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
+              prevStepMethodName = step.methodName;
+              continue;
           }
 
           // fallback when param names unknown: set a synthetic thread var for the first arg
           const argPos =
             step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
-          const boundMethod = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
+          // handle unknown-param method call; if the receiver is the previous temp
+          // and that temp originated from executing the same method getter,
+          // prefer executing the stored function value directly.
+          let executeTarget2 = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
+          if (
+            receiverRef &&
+            receiverRef.opcode === "SPtempVars_getVar" &&
+            Array.isArray(receiverRef.inputs) &&
+            prevTemp &&
+            receiverRef.inputs[1] === prevTemp
+          ) {
+            const resolved2 = resolveOriginForTemp(prevTemp) || prevTempOrigin;
+            try {
+              console.error("DEBUG unknown-param check:", step.methodName, prevTemp, JSON.stringify(resolved2), JSON.stringify(prevTempOrigin));
+            } catch (e) {}
+            if (resolved2 && (resolved2.type === "execGetProp" || resolved2.type === "boundGetProp") && resolved2.method === step.methodName) executeTarget2 = { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] };
+            else {
+              try {
+                console.error("DEBUG unknown-param no-collapse:", step.methodName, prevTemp, JSON.stringify(resolved2), JSON.stringify(prevTempOrigin));
+              } catch (e) {}
+            }
+          }
           if (argPos !== "") {
             const argTemp = __pw_newArgTemp("value");
             inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPos] });
           }
-          if (suppressExec) {
-            const tempName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, boundMethod] });
-            prevTemp = tempName;
+          const tempName = __pw_newTemp("__c");
+          if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+          let setNode2;
+          if (executeTarget2 && executeTarget2.opcode === "jwClass_getProp") {
+            setNode2 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, executeTarget2] };
+            if (Array.isArray(executeTarget2.inputs)) setNode2.__origin = { type: "boundGetProp", method: executeTarget2.inputs[0], receiver: executeTarget2.inputs[1] };
+          } else if (executeTarget2 && executeTarget2.opcode === "SPtempVars_getVar") {
+            // Store the temp-ref (function value) instead of pre-executing it
+            setNode2 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, executeTarget2] };
+            setNode2.__origin = { type: "boundTempRef", referenced: executeTarget2.inputs[1] };
           } else {
-            const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
-            const tempName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
-            prevTemp = tempName;
+            const callReporter = { opcode: "jwLambda_executeR", inputs: [executeTarget2, ""] };
+            if (callReporter && callReporter.opcode === "jwLambda_executeR") {
+              setNode2 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] };
+            } else {
+              setNode2 = makeSetForCallReporter("thread", tempName, callReporter);
+            }
           }
-          prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
-            ? returnsLambdaArgsForMethod.slice()
-            : null;
+          inlineChildren.push(setNode2);
+          prevTemp = tempName;
+          prevTempOrigin = setNode2.__origin || null;
+          tempOriginMap[prevTemp] = prevTempOrigin;
+          prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod) ? returnsLambdaArgsForMethod.slice() : null;
           prevStepMethodName = step.methodName;
           continue;
         }
@@ -1720,7 +2409,7 @@ if (!nestedInput) {
         if (
           !step.methodName &&
           prevStepMethodName &&
-          (!Array.isArray(prevReturnedLambdaArgs) || prevReturnedLambdaArgs.length === 0) &&
+          (prevReturnedLambdaArgs == null) &&
           prevTemp
         ) {
           // treat as a method call on the previous temp using the previously-seen method name
@@ -1739,15 +2428,17 @@ if (!nestedInput) {
                 step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
             }
-            const boundMethod = {
-              opcode: "jwClass_getProp",
-              inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
-            };
-            const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
+            // If the previous temp was produced by executing the same method getter,
+            // call the stored function directly instead of re-looking-up the method.
+            let executeTargetFake = { opcode: "jwClass_getProp", inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }] };
+            const resolvedFake = resolveOriginForTemp(prevTemp) || prevTempOrigin;
+            if (resolvedFake && (resolvedFake.type === "execGetProp" || resolvedFake.type === "boundGetProp") && resolvedFake.method === fakeMethod) {
+              executeTargetFake = { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] };
+            }
             const tempName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
-            prevTemp = tempName;
-            prevReturnedLambdaArgs =
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+            let setNode;
+            const fakeReturns =
               classNameForStep &&
               classRegistry[classNameForStep] &&
               classRegistry[classNameForStep].methodReturns &&
@@ -1756,6 +2447,40 @@ if (!nestedInput) {
                   ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice()
                   : null
                 : null;
+            if (Array.isArray(fakeReturns) && fakeReturns.length > 0) {
+              setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, executeTargetFake] };
+              if (executeTargetFake && executeTargetFake.opcode === "jwClass_getProp") setNode.__origin = { type: "boundGetProp", method: executeTargetFake.inputs[0], receiver: executeTargetFake.inputs[1] };
+              else if (executeTargetFake && executeTargetFake.opcode === "SPtempVars_getVar") setNode.__origin = { type: "boundTempRef", referenced: executeTargetFake.inputs[1] };
+            } else {
+              // If executeTargetFake is itself a getter or temp-ref, store the raw
+              // getter/value into the temp and tag its origin so subsequent
+              // `jwLambda_executeR(SPtempVars_getVar(...))` calls will operate on
+              // the function value directly instead of re-executing a pre-run
+              // result.
+              if (executeTargetFake && executeTargetFake.opcode === "jwClass_getProp") {
+                setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, executeTargetFake] };
+                setNode.__origin = { type: "boundGetProp", method: executeTargetFake.inputs[0], receiver: executeTargetFake.inputs[1] };
+              } else if (executeTargetFake && executeTargetFake.opcode === "SPtempVars_getVar") {
+                setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, executeTargetFake] };
+                setNode.__origin = { type: "boundTempRef", referenced: executeTargetFake.inputs[1] };
+              } else {
+                const callReporter = { opcode: "jwLambda_executeR", inputs: [executeTargetFake, ""] };
+                if (callReporter && callReporter.opcode === "jwLambda_executeR") {
+                  setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] };
+                } else {
+                  setNode = makeSetForCallReporter("thread", tempName, callReporter);
+                }
+                if (!setNode.__origin) {
+                  if (executeTargetFake && executeTargetFake.opcode === "jwClass_getProp") setNode.__origin = { type: "execGetProp", method: executeTargetFake.inputs[0], receiver: executeTargetFake.inputs[1] };
+                  else if (executeTargetFake && executeTargetFake.opcode === "SPtempVars_getVar") setNode.__origin = { type: "execTempCall", referenced: executeTargetFake.inputs[1] };
+                }
+              }
+            }
+            inlineChildren.push(setNode);
+            prevTemp = tempName;
+            prevTempOrigin = setNode.__origin || null;
+            tempOriginMap[prevTemp] = prevTempOrigin;
+            prevReturnedLambdaArgs = fakeReturns;
             prevStepMethodName = fakeMethod;
             continue;
           }
@@ -1766,15 +2491,18 @@ if (!nestedInput) {
             const argTemp = __pw_newArgTemp("value");
             inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, fakeArgExpr] });
           }
-          const boundMethod2 = {
-            opcode: "jwClass_getProp",
-            inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
-          };
-          const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
+          let executeTargetFake2 = { opcode: "jwClass_getProp", inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }] };
+          const resolvedFake2 = resolveOriginForTemp(prevTemp) || prevTempOrigin;
+          if (resolvedFake2 && (resolvedFake2.type === "execGetProp" || resolvedFake2.type === "boundGetProp") && resolvedFake2.method === fakeMethod) executeTargetFake2 = { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] };
+          else {
+            try {
+              console.error("DEBUG resolveFake2:", fakeMethod, prevTemp, JSON.stringify(resolvedFake2), JSON.stringify(prevTempOrigin));
+            } catch (e) {}
+          }
           const tempName2 = __pw_newTemp("__c");
-          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] });
-          prevTemp = tempName2;
-          prevReturnedLambdaArgs =
+          if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName2] = tempOriginMap[tempName2] || null;
+          let setNode3;
+          const fakeReturns2 =
             classNameForStep &&
             classRegistry[classNameForStep] &&
             classRegistry[classNameForStep].methodReturns &&
@@ -1783,6 +2511,35 @@ if (!nestedInput) {
                 ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice()
                 : null
               : null;
+          if (Array.isArray(fakeReturns2) && fakeReturns2.length > 0) {
+            setNode3 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, executeTargetFake2] };
+            if (executeTargetFake2 && executeTargetFake2.opcode === "jwClass_getProp") setNode3.__origin = { type: "boundGetProp", method: executeTargetFake2.inputs[0], receiver: executeTargetFake2.inputs[1] };
+            else if (executeTargetFake2 && executeTargetFake2.opcode === "SPtempVars_getVar") setNode3.__origin = { type: "boundTempRef", referenced: executeTargetFake2.inputs[1] };
+          } else {
+            if (executeTargetFake2 && executeTargetFake2.opcode === "jwClass_getProp") {
+              setNode3 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, executeTargetFake2] };
+              setNode3.__origin = { type: "boundGetProp", method: executeTargetFake2.inputs[0], receiver: executeTargetFake2.inputs[1] };
+            } else if (executeTargetFake2 && executeTargetFake2.opcode === "SPtempVars_getVar") {
+              setNode3 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, executeTargetFake2] };
+              setNode3.__origin = { type: "boundTempRef", referenced: executeTargetFake2.inputs[1] };
+            } else {
+              const callReporter2 = { opcode: "jwLambda_executeR", inputs: [executeTargetFake2, ""] };
+              if (callReporter2 && callReporter2.opcode === "jwLambda_executeR") {
+                setNode3 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] };
+              } else {
+                setNode3 = makeSetForCallReporter("thread", tempName2, callReporter2);
+              }
+              if (!setNode3.__origin) {
+                if (executeTargetFake2 && executeTargetFake2.opcode === "jwClass_getProp") setNode3.__origin = { type: "execGetProp", method: executeTargetFake2.inputs[0], receiver: executeTargetFake2.inputs[1] };
+                else if (executeTargetFake2 && executeTargetFake2.opcode === "SPtempVars_getVar") setNode3.__origin = { type: "execTempCall", referenced: executeTargetFake2.inputs[1] };
+              }
+            }
+          }
+          inlineChildren.push(setNode3);
+          prevTemp = tempName2;
+          prevTempOrigin = setNode3.__origin || null;
+          tempOriginMap[prevTemp] = prevTempOrigin;
+          prevReturnedLambdaArgs = fakeReturns2;
           prevStepMethodName = fakeMethod;
           continue;
         }
@@ -1793,29 +2550,35 @@ if (!nestedInput) {
             const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
             inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
           }
-          // Ensure we don't execute a complex receiver expression twice.
-          let callTarget = receiverRef;
-          if (
-            callTarget &&
-            typeof callTarget === "object" &&
-            callTarget.opcode &&
-            callTarget.opcode !== "SPtempVars_getVar" &&
-            callTarget.opcode !== "jwClass_self"
-          ) {
-            const tmpName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tmpName, callTarget] });
-            callTarget = { opcode: "SPtempVars_getVar", inputs: ["thread", tmpName] };
-          }
-          if (suppressExec) {
-            const tempName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callTarget] });
-            prevTemp = tempName;
+          const tempName = __pw_newTemp("__c");
+          if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+          let setNode;
+          if (receiverRef && receiverRef.opcode === "jwClass_getProp") {
+            // store the getter instead of pre-executing
+            setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, receiverRef] };
+            if (Array.isArray(receiverRef.inputs)) setNode.__origin = { type: "boundGetProp", method: receiverRef.inputs[0], receiver: receiverRef.inputs[1] };
+          } else if (receiverRef && receiverRef.opcode === "SPtempVars_getVar") {
+            setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, receiverRef] };
+            if (Array.isArray(receiverRef.inputs)) setNode.__origin = { type: "boundTempRef", referenced: receiverRef.inputs[1] };
           } else {
-            const callReporter = { opcode: "jwLambda_executeR", inputs: [callTarget, ""] };
-            const tempName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
-            prevTemp = tempName;
+            const callReporter = { opcode: "jwLambda_executeR", inputs: [receiverRef, ""] };
+            if (callReporter && callReporter.opcode === "jwLambda_executeR") {
+              setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] };
+            } else {
+              setNode = makeSetForCallReporter("thread", tempName, callReporter);
+            }
+            if (!setNode.__origin) {
+              if (receiverRef && receiverRef.opcode === "SPtempVars_getVar" && Array.isArray(receiverRef.inputs)) {
+                setNode.__origin = { type: "execTempCall", referenced: receiverRef.inputs[1] };
+              } else if (receiverRef && receiverRef.opcode === "jwClass_getProp" && Array.isArray(receiverRef.inputs)) {
+                setNode.__origin = { type: "execGetProp", method: receiverRef.inputs[0], receiver: receiverRef.inputs[1] };
+              }
+            }
           }
+          inlineChildren.push(setNode);
+          prevTemp = tempName;
+          prevTempOrigin = setNode.__origin || null;
+          tempOriginMap[prevTemp] = prevTempOrigin;
           // We don't currently track lambdas returned by anonymous/function-valued calls;
           // reset prevReturnedLambdaArgs unless more static info becomes available.
           prevReturnedLambdaArgs = null;
@@ -1833,84 +2596,219 @@ if (!nestedInput) {
           const argTemp2 = __pw_newArgTemp("value");
           inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp2, argPos2] });
         }
-        let callTarget2 = receiverRef;
-        if (
-          callTarget2 &&
-          typeof callTarget2 === "object" &&
-          callTarget2.opcode &&
-          callTarget2.opcode !== "SPtempVars_getVar" &&
-          callTarget2.opcode !== "jwClass_self"
-        ) {
-          const tmpName2a = __pw_newTemp("__c");
-          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tmpName2a, callTarget2] });
-          callTarget2 = { opcode: "SPtempVars_getVar", inputs: ["thread", tmpName2a] };
-        }
-        if (suppressExec) {
-          const tempName2 = __pw_newTemp("__c");
-          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callTarget2] });
-          prevTemp = tempName2;
+        const callReporter2 = { opcode: "jwLambda_executeR", inputs: [receiverRef, ""] };
+        const tempName2 = __pw_newTemp("__c");
+        if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName2] = tempOriginMap[tempName2] || null;
+        let setNode4;
+        if (callReporter2 && callReporter2.opcode === "jwLambda_executeR") {
+          setNode4 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] };
         } else {
-          const callReporter2 = { opcode: "jwLambda_executeR", inputs: [callTarget2, ""] };
-          const tempName2 = __pw_newTemp("__c");
-          inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] });
-          prevTemp = tempName2;
+          setNode4 = makeSetForCallReporter("thread", tempName2, callReporter2);
         }
+        if (!setNode4.__origin) {
+          if (receiverRef && receiverRef.opcode === "SPtempVars_getVar" && Array.isArray(receiverRef.inputs)) setNode4.__origin = { type: "execTempCall", referenced: receiverRef.inputs[1] };
+          else if (receiverRef && receiverRef.opcode === "jwClass_getProp" && Array.isArray(receiverRef.inputs)) setNode4.__origin = { type: "execGetProp", method: receiverRef.inputs[0], receiver: receiverRef.inputs[1] };
+        }
+        inlineChildren.push(setNode4);
+        prevTemp = tempName2;
         prevReturnedLambdaArgs = null;
+        prevStepMethodName = null;
       }
 
-      // Collapse accidental consecutive executor calls (e.g., A -> execute(A) -> execute(result))
-      for (let ii = 0; ii < inlineChildren.length - 1; ii++) {
-        try {
-          const a = inlineChildren[ii];
-          const b = inlineChildren[ii + 1];
-          if (
-            a &&
-            b &&
-            a.opcode === "SPtempVars_setVar" &&
-            b.opcode === "SPtempVars_setVar" &&
-            a.inputs &&
-            b.inputs &&
-            a.inputs[2] &&
-            b.inputs[2] &&
-            a.inputs[2].opcode === "jwLambda_executeR" &&
-            b.inputs[2].opcode === "jwLambda_executeR" &&
-            Array.isArray(b.inputs[2].inputs) &&
-            b.inputs[2].inputs[0] &&
-            b.inputs[2].inputs[0].opcode === "SPtempVars_getVar" &&
-            b.inputs[2].inputs[0].inputs[1] === a.inputs[1]
-          ) {
-            inlineChildren.splice(ii + 1, 1);
-            ii = Math.max(-1, ii - 1);
-          }
-        } catch (e) {
-          // ignore shape issues and continue
-        }
-      }
-
-      // Recompute the last temp from the emitted setters (in case we removed entries).
-      let lastTempName = prevTemp;
-      for (let jj = inlineChildren.length - 1; jj >= 0; jj--) {
-        const el = inlineChildren[jj];
-        if (el && el.opcode === "SPtempVars_setVar" && Array.isArray(el.inputs) && el.inputs.length >= 2) {
-          lastTempName = el.inputs[1];
-          break;
-        }
-      }
+      // return the last temp value
       const retNode = {
         opcode: "procedures_return",
-        inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", lastTempName] }],
+        inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
       };
       inlineChildren.push(retNode);
-      return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
+      // Use centralized inline block creator so normalization is always applied
+      return createInlineBlock(inlineChildren);
     }
     if (expr.type === "Call") {
+      // Flatten nested call-chains like `get(arr,0)(5)()()` or `foo()(a)()`
+      // into an inline-stack sequence that evaluates the base call into a
+      // temp and then executes successive `jwLambda_executeR` steps on that
+      // temp, reusing pre-collected tagged arg names when available.
+      if (expr.callee && (expr.callee.type === "Call" || expr.callee.type === "MemberCall")) {
+        // collect chain from outer -> inner, then reverse to base-first
+        const chain = [];
+        let cur = expr;
+        while (cur && cur.type === "Call") {
+          chain.push(cur);
+          if (cur.callee && (cur.callee.type === "Call" || cur.callee.type === "MemberCall")) cur = cur.callee;
+          else break;
+        }
+        chain.reverse();
+
+        const inlineChildren = [];
+        const tempOriginMap = {};
+        // Evaluate base call into a temp (this yields the function value)
+        const baseCall = chain[0];
+        const baseNested = exprToNested(baseCall, inMethod, paramMap);
+        const temp0 = __pw_newTemp("__c");
+        if (typeof tempOriginMap !== "undefined") tempOriginMap[temp0] = tempOriginMap[temp0] || null;
+        // Create base setter; if baseNested is an executed reporter, prefer
+        // emitting the raw getter/temp-ref at emit-time to avoid pre-execution.
+        let setBase;
+        if (baseNested && baseNested.opcode === "jwLambda_executeR" && Array.isArray(baseNested.inputs)) {
+          setBase = makeSetForCallReporter("thread", temp0, baseNested);
+          if (!setBase.__origin) {
+            const target = baseNested.inputs && baseNested.inputs[0];
+            if (target && target.opcode === "jwClass_getProp" && Array.isArray(target.inputs)) {
+              setBase = { opcode: "SPtempVars_setVar", inputs: ["thread", temp0, target] };
+              setBase.__origin = { type: "boundGetProp", method: target.inputs[0], receiver: target.inputs[1] };
+            } else if (target && target.opcode === "SPtempVars_getVar" && Array.isArray(target.inputs)) {
+              setBase = { opcode: "SPtempVars_setVar", inputs: ["thread", temp0, target] };
+              setBase.__origin = { type: "boundTempRef", referenced: target.inputs[1] };
+            }
+          }
+        } else {
+          setBase = { opcode: "SPtempVars_setVar", inputs: ["thread", temp0, baseNested] };
+        }
+        inlineChildren.push(setBase);
+        let prevTemp = temp0;
+        let prevTempOrigin = setBase.__origin || null;
+        tempOriginMap[prevTemp] = prevTempOrigin;
+
+        // If the base call came from an array variable (get(arr, idx)), or
+        // otherwise returned a lambda from a known variable, prefer using
+        // the pre-collected tagged param names so callers set the same
+        // thread-var arg names instead of synthetic temps.
+        let prevReturnedLambdaArgs = null;
+        try {
+          function findFirstVarName(node) {
+            if (!node) return null;
+            if (node.type === "Var") return node.name;
+            if (Array.isArray(node.args) && node.args.length > 0) {
+              for (const a of node.args) {
+                const found = findFirstVarName(a);
+                if (found) return found;
+              }
+            }
+            if (node.callee) return findFirstVarName(node.callee);
+            return null;
+          }
+          let maybeName = null;
+          if (baseCall && baseCall.args && baseCall.args[0] && baseCall.args[0].type === "Var") maybeName = baseCall.args[0].name;
+          if (!maybeName && baseCall && baseCall.callee && baseCall.callee.type === "Var") maybeName = baseCall.callee.name;
+          if (!maybeName) maybeName = findFirstVarName(baseCall);
+          if (maybeName && varToLambda[maybeName] && Array.isArray(varToLambda[maybeName].tagged)) prevReturnedLambdaArgs = varToLambda[maybeName].tagged.slice();
+        } catch (e) {}
+
+        // If we still don't have tagged names, attempt to extract them
+        // from the nested base value emitted by `exprToNested`. This
+        // handles cases where the base is an inline `jwArray_builder` or
+        // a directly emitted `jwLambda_newLambda` so we can reuse the
+        // lambda's tagged arg names instead of generating synthetic temps.
+        if (!prevReturnedLambdaArgs) {
+          try {
+            function extractParamTags(n) {
+              if (!n || typeof n !== "object") return null;
+              if (n.opcode === "jwLambda_newLambda" && Array.isArray(n.inputs)) {
+                const argSpec = n.inputs[0];
+                if (typeof argSpec === "string") return [argSpec];
+                if (Array.isArray(argSpec)) return argSpec.slice();
+                return null;
+              }
+              if (n.opcode === "jwArray_builder" && Array.isArray(n.inputs)) {
+                const sub = n.inputs[1];
+                if (Array.isArray(sub)) {
+                  for (const el of sub) {
+                    if (el && el.opcode === "jwArray_builderAppend" && Array.isArray(el.inputs)) {
+                      const lambda = el.inputs[0];
+                      const found = extractParamTags(lambda);
+                      if (found) return found;
+                    }
+                  }
+                }
+              }
+              if (n.opcode === "control_inline_stack_output" && Array.isArray(n.inputs) && Array.isArray(n.inputs[0])) {
+                const inner = n.inputs[0];
+                for (let i = inner.length - 1; i >= 0; i--) {
+                  const nd = inner[i];
+                  if (nd && nd.opcode === "procedures_return") {
+                    const rv = nd.inputs && nd.inputs[0];
+                    const found = extractParamTags(rv);
+                    if (found) return found;
+                  }
+                }
+              }
+              if (n.opcode === "jwArray_get" && Array.isArray(n.inputs)) {
+                return extractParamTags(n.inputs[0]);
+              }
+              if (n.type === "Var" && n.name && varToLambda && varToLambda[n.name] && Array.isArray(varToLambda[n.name].tagged)) {
+                return varToLambda[n.name].tagged.slice();
+              }
+              return null;
+            }
+            const tags = extractParamTags(baseNested);
+            if (Array.isArray(tags) && tags.length > 0) prevReturnedLambdaArgs = tags.slice();
+          } catch (e) {}
+        }
+
+        // Execute subsequent calls in the chain
+        for (let ci = 1; ci < chain.length; ci++) {
+          const step = chain[ci];
+          // set named thread args if we have tagged names
+          if (Array.isArray(prevReturnedLambdaArgs) && prevReturnedLambdaArgs.length > 0) {
+            for (let pi = 0; pi < prevReturnedLambdaArgs.length; pi++) {
+              const pname = prevReturnedLambdaArgs[pi];
+              const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
+            }
+          } else {
+            // fallback: set a synthetic arg temp for the first positional arg
+            const argPos = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+            if (argPos !== "") {
+              const argTemp = __pw_newArgTemp("value");
+              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPos] });
+            }
+          }
+          const callReporter = { opcode: "jwLambda_executeR", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }, ""] };
+            const prevRef = prevTemp;
+            const tmp = __pw_newTemp("__c");
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tmp] = tempOriginMap[tmp] || null;
+            let setCall;
+            if (callReporter && callReporter.opcode === "jwLambda_executeR") {
+              setCall = { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, callReporter] };
+            } else {
+              setCall = makeSetForCallReporter("thread", tmp, callReporter);
+            }
+            if (!setCall.__origin) setCall.__origin = { type: "execTempCall", referenced: prevRef };
+            inlineChildren.push(setCall);
+            prevTemp = tmp;
+            // the new temp is the result of executing the previous temp
+            prevTempOrigin = setCall.__origin || null;
+            tempOriginMap[prevTemp] = prevTempOrigin;
+          // after an invocation we don't have reliable info about the next
+          // returned-lambda params (unless further metadata is available),
+          // so clear prevReturnedLambdaArgs to use fallbacks.
+          prevReturnedLambdaArgs = null;
+        }
+
+        // return last temp value
+        inlineChildren.push({ opcode: "procedures_return", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }] });
+          try {
+            console.error("DEBUG flattenMemberCall tempOriginMap:", JSON.stringify(tempOriginMap));
+            console.error("DEBUG flattenMemberCall inlineChildren:", JSON.stringify(inlineChildren.map(c=>({opcode:c.opcode, inputs:c.inputs?c.inputs.slice(0,2):c.inputs})).slice(0,50)));
+          } catch (e) {}
+        return createInlineBlock(inlineChildren);
+      }
       const name = expr.name;
       // Map convenient function names to jwArray opcodes so source can use
       // push/append/get/length/set/concat/join/sum as regular calls.
       if (name === "push" || name === "append") {
         arraysUsed = true;
-        const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
-        const valArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+        const arrNode = expr.args && expr.args[0] ? expr.args[0] : null;
+        const arrArg = arrNode ? exprToNested(arrNode, inMethod, paramMap) : "";
+        // If pushing into a named array variable for which we pre-collected
+        // lambda param metadata, pass that param map when emitting the
+        // pushed value so the lambda uses the same tagged arg names.
+        let valParamMap = paramMap;
+        try {
+          if (arrNode && arrNode.type === "Var" && varToLambda[arrNode.name]) valParamMap = varToLambda[arrNode.name].map;
+        } catch (e) {}
+        const valArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, valParamMap) : "";
         return { opcode: "jwArray_append", inputs: [arrArg, valArg] };
       }
       if (name === "length") {
@@ -1920,17 +2818,43 @@ if (!nestedInput) {
       }
       if (name === "get") {
         arraysUsed = true;
-        const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const arrNode = expr.args && expr.args[0] ? expr.args[0] : null;
+        const arrArg = arrNode ? exprToNested(arrNode, inMethod, paramMap) : "";
         const rawIdxArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
         const idxArg = adjustArrayIndex(rawIdxArg);
+        // If the array expression emitted an inline wrapper, splice the
+        // jwArray_get into its final procedures_return so we avoid
+        // producing an extra outer wrapper and redundant temps.
+        if (
+          arrArg &&
+          arrArg.opcode === "control_inline_stack_output" &&
+          Array.isArray(arrArg.inputs) &&
+          Array.isArray(arrArg.inputs[0])
+        ) {
+          const inlineChildren = arrArg.inputs[0];
+          for (let i = inlineChildren.length - 1; i >= 0; i--) {
+            const node = inlineChildren[i];
+            if (node && node.opcode === "procedures_return") {
+              const retVal = node.inputs && node.inputs[0];
+              const newReturn = { opcode: "jwArray_get", inputs: [retVal, idxArg] };
+              inlineChildren[i] = { opcode: "procedures_return", inputs: [newReturn] };
+              return createInlineBlock(inlineChildren);
+            }
+          }
+        }
         return { opcode: "jwArray_get", inputs: [{ ...arrArg, noPlaceholder: true }, idxArg] };
       }
       if (name === "set") {
         arraysUsed = true;
-        const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const arrNode = expr.args && expr.args[0] ? expr.args[0] : null;
+        const arrArg = arrNode ? exprToNested(arrNode, inMethod, paramMap) : "";
         const rawIdxArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
         const idxArg = adjustArrayIndex(rawIdxArg);
-        const valArg = expr.args && expr.args[2] ? exprToNested(expr.args[2], inMethod, paramMap) : "";
+        let valParamMap = paramMap;
+        try {
+          if (arrNode && arrNode.type === "Var" && varToLambda[arrNode.name]) valParamMap = varToLambda[arrNode.name].map;
+        } catch (e) {}
+        const valArg = expr.args && expr.args[2] ? exprToNested(expr.args[2], inMethod, valParamMap) : "";
         return { opcode: "jwArray_set", inputs: [{ ...arrArg, noPlaceholder: true }, idxArg, valArg] };
       }
       if (name === "concat") {
@@ -2023,6 +2947,7 @@ if (!nestedInput) {
       // Otherwise build an inline stack wrapper that: set tempNew = new CLASS;
       // call constructor via jwClass_getProp + jwLambda_execute; return tempNew
       const tempName = __pw_newTemp("__new");
+      if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
       // set the tempNew as a thread-scoped temp variable
       const setTemp = {
         opcode: "SPtempVars_setVar",
@@ -2075,8 +3000,7 @@ if (!nestedInput) {
       const inlineChildren = [setTemp]
         .concat(ctorParamSetters, ctorArgSetters, [callCtor, ret])
         .filter(Boolean);
-      const inlineBlock = { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
-      return inlineBlock;
+      return createInlineBlock(inlineChildren);
     }
     if (expr.type === "Ternary") {
       // Represent ternary using positional args so nested objects are preserved
@@ -2216,6 +3140,7 @@ if (!nestedInput) {
         // fallback: store result into a thread-temp so the top-level chain
         // points to a stack `SPtempVars_setVar` rather than a reporter.
         const tmp = __pw_newTemp("__a");
+        if (typeof tempOriginMap !== "undefined") tempOriginMap[tmp] = tempOriginMap[tmp] || null;
         const appendCall = { opcode: "jwArray_append", inputs: [arrArg, valArg] };
         return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, appendCall] };
       }
@@ -2244,6 +3169,7 @@ if (!nestedInput) {
           return { opcode: "SPtempVars_setVar", inputs: [destType, varName, setCall] };
         }
         const tmp = __pw_newTemp("__a");
+        if (typeof tempOriginMap !== "undefined") tempOriginMap[tmp] = tempOriginMap[tmp] || null;
         const setCall = {
           opcode: "jwArray_set",
           inputs: [{ ...arrArg, noPlaceholder: true }, idxArg, valArg],
@@ -2413,12 +3339,12 @@ if (!nestedInput) {
                 inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
               }
               const boundMethod = { opcode: "jwClass_getProp", inputs: [step.methodName, receiverRef] };
-              const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
               const tempName = __pw_newTemp("__c");
-              inlineChildren.push({
-                opcode: "SPtempVars_setVar",
-                inputs: ["thread", tempName, callReporter],
-              });
+              if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+              // store the getter in multi-step chains (avoid pre-executing)
+              const setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, boundMethod] };
+              setNode.__origin = { type: "boundGetProp", method: step.methodName, receiver: receiverRef };
+              inlineChildren.push(setNode);
               prevTemp = tempName;
               prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
                 ? returnsLambdaArgsForMethod.slice()
@@ -2433,9 +3359,11 @@ if (!nestedInput) {
               const argTemp = __pw_newArgTemp("value");
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPos] });
             }
-            const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
             const tempName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+            const setNode2 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, boundMethod] };
+            setNode2.__origin = { type: "boundGetProp", method: step.methodName, receiver: receiverRef };
+            inlineChildren.push(setNode2);
             prevTemp = tempName;
             prevReturnedLambdaArgs = Array.isArray(returnsLambdaArgsForMethod)
               ? returnsLambdaArgsForMethod.slice()
@@ -2475,22 +3403,15 @@ if (!nestedInput) {
                 opcode: "jwClass_getProp",
                 inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
               };
-              const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
               const tempName = __pw_newTemp("__c");
-              inlineChildren.push({
-                opcode: "SPtempVars_setVar",
-                inputs: ["thread", tempName, callReporter],
-              });
+              if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+              // store the getter in multi-step chains (avoid pre-executing)
+              const setNode_fake = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, boundMethod] };
+              if (boundMethod && boundMethod.opcode === "jwClass_getProp" && Array.isArray(boundMethod.inputs)) setNode_fake.__origin = { type: "boundGetProp", method: boundMethod.inputs[0], receiver: boundMethod.inputs[1] };
+              else if (boundMethod && boundMethod.opcode === "SPtempVars_getVar" && Array.isArray(boundMethod.inputs)) setNode_fake.__origin = { type: "boundTempRef", referenced: boundMethod.inputs[1] };
+              inlineChildren.push(setNode_fake);
               prevTemp = tempName;
-              prevReturnedLambdaArgs =
-                classNameForStep &&
-                classRegistry[classNameForStep] &&
-                classRegistry[classNameForStep].methodReturns &&
-                classRegistry[classNameForStep].methodReturns[fakeMethod]
-                  ? Array.isArray(classRegistry[classNameForStep].methodReturns[fakeMethod])
-                    ? classRegistry[classNameForStep].methodReturns[fakeMethod].slice()
-                    : null
-                  : null;
+              prevReturnedLambdaArgs = null;
               prevStepMethodName = fakeMethod;
               continue;
             }
@@ -2504,12 +3425,12 @@ if (!nestedInput) {
               opcode: "jwClass_getProp",
               inputs: [fakeMethod, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
             };
-            const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
             const tempName2 = __pw_newTemp("__c");
-            inlineChildren.push({
-              opcode: "SPtempVars_setVar",
-              inputs: ["thread", tempName2, callReporter2],
-            });
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName2] = tempOriginMap[tempName2] || null;
+            const setNode_fake2 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, boundMethod2] };
+            if (boundMethod2 && boundMethod2.opcode === "jwClass_getProp" && Array.isArray(boundMethod2.inputs)) setNode_fake2.__origin = { type: "boundGetProp", method: boundMethod2.inputs[0], receiver: boundMethod2.inputs[1] };
+            else if (boundMethod2 && boundMethod2.opcode === "SPtempVars_getVar" && Array.isArray(boundMethod2.inputs)) setNode_fake2.__origin = { type: "boundTempRef", referenced: boundMethod2.inputs[1] };
+            inlineChildren.push(setNode_fake2);
             prevTemp = tempName2;
             prevReturnedLambdaArgs =
               classNameForStep &&
@@ -2532,7 +3453,18 @@ if (!nestedInput) {
             }
             const callReporter = { opcode: "jwLambda_executeR", inputs: [receiverRef, ""] };
             const tempName = __pw_newTemp("__c");
-            inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName] = tempOriginMap[tempName] || null;
+            let setNode;
+            if (callReporter && callReporter.opcode === "jwLambda_executeR") {
+              setNode = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] };
+            } else {
+              setNode = makeSetForCallReporter("thread", tempName, callReporter);
+            }
+            if (!setNode.__origin) {
+              if (receiverRef && receiverRef.opcode === "SPtempVars_getVar" && Array.isArray(receiverRef.inputs)) setNode.__origin = { type: "execTempCall", referenced: receiverRef.inputs[1] };
+              else if (receiverRef && receiverRef.opcode === "jwClass_getProp" && Array.isArray(receiverRef.inputs)) setNode.__origin = { type: "execGetProp", method: receiverRef.inputs[0], receiver: receiverRef.inputs[1] };
+            }
+            inlineChildren.push(setNode);
             prevTemp = tempName;
             prevReturnedLambdaArgs = null;
             // Once we've executed a returned-lambda, the prior `methodName`
@@ -2562,12 +3494,28 @@ if (!nestedInput) {
               opcode: "jwClass_getProp",
               inputs: [prevStepMethodName, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
             };
-            const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
             const tempName2 = __pw_newTemp("__c");
-            inlineChildren.push({
-              opcode: "SPtempVars_setVar",
-              inputs: ["thread", tempName2, callReporter2],
-            });
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName2] = tempOriginMap[tempName2] || null;
+            let setNode_fake3;
+            if (boundMethod2 && boundMethod2.opcode === "jwClass_getProp") {
+              setNode_fake3 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, boundMethod2] };
+              if (Array.isArray(boundMethod2.inputs)) setNode_fake3.__origin = { type: "boundGetProp", method: boundMethod2.inputs[0], receiver: boundMethod2.inputs[1] };
+            } else if (boundMethod2 && boundMethod2.opcode === "SPtempVars_getVar") {
+              setNode_fake3 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, boundMethod2] };
+              if (Array.isArray(boundMethod2.inputs)) setNode_fake3.__origin = { type: "boundTempRef", referenced: boundMethod2.inputs[1] };
+            } else {
+              const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
+              if (callReporter2 && callReporter2.opcode === "jwLambda_executeR") {
+                setNode_fake3 = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] };
+              } else {
+                setNode_fake3 = makeSetForCallReporter("thread", tempName2, callReporter2);
+              }
+              if (!setNode_fake3.__origin) {
+                if (boundMethod2 && boundMethod2.opcode === "jwClass_getProp") setNode_fake3.__origin = { type: "execGetProp", method: boundMethod2.inputs[0], receiver: boundMethod2.inputs[1] };
+                else if (boundMethod2 && boundMethod2.opcode === "SPtempVars_getVar") setNode_fake3.__origin = { type: "execTempCall", referenced: boundMethod2.inputs[1] };
+              }
+            }
+            inlineChildren.push(setNode_fake3);
             prevTemp = tempName2;
             prevReturnedLambdaArgs =
               classNameForStep &&
@@ -2586,17 +3534,34 @@ if (!nestedInput) {
               const argTemp2 = __pw_newArgTemp("value");
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp2, argPos2] });
             }
-            const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
             const tempName2 = __pw_newTemp("__c");
-            inlineChildren.push({
-              opcode: "SPtempVars_setVar",
-              inputs: ["thread", tempName2, callReporter2],
-            });
+            if (typeof tempOriginMap !== "undefined") tempOriginMap[tempName2] = tempOriginMap[tempName2] || null;
+            let setNode_inline;
+            if (boundMethod2 && boundMethod2.opcode === "jwClass_getProp") {
+              setNode_inline = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, boundMethod2] };
+              if (Array.isArray(boundMethod2.inputs)) setNode_inline.__origin = { type: "boundGetProp", method: boundMethod2.inputs[0], receiver: boundMethod2.inputs[1] };
+            } else if (boundMethod2 && boundMethod2.opcode === "SPtempVars_getVar") {
+              setNode_inline = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, boundMethod2] };
+              if (Array.isArray(boundMethod2.inputs)) setNode_inline.__origin = { type: "boundTempRef", referenced: boundMethod2.inputs[1] };
+            } else {
+              const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
+              if (callReporter2 && callReporter2.opcode === "jwLambda_executeR") {
+                setNode_inline = { opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] };
+              } else {
+                setNode_inline = makeSetForCallReporter("thread", tempName2, callReporter2);
+              }
+              if (!setNode_inline.__origin) {
+                if (boundMethod2 && boundMethod2.opcode === "jwClass_getProp" && Array.isArray(boundMethod2.inputs)) setNode_inline.__origin = { type: "execGetProp", method: boundMethod2.inputs[0], receiver: boundMethod2.inputs[1] };
+                else if (boundMethod2 && boundMethod2.opcode === "SPtempVars_getVar" && Array.isArray(boundMethod2.inputs)) setNode_inline.__origin = { type: "execTempCall", referenced: boundMethod2.inputs[1] };
+              }
+            }
+            inlineChildren.push(setNode_inline);
             prevTemp = tempName2;
           }
         }
 
         // Emit the sequence of stack blocks directly (no inline wrapper and no return)
+        // Emit-time handling and origin annotations prevent double-exec patterns.
         return inlineChildren;
       }
 
@@ -2644,11 +3609,18 @@ if (!nestedInput) {
           : stmt.kind === "thread"
             ? "thread"
             : "global";
-      if (stmt.value)
+      if (stmt.value) {
+        // If the declared value is an array literal whose element is a lambda,
+        // and we discovered a param map for that variable during precollection,
+        // pass the map into exprToNested so the inner lambda uses the same
+        // tagged thread-var names.
+        let useParamMap = paramMap;
+        if (stmt.value && stmt.value.type === "Array" && varToLambda[stmt.name]) useParamMap = varToLambda[stmt.name].map;
         return {
           opcode: "SPtempVars_setVar",
-          inputs: [scope, stmt.name, exprToNested(stmt.value, inMethod, paramMap)],
+          inputs: [scope, stmt.name, exprToNested(stmt.value, inMethod, useParamMap)],
         };
+      }
       return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, ""] };
     }
     if (stmt.type === "Return") {
@@ -2709,6 +3681,18 @@ if (!nestedInput) {
           val = exprToNested(stmt.value, inMethod, paramMap);
         }
         return { opcode: "jwClass_setProp", inputs: [propName, objReceiver, val] };
+      }
+      // simple variable assignment: if assigning an array literal containing
+      // a lambda and we pre-collected a param map for this var, pass it
+      // through to exprToNested so inner lambdas reuse tagged names.
+      if (!stmt.memberChain) {
+        const scope = inMethod && (stmt.kind === "let" || stmt.kind === "const") ? "thread" : "global";
+        let val = stmt.value ? stmt.value : null;
+        if (val && val.type === "Array" && varToLambda[stmt.name]) {
+          return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, exprToNested(val, inMethod, varToLambda[stmt.name].map)] };
+        }
+        if (val) return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, exprToNested(val, inMethod, paramMap)] };
+        return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, ""] };
       }
       return {
         opcode: "SPtempVars_setVar",
@@ -2950,13 +3934,88 @@ if (!nestedInput) {
   }
 }
 
-// Now always use nested input for generation
-let emitResult;
+  // Ensure any remaining inline wrappers get the collapse pass and
+  // annotate setVar origins across the entire nested tree so the
+  // generator and later passes can use origin metadata.
+  function annotateSetOrigins(node) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const n of node) annotateSetOrigins(n);
+      return;
+    }
+    if (typeof node !== "object") return;
+    // If this is a SPtempVars_setVar storing an execute reporter, record origin
+    if (node.opcode === "SPtempVars_setVar" && Array.isArray(node.inputs)) {
+      const val = node.inputs[2];
+      if (val && val.opcode === "jwLambda_executeR") {
+        const execArg = val.inputs && val.inputs[0];
+        if (execArg && execArg.opcode === "jwClass_getProp" && Array.isArray(execArg.inputs)) {
+          node.__origin = { type: "execGetProp", method: execArg.inputs[0], receiver: execArg.inputs[1] };
+        } else if (execArg && execArg.opcode === "SPtempVars_getVar" && Array.isArray(execArg.inputs)) {
+          node.__origin = { type: "execTempCall", referenced: execArg.inputs[1] };
+        } else if (execArg && execArg.opcode === "jwArray_get" && Array.isArray(execArg.inputs)) {
+          node.__origin = { type: "execArrayGet", arr: execArg.inputs[0], index: execArg.inputs[1] };
+        } else if (execArg && execArg.opcode === "control_inline_stack_output" && Array.isArray(execArg.inputs)) {
+          node.__origin = { type: "execInline" };
+        }
+      }
+    }
+    // Recurse into children arrays/substacks
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (Array.isArray(v)) {
+        for (const item of v) annotateSetOrigins(item);
+      } else if (typeof v === "object" && v !== null) annotateSetOrigins(v);
+    }
+  }
+
+  function collapseAllInlineWrappers(nested) {
+    if (!Array.isArray(nested)) return;
+    // If this array looks like a stack of child nodes (objects with opcode),
+    // run the collapse pass directly on it.
+    if (nested.length > 0 && nested[0] && typeof nested[0] === "object" && Object.prototype.hasOwnProperty.call(nested[0], "opcode")) {
+      // No post-emit collapse pass: emit-time handling should avoid
+      // double-exec patterns and annotateSetOrigins records origins.
+    }
+    for (const item of nested) {
+      if (!item) continue;
+      if (Array.isArray(item)) {
+        collapseAllInlineWrappers(item);
+        continue;
+      }
+      if (typeof item !== "object") continue;
+      for (const k of Object.keys(item)) {
+        const v = item[k];
+        if (Array.isArray(v)) collapseAllInlineWrappers(v);
+        else if (typeof v === "object" && v !== null) collapseAllInlineWrappers([v]);
+      }
+    }
+  }
+
+  try {
+    // Normalize any inline set-of-executeR patterns across the nested tree
+    // before annotating origins so the tree contains origin-tagged getters
+    // instead of pre-executed jwLambda_executeR reporters.
+    normalizeAllSetCallReporters(nestedInput);
+    annotateSetOrigins(nestedInput);
+    collapseAllInlineWrappers(nestedInput);
+  } catch (e) {}
+
+  // Write nested debug dump for easier inspection and pair-finder tooling.
+  try {
+    if (nestedInput) {
+      const dbgPath = path.join(process.cwd(), "pang_nested_debug.json");
+      fs.writeFileSync(dbgPath, JSON.stringify([nestedInput], null, 2), "utf8");
+      console.log(`✅ pang_nested_debug.json written to ${dbgPath}`);
+    }
+  } catch (e) {
+    console.error("Failed to write pang_nested_debug.json:", e && e.message);
+  }
+
+  //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
+  emitResult = generator.generateFromNested(nestedInput);
 try {
   // DEBUG: dump nested representation to inspect emitted class/new/method shapes
-  try {
-    fs.writeFileSync("/tmp/pang_nested_debug.json", JSON.stringify(nestedInput, null, 2), "utf8");
-  } catch (e) {}
   //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
   emitResult = generator.generateFromNested(nestedInput);
   // quick validation: ensure emitted pseudocode blocks look reasonable
@@ -2976,12 +4035,6 @@ try {
     }
   } catch (e) {
     console.error("EmitResult validation error", e && e.message);
-  }
-  // dump emitResult to temp file for debugging malformed pseudocode
-  try {
-    fs.writeFileSync("/tmp/pang_emit_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
-  } catch (e) {
-    // ignore write errors
   }
 } catch (e) {
   console.error("Emit error:", (e && e.message) || e);

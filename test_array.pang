@@ -1,13 +1,15 @@
 on("flag", *{
     // Array literal basics
-    let test = [() => {return () => {return 5}}];
-    print(get(test, 0)()());
+    let test = [(a) => {return () => {return () => {return a + 1}}}];
+    print(get(test, 0)(5)()());
     let a = [1, 2, 3];
     print(length(a), {seconds: 1});
     print(get(a, 0), {seconds: 2});
 
     // push/append modifies the array
     push(a, 4);
+    push(a, () => {return (b) => {return b * 2}});
+    print(get(a, 4)()(5), {seconds: 2});
     //print(length(a), {seconds: 1});
 
     // concat + join
