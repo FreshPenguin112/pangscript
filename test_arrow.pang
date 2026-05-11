@@ -19,4 +19,6 @@ on("flag", *{
     print(num.num, {seconds: 2})
     print(num.add(5).add(6).num, {seconds: 2});
     print(num.test()("bar ")(), {seconds: 2})
+    let test1 = (a) => {return () => {return a + 1}};
+    print(test1(5)());
 });
