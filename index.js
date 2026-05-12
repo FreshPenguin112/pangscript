@@ -1184,6 +1184,30 @@ if (!nestedInput) {
     console.error("Break placement error:", e.message);
     process.exit(1);
   }
+  // Track top-level globals so method-local assignments can default to
+  // thread scope unless the variable is already a known global.
+  const globalNames = new Set();
+  function collectGlobalVariables(root) {
+    function walk(node, topLevel) {
+      if (!node) return;
+      if (Array.isArray(node)) {
+        for (const n of node) walk(n, topLevel);
+        return;
+      }
+      if (topLevel) {
+        if (node.type === "Declare" && node.name) globalNames.add(node.name);
+        else if (node.type === "Assign" && node.name) globalNames.add(node.name);
+        else if (node.type === "Class" && node.name) globalNames.add(node.name);
+      }
+      if (node.type === "Class") return;
+      if (node.type === "Block" && Array.isArray(node.body)) return walk(node.body, false);
+      if (node.type === "On" && node.body && Array.isArray(node.body.body)) return walk(node.body.body, false);
+      if (node.body && Array.isArray(node.body)) return walk(node.body, false);
+    }
+    walk(root, true);
+  }
+  collectGlobalVariables(ast);
+
   // Collect class definitions (name -> method param lists) so constructor
   // argument mapping can be emitted later during nested conversion.
   const classRegistry = {};
@@ -1226,9 +1250,7 @@ if (!nestedInput) {
           // Map returned-lambda param names to tagged names as well and store originals
           if (Array.isArray(retLambdaParams) && retLambdaParams.length > 0) {
             classRegistry[name].methodReturnOriginals[m.name] = retLambdaParams.slice();
-            classRegistry[name].methodReturns[m.name] = retLambdaParams.map((p, i) =>
-              p ? __pw_newArgTemp(p, `class:${name}:${m.name}:return:param:${i}:${p}`) : p,
-            );
+            classRegistry[name].methodReturns[m.name] = retLambdaParams.map((p, i) => 'arg' + i);
           } else {
             classRegistry[name].methodReturns[m.name] = retLambdaParams;
             classRegistry[name].methodReturnOriginals[m.name] = retLambdaParams;
@@ -1264,12 +1286,12 @@ if (!nestedInput) {
       if (node.type === "Declare" && node.value && node.value.type === "Lambda") {
         const lp = node.value.params;
         if (Array.isArray(lp)) {
-          const arr = lp.map((p, i) => (p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p));
+          const arr = lp.map((p, i) => '__arg' + i);
           const map = {};
-          for (let i = 0; i < lp.length; i++) if (lp[i]) map[lp[i]] = arr[i];
+          lp.forEach((p, i) => { if (p) map[p] = '__arg' + i; });
           varToLambda[node.name] = { arr, map, params: lp.slice() };
         } else if (lp) {
-          const tmp = __pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`);
+          const tmp = '__arg0';
           varToLambda[node.name] = { arr: [tmp], map: { [lp]: tmp }, params: [lp] };
         } else varToLambda[node.name] = { arr: [], map: {}, params: [] };
       }
@@ -1283,12 +1305,12 @@ if (!nestedInput) {
           if (el && el.type === "Lambda") {
             const lp = el.params;
             if (Array.isArray(lp)) {
-              const arr = lp.map((p, i) => (p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p));
+              const arr = lp.map((p, i) => 'arg' + i);
               const map = {};
-              for (let i = 0; i < lp.length; i++) if (lp[i]) map[lp[i]] = arr[i];
+              lp.forEach((p, i) => { if (p) map[p] = 'arg' + i; });
               varToLambda[node.name] = { arr, map, params: lp.slice() };
             } else if (lp) {
-              const tmp = __pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`);
+              const tmp = 'arg0';
               varToLambda[node.name] = { arr: [tmp], map: { [lp]: tmp }, params: [lp] };
             } else varToLambda[node.name] = { arr: [], map: {}, params: [] };
             break;
@@ -1341,6 +1363,71 @@ if (!nestedInput) {
   }
   collectVarAssignments(ast);
 
+  // Map of method-local declared variable names: { "Class:method": Set<name> }
+  const methodLocalDecls = {};
+  // Current method key while emitting method bodies (used by stmtToNested)
+  let currentEmittingMethodKey = null;
+  function collectMethodLocalDecls(root) {
+    function walk(node) {
+      if (!node) return;
+      if (Array.isArray(node)) {
+        for (const n of node) walk(n);
+        return;
+      }
+      if (node.type === "Class") {
+        const cname = node.name;
+        for (const m of node.members || []) {
+          if (!m || m.type !== "Method") continue;
+          const key = `${cname}:${m.name}`;
+          methodLocalDecls[key] = new Set();
+          function walkMethod(n) {
+            if (!n) return;
+            if (Array.isArray(n)) {
+              for (const x of n) walkMethod(x);
+              return;
+            }
+            if (n.type === "Declare" && n.name) methodLocalDecls[key].add(n.name);
+            // for-loop header declares
+            if (n.type === "For" && n.init && n.init.type === "Declare" && n.init.name)
+              methodLocalDecls[key].add(n.init.name);
+            // descend
+            if (n.body && Array.isArray(n.body)) walkMethod(n.body);
+            if (n.body && n.body.body) walkMethod(n.body.body);
+            for (const k of Object.keys(n)) {
+              if (n[k] && typeof n[k] === "object") walkMethod(n[k]);
+            }
+          }
+          walkMethod(m.body);
+        }
+        return;
+      }
+      if (node.type === "Block" && Array.isArray(node.body)) return walk(node.body);
+      if (node.type === "On" && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
+      if (node.body && Array.isArray(node.body)) return walk(node.body);
+    }
+    walk(root);
+  }
+  collectMethodLocalDecls(ast);
+
+  // Helper to decide whether a variable name should be emitted as a
+  // thread-scoped temp or a global. Preferences:
+  // - explicit `thread` kind -> thread
+  // - inside a method: params, synthetic `__` names, and any name declared
+  //   in the current method -> thread
+  // - otherwise, if a known top-level global -> global
+  // - fallback: thread inside methods, global at top-level
+  function varScopeForName(name, inMethod, paramMap, kind) {
+    if (kind === "thread") return "thread";
+    if (inMethod) {
+      if (name && paramMap && Object.prototype.hasOwnProperty.call(paramMap, name)) return "thread";
+      if (name && name.startsWith("__")) return "thread";
+      if (currentEmittingMethodKey && methodLocalDecls[currentEmittingMethodKey] && methodLocalDecls[currentEmittingMethodKey].has(name)) return "thread";
+      if (name && globalNames.has(name)) return "global";
+      return "thread";
+    }
+    return "global";
+  }
+
   // When emitting class method bodies we set this to the current class
   // name so `this` receiver lookups can be resolved to the proper
   // `classRegistry` entry (ensures `this.add(...)` uses the same
@@ -1351,10 +1438,19 @@ if (!nestedInput) {
   // - If index is a numeric literal, add 1 at compile time.
   // - If index is a numeric string, convert and add 1.
   // - Otherwise (expression/variable), emit an `operator_add` reporter to add 1 at runtime.
-  function adjustArrayIndex(idxNested) {
+  function adjustArrayIndex(idxNested, inMethod, paramMap) {
     if (idxNested === "" || idxNested === undefined || idxNested === null) return idxNested;
     if (typeof idxNested === "number") return idxNested + 1;
     if (typeof idxNested === "string" && /^-?\d+(?:\.\d+)?$/.test(idxNested)) return Number(idxNested) + 1;
+    // If the index is a simple variable reference produced by exprToNested
+    // (e.g., { type: 'Var', name: 'i' }), emit an explicit SPtempVars_getVar
+    // with the correct scope so the index expression doesn't rely on
+    // generator varInfo ordering.
+    if (idxNested && typeof idxNested === "object" && idxNested.type === "Var") {
+      const vname = idxNested.name;
+      const getterType = varScopeForName(vname, inMethod, paramMap, undefined);
+      return { opcode: "operator_add", inputs: [{ opcode: "SPtempVars_getVar", inputs: [getterType, String(vname)] }, 1] };
+    }
     return { opcode: "operator_add", inputs: [idxNested, 1] };
   }
 
@@ -1374,7 +1470,9 @@ if (!nestedInput) {
       let localParamMap = paramMap || null;
       if (!localParamMap) {
         localParamMap = {};
-        for (const p of origParams) if (p) localParamMap[p] = __pw_newArgTemp(p);
+        origParams.forEach((p, i) => {
+          if (p) localParamMap[p] = '__arg' + i;
+        });
       }
       let lambdaArg;
       if (!origParams || origParams.length === 0)
@@ -1669,7 +1767,7 @@ if (!nestedInput) {
             arraysUsed = true;
             const arrArg = step.args && step.args[0] ? exprToNested(step.args[0], inMethod, paramMap) : "";
             const rawIdx = step.args && step.args[1] ? exprToNested(step.args[1], inMethod, paramMap) : "";
-            const idxArg = adjustArrayIndex(rawIdx);
+            const idxArg = adjustArrayIndex(rawIdx, inMethod, paramMap);
             const callExpr = { opcode: "jwArray_get", inputs: [{ ...arrArg, noPlaceholder: true }, idxArg] };
             const tempName = __pw_newTemp("__c");
             // Store the jwArray_get reporter into a thread temp. Do NOT
@@ -1699,7 +1797,7 @@ if (!nestedInput) {
           const argsArr = (step.args || []).map((a) => (a === undefined ? "" : exprToNested(a, inMethod, paramMap)));
           if (typeof cname === "string" && varToLambda && varToLambda[cname]) {
             const vinfo = varToLambda[cname];
-            const getterType = cname.startsWith("__") ? "thread" : "global";
+            const getterType = varScopeForName(cname, inMethod, paramMap, undefined);
             const lambdaGetter = { opcode: "SPtempVars_getVar", inputs: [getterType, String(cname)] };
             // If we have recorded tagged arg names, set them before executing
             if (vinfo && Array.isArray(vinfo.arr) && vinfo.arr.length > 0) {
@@ -1985,7 +2083,7 @@ if (!nestedInput) {
       // executes the variable-stored lambda via `jwLambda_executeR`.
       if (typeof name === "string" && varToLambda && varToLambda[name]) {
         const vinfo = varToLambda[name];
-        const getterType = typeof name === "string" && name.startsWith("__") ? "thread" : "global";
+        const getterType = varScopeForName(name, inMethod, paramMap, undefined);
         const lambdaGetter = { opcode: "SPtempVars_getVar", inputs: [getterType, String(name)] };
         // If we know the lambda's tagged arg names, set them before call
         if (vinfo && Array.isArray(vinfo.arr) && vinfo.arr.length > 0) {
@@ -2027,14 +2125,14 @@ if (!nestedInput) {
         arraysUsed = true;
         const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
         const rawIdxArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
-        const idxArg = adjustArrayIndex(rawIdxArg);
+        const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
         return { opcode: "jwArray_get", inputs: [{ ...arrArg, noPlaceholder: true }, idxArg] };
       }
       if (name === "set") {
         arraysUsed = true;
         const arrArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
         const rawIdxArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
-        const idxArg = adjustArrayIndex(rawIdxArg);
+        const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
         const valArg = expr.args && expr.args[2] ? exprToNested(expr.args[2], inMethod, paramMap) : "";
         return { opcode: "jwArray_set", inputs: [{ ...arrArg, noPlaceholder: true }, idxArg, valArg] };
       }
@@ -2082,7 +2180,7 @@ if (!nestedInput) {
         // the variable-stored lambda instead of emitting a raw opcode.
         if (typeof name === "string" && varToLambda && varToLambda[name]) {
           const vinfo = varToLambda[name];
-          const getterType = typeof name === "string" && name.startsWith("__") ? "thread" : "global";
+          const getterType = varScopeForName(name, inMethod, paramMap, undefined);
           const lambdaGetter = { opcode: "SPtempVars_getVar", inputs: [getterType, String(name)] };
           if (vinfo && Array.isArray(vinfo.arr) && vinfo.arr.length > 0) {
             const setters = [];
@@ -2108,12 +2206,26 @@ if (!nestedInput) {
         return { opcode: name, inputs: argsArr, __shape: shape };
       }
 
+      // If this name is a parameter, assume it's a lambda if called
+      if (paramMap && paramMap[name]) {
+        const lambdaGetter = { opcode: "SPtempVars_getVar", inputs: ["thread", paramMap[name]] };
+        const setters = [];
+        for (let i = 0; i < (expr.args || []).length; i++) {
+          const argExpr = expr.args[i] ? exprToNested(expr.args[i], inMethod, paramMap) : "";
+          const pname = '__arg' + i;
+          setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
+        }
+        const callReporter = { opcode: "jwLambda_executeR", inputs: [lambdaGetter, ""] };
+        const ret = { opcode: "procedures_return", inputs: [callReporter] };
+        return { opcode: "control_inline_stack_output", inputs: [setters.concat([ret])] };
+      }
+
       // Final fallback: if the call name corresponds to a variable-stored
       // lambda, emit an inline wrapper as above; otherwise return a raw
       // opcode block for the call.
       if (typeof name === "string" && varToLambda && varToLambda[name]) {
         const vinfo = varToLambda[name];
-        const getterType = typeof name === "string" && name.startsWith("__") ? "thread" : "global";
+        const getterType = varScopeForName(name, inMethod, paramMap, undefined);
         const lambdaGetter = { opcode: "SPtempVars_getVar", inputs: [getterType, String(name)] };
         if (vinfo && Array.isArray(vinfo.arr) && vinfo.arr.length > 0) {
           const setters = [];
@@ -2327,6 +2439,11 @@ if (!nestedInput) {
 
   function stmtToNested(stmt, inMethod = false, paramMap = null) {
     if (!stmt) return null;
+
+    function resolveScope(name) {
+      return varScopeForName(name, inMethod, paramMap, undefined);
+    }
+
     if (stmt.type === "Print") {
       const msg = exprToNested(stmt.expr, inMethod, paramMap);
       const seconds = stmt.options && stmt.options.seconds !== undefined ? stmt.options.seconds : undefined;
@@ -2370,10 +2487,16 @@ if (!nestedInput) {
         // leaving a reporter block in the top-level next chain.
         if (arrArg && typeof arrArg === "object" && arrArg.type === "Var") {
           const varName = arrArg.name || "";
-          const destType = typeof varName === "string" && varName.startsWith("__") ? "thread" : "global";
+          const destType = resolveScope(varName);
           const getter = { opcode: "SPtempVars_getVar", inputs: [destType, varName] };
           const appendCall = { opcode: "jwArray_append", inputs: [getter, valArg] };
           return { opcode: "SPtempVars_setVar", inputs: [destType, varName, appendCall] };
+        }
+        if (arrArg && typeof arrArg === "object" && arrArg.opcode === "jwClass_getProp") {
+          const propName = arrArg.inputs && arrArg.inputs[0];
+          const receiver = arrArg.inputs && arrArg.inputs[1];
+          const appendCall = { opcode: "jwArray_append", inputs: [arrArg, valArg] };
+          return { opcode: "jwClass_setProp", inputs: [propName, receiver, appendCall] };
         }
         // fallback: store result into a thread-temp so the top-level chain
         // points to a stack `SPtempVars_setVar` rather than a reporter.
@@ -2394,13 +2517,13 @@ if (!nestedInput) {
       if (name === "set") {
         const arrArg = stmt.args && stmt.args[0] ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
         const rawIdxArg = stmt.args && stmt.args[1] ? exprToNested(stmt.args[1], inMethod, paramMap) : "";
-        const idxArg = adjustArrayIndex(rawIdxArg);
+        const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
         const valArg = stmt.args && stmt.args[2] ? exprToNested(stmt.args[2], inMethod, paramMap) : "";
         // jwArray_set returns a new array; write it back to the variable when
         // used as a statement (same strategy as append).
         if (arrArg && typeof arrArg === "object" && arrArg.type === "Var") {
           const varName = arrArg.name || "";
-          const destType = typeof varName === "string" && varName.startsWith("__") ? "thread" : "global";
+          const destType = resolveScope(varName);
           const getter = { opcode: "SPtempVars_getVar", inputs: [destType, varName], noPlaceholder: true };
           const setCall = { opcode: "jwArray_set", inputs: [getter, idxArg, valArg] };
           return { opcode: "SPtempVars_setVar", inputs: [destType, varName, setCall] };
@@ -2415,7 +2538,7 @@ if (!nestedInput) {
       if (name === "get") {
         const arrArg = stmt.args && stmt.args[0] ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
         const rawIdxArg = stmt.args && stmt.args[1] ? exprToNested(stmt.args[1], inMethod, paramMap) : "";
-        const idxArg = adjustArrayIndex(rawIdxArg);
+        const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
         return { opcode: "jwArray_get", inputs: [{ ...arrArg, noPlaceholder: true }, idxArg] };
       }
       if (name === "sum") {
@@ -2800,27 +2923,31 @@ if (!nestedInput) {
       return { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
     }
       if (stmt.type === "Declare") {
-      const scope =
-        inMethod && (stmt.kind === "let" || stmt.kind === "const")
-          ? "thread"
-          : stmt.kind === "thread"
-            ? "thread"
-            : "global";
-      if (stmt.value) {
-        const vinfo = varToLambda[stmt.name];
-        const mapped = vinfo && vinfo.map ? vinfo.map : paramMap;
-        const valueNested = exprToNested(stmt.value, inMethod, mapped);
-        return {
-          opcode: "SPtempVars_setVar",
-          inputs: [scope, stmt.name, valueNested],
-        };
+        // Determine destination scope for declared variable
+        const destType = varScopeForName(stmt.name, inMethod, paramMap, stmt.kind);
+        if (stmt.value) {
+          const vinfo = varToLambda[stmt.name];
+          const mapped = vinfo && vinfo.map ? vinfo.map : paramMap;
+          const valueNested = exprToNested(stmt.value, inMethod, mapped);
+          return {
+            opcode: "SPtempVars_setVar",
+            inputs: [destType, stmt.name, valueNested],
+          };
+        }
+        return { opcode: "SPtempVars_setVar", inputs: [destType, stmt.name, ""] };
       }
-      return { opcode: "SPtempVars_setVar", inputs: [scope, stmt.name, ""] };
-    }
     if (stmt.type === "Return") {
       // Only allowed inside class methods or lambdas (inMethod flag)
       if (!inMethod) throw new Error("'return' used outside of a method or lambda is not allowed");
-      const val = stmt.value ? exprToNested(stmt.value, inMethod, paramMap) : "";
+      let val = stmt.value ? exprToNested(stmt.value, inMethod, paramMap) : "";
+      // If the return is a simple variable reference, emit an explicit
+      // SPtempVars_getVar here using the centralized scope decision so the
+      // generator doesn't have to rely on varInfo ordering.
+      if (val && typeof val === "object" && val.type === "Var") {
+        const vname = val.name;
+        const getterType = varScopeForName(vname, inMethod, paramMap, undefined);
+        val = { opcode: "SPtempVars_getVar", inputs: [getterType, String(vname)] };
+      }
       // If returned value is a block-like object, reject only if its
       // block shape is a stack/branch (i.e., not a reporter). Allow
       // reporter-type blocks that may include substack inputs (e.g., lambdas).
@@ -2876,10 +3003,11 @@ if (!nestedInput) {
         }
         return { opcode: "jwClass_setProp", inputs: [propName, objReceiver, val] };
       }
+      const destType = varScopeForName(stmt.name, inMethod, paramMap, stmt.kind);
       return {
         opcode: "SPtempVars_setVar",
         inputs: [
-          stmt.kind === "thread" ? "thread" : "global",
+          destType,
           stmt.name || "",
           (() => {
             const vinfo = varToLambda[stmt.name];
@@ -2924,6 +3052,9 @@ if (!nestedInput) {
           end = exprToNested(stmt.cond, inMethod, paramMap);
         }
       }
+      // Adjust end to be exclusive like JS for loops, since SPTempVars_forVar is inclusive
+      if (typeof end === "number") end -= 1;
+      else if (end && typeof end === "object") end = { opcode: "operator_subtract", inputs: [end, 1] };
       if (stmt.update) {
         if (stmt.update.type === "Assign" && stmt.update.value && stmt.update.value.type === "Binary") {
           const bin = stmt.update.value;
@@ -3008,9 +3139,12 @@ if (!nestedInput) {
 
           let methodBody = [];
           if (m.body && Array.isArray(m.body.body)) {
+            const _prevMethodKey = currentEmittingMethodKey;
+            currentEmittingMethodKey = `${className}:${m.name}`;
             const raw = m.body.body.map((s) => stmtToNested(s, true, methodParamMap)).filter(Boolean);
             methodBody = flattenNestedResults(raw);
             assertReturnTerminal(methodBody, `method '${m.name}' body`);
+            currentEmittingMethodKey = _prevMethodKey;
           }
           const lambdaBlock = { opcode: "jwLambda_newLambda", inputs: [lambdaArg, methodBody] };
           const setProp = {

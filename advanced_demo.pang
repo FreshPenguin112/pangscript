@@ -1,0 +1,31 @@
+on("flag", *{
+    class Calculator {
+        constructor() {
+            this.numbers = [];
+        }
+
+        add(num) {
+            push(this.numbers, num);
+            return this;
+        }
+
+        sum() {
+            return sum(this.numbers);
+        }
+
+        applyFunc(func) {
+            let results = [];
+            for (let i = 0; i < length(this.numbers); i = i + 1) {
+                push(results, func(get(this.numbers, i)));
+            }
+            return results;
+        }
+    }
+
+    let calc = new Calculator();
+    calc.add(1).add(2).add(3).add(4).add(5);
+    print("Sum: " .. calc.sum(), {seconds: 2});
+    let square = (x) => { return x ** 2; };
+    let squares = calc.applyFunc(square);
+    print("Squares: " .. join(squares, ", "), {seconds: 2});
+});
