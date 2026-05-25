@@ -10,6 +10,7 @@
     "build": "bunx antlr4ng -o ./lib -Dlanguage=JavaScript -visitor -listener *.g4 && bunx babel ./lib --out-dir ./lib --plugins=@babel/plugin-transform-modules-commonjs"
   },
   "devDependencies": {
-    "antlr4ng-cli": "^2.0.0"
+    "antlr4ng-cli": "^2.0.0",
+    "baseline-browser-mapping": "^2.10.29"
   }
 }

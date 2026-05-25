@@ -14,6 +14,8 @@ statementItem
     | assignStmt
     | returnStmt
     | breakStmt
+    | continueStmt
+    | yieldStmt
     ;
 
 // statements require semicolons by default (most statements end with ';')
@@ -25,7 +27,7 @@ statement
     ;
 
 onCall
-    : 'on' '(' STRING ',' (inlineBlock | block) ')'
+    : 'on' '(' STRING ',' (arrowFunction | inlineBlock | block) ')'
     ;
 
 // inline blocks allow a slightly different statement set where some
@@ -61,7 +63,7 @@ printCall
 
 // Variable declaration: let or const
 varDecl
-    : ('let' | 'const') IDENT ('=' expr)?
+    : ('let' | 'const')? IDENT ('=' expr)?
     ;
 
 // Assignment statement (implicit let if variable not declared)
@@ -70,19 +72,34 @@ assignStmt
     ;
 
 ifStmt
-    : 'if' '(' expr ')' block ( 'else' 'if' '(' expr ')' block )* ( 'else' block )?
-    ;
+        : 'if' '(' expr ')' (block | statement) ';'?
+            ( 'else' 'if' '(' expr ')' (block | statement) )* ';'?
+            ( 'else' (block | statement) )? ';'?
+        ;
 
 forStmt
-    : 'for' '(' (varDecl | assignStmt)? ';' expr? ';' (assignStmt | functionCall | expr)? ')' block
+    : 'for' '(' (varDecl | assignStmt)? ';' expr? ';' (assignStmt | functionCall | expr)? ')' (block | statement)
     ;
 
 whileStmt
-    : 'while' '(' expr ')' block
+    : 'while' '(' expr ')' (block | statement)
     ;
 
 breakStmt
     : 'break'
+    ;
+
+yieldStmt
+    : 'yield' expr?
+    ;
+
+continueStmt
+    : 'continue'
+    ;
+
+primary
+    : atom
+      (INCR | DECR)? // optional post-increment/decrement
     ;
 
 expr
@@ -92,10 +109,12 @@ expr
     | '!' expr
     | '~' expr
     | ('+' | '-') expr
+    | INCR expr
+    | DECR expr
     // power (right-associative)
     | <assoc=right> expr POWER expr
     // multiplicative
-    | expr ('*' | '/') expr
+    | expr ('*' | '/' | '%') expr
     // additive
     | expr ('+' | '-') expr
     // shifts
@@ -117,7 +136,7 @@ expr
     | expr '?' expr ':' expr
     ;
 
-primary
+atom
     : NUMBER
     | STRING
     | 'true'
@@ -180,7 +199,8 @@ classDecl
     ;
 
 classMember
-    : IDENT '(' (IDENT (',' IDENT)*)? ')' block
+    : ('static')? (IDENT)? '*'? IDENT '(' (IDENT (',' IDENT)*)? ')' block
+    | 'constructor' '(' (IDENT (',' IDENT)*)? ')' block
     ;
 
 IDENT
@@ -197,6 +217,15 @@ CONCAT
     : '.' '.'
     ;
 
+// increment / decrement
+INCR
+    : '+' '+'
+    ;
+
+DECR
+    : '-' '-'
+    ;
+
 THIS
     : 'this'
     ;
@@ -206,7 +235,8 @@ STRING
     ;
 
 NUMBER
-    : [0-9]+ ('.' [0-9]+)?
+    : '0' [xX] [0-9a-fA-F]+      // hex
+    | [0-9]+ ('.' [0-9]+)?       // decimal / float
     ;
 
 WS

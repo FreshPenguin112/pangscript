@@ -6,6 +6,10 @@ on("flag", *{
         }
         bar() {
             print("bar");
+            let foo = 42;
+            for (let i = 0; i < foo; i++) {
+                print(i, {seconds: 1});
+            }
         }
     }
 
