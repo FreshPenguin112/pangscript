@@ -12,7 +12,7 @@ Object.assign(blocks.processedBlocks, {
   dogeiscutObject_builderSet: [[{ name: 'OBJECT', type: 1 }], 'stack'],
   dogeiscutObject_get: [[{ name: 'OBJECT', type: 1 }, { name: 'KEY', type: 1 }], 'reporter'],
   dogeiscutObject_getPath: [[{ name: 'ARRAY', type: 1 }, { name: 'OBJECT', type: 1 }], 'reporter'],
-  dogeiscutObject_has: [[{ name: 'KEY', type: 1 }, { name: 'OBJECT', type: 1 }], 'reporter'],
+  dogeiscutObject_has: [[{ name: 'OBJECT', type: 1 }, { name: 'KEY', type: 1 }], 'reporter'],
   dogeiscutObject_size: [[{ name: 'OBJECT', type: 1 }], 'reporter'],
   dogeiscutObject_set: [[{ name: 'OBJECT', type: 1 }, { name: 'KEY', type: 1 }, { name: 'VALUE', type: 1 }], 'stack'],
   dogeiscutObject_setPath: [[{ name: 'OBJECT', type: 1 }, { name: 'ARRAY', type: 1 }, { name: 'VALUE', type: 1 }], 'stack'],

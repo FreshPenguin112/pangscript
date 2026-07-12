@@ -2180,7 +2180,7 @@ if (!nestedInput) {
   // pipeline). Without this, such calls fall through to being emitted as a
   // raw, nonexistent opcode named "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__" instead of invoking the
   // lambda stored in the global variable of the same name.
-  const RUNTIME_TYPEOF_PARAMS = ["v", "isVarName", "type"];
+  const RUNTIME_TYPEOF_PARAMS = ["v", "isVarName", "type", "isPropGet", "propName", "propGetType"];
   varToLambda["_INTERNAL__runtime_typeof__AABBCCDDEE12123434__"] = {
     arr: RUNTIME_TYPEOF_PARAMS.map((_, i) => `__arg${i}`),
     map: RUNTIME_TYPEOF_PARAMS.reduce((m, p, i) => {
@@ -2854,7 +2854,7 @@ if (!nestedInput) {
             kind: "let",
             value: {
               type: "Lambda",
-              params: ["v", "isVarName", "type"],
+              params: ["v", "isVarName", "type", "isPropGet", "propName", "propGetType"],
               body: {
                 type: "Block",
                 body: [
@@ -2867,6 +2867,127 @@ if (!nestedInput) {
                   {
                     type: "If",
                     cases: [
+                      {
+                        cond: { type: "Var", name: "isPropGet" },
+                        thenBlock: {
+                          type: "Block",
+                          body: [
+                            {
+                              type: "If",
+                              cases: [
+                                {
+                                  cond: {
+                                    type: "Binary",
+                                    op: "==",
+                                    left: { type: "Var", name: "propGetType" },
+                                    right: { type: "Literal", litType: "string", value: "object" },
+                                  },
+                                  thenBlock: {
+                                    type: "Block",
+                                    body: [
+                                      {
+                                        type: "If",
+                                        cases: [
+                                          {
+                                            cond: {
+                                              type: "Unary",
+                                              op: "!",
+                                              operand: {
+                                                type: "Call",
+                                                name: "dogeiscutObject_has",
+                                                args: [
+                                                  { type: "Var", name: "v" },
+                                                  { type: "Var", name: "propName" },
+                                                ],
+                                              },
+                                            },
+                                            thenBlock: {
+                                              type: "Block",
+                                              body: [
+                                                {
+                                                  type: "Return",
+                                                  value: { type: "Literal", litType: "string", value: "undefined" },
+                                                },
+                                              ],
+                                            },
+                                          },
+                                        ],
+                                        elseBlock: null,
+                                      },
+                                      {
+                                        type: "Assign",
+                                        name: "value",
+                                        value: {
+                                          type: "Call",
+                                          name: "dogeiscutObject_get",
+                                          args: [
+                                            { type: "Var", name: "v" },
+                                            { type: "Var", name: "propName" },
+                                          ],
+                                        },
+                                      },
+                                    ],
+                                  },
+                                },
+                              ],
+                              elseBlock: {
+                                type: "Block",
+                                body: [
+                                  {
+                                    type: "If",
+                                    cases: [
+                                      {
+                                        cond: {
+                                          type: "Unary",
+                                          op: "!",
+                                          operand: {
+                                            type: "Call",
+                                            name: "dogeiscutObject_has",
+                                            args: [
+                                              {
+                                                type: "Call",
+                                                name: "dogeiscutObject_parse",
+                                                args: [{ type: "Var", name: "v" }],
+                                              },
+                                              { type: "Var", name: "propName" },
+                                            ],
+                                          },
+                                        },
+                                        thenBlock: {
+                                          type: "Block",
+                                          body: [
+                                            {
+                                              type: "Return",
+                                              value: { type: "Literal", litType: "string", value: "undefined" },
+                                            },
+                                          ],
+                                        },
+                                      },
+                                    ],
+                                    elseBlock: null,
+                                  },
+                                  {
+                                    type: "Assign",
+                                    name: "value",
+                                    value: {
+                                      type: "Call",
+                                      name: "dogeiscutObject_get",
+                                      args: [
+                                        {
+                                          type: "Call",
+                                          name: "dogeiscutObject_parse",
+                                          args: [{ type: "Var", name: "v" }],
+                                        },
+                                        { type: "Var", name: "propName" },
+                                      ],
+                                    },
+                                  },
+                                ],
+                              },
+                            },
+                          ],
+                        },
+                      },
                       {
                         cond: { type: "Var", name: "isVarName" },
                         thenBlock: {
@@ -3415,6 +3536,65 @@ if (!nestedInput) {
           inMethod,
           paramMap,
         );
+      }
+
+      // Property-get operand (object key access or array index access): pass
+      // the receiver as v plus isPropGet=true so the helper can return
+      // "undefined" when the property/index does not exist. For object gets
+      // propGetType is "object" (key checked via dogeiscutObject_has); for
+      // array gets propGetType is "array" (one-indexed index checked via
+      // dogeiscutObject_has on dogeiscutObject_parse(receiver)).
+      if (inner && inner.type === "Index") {
+        const receiverNested = exprToNested(inner.receiver, inMethod, paramMap);
+        const rawIdx = exprToNested(inner.index, inMethod, paramMap);
+        const adjIdx = adjustArrayIndex(rawIdx, inMethod, paramMap);
+        const idxNested =
+          adjIdx && typeof adjIdx === "object"
+            ? adjIdx
+            : { type: "Literal", litType: "number", value: adjIdx };
+        return exprToNested(
+          {
+            type: "Call",
+            name: "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__",
+            args: [
+              receiverNested,
+              { type: "Literal", litType: "boolean", value: false },
+              { type: "Literal", litType: "string", value: "" },
+              { type: "Literal", litType: "boolean", value: true },
+              idxNested,
+              { type: "Literal", litType: "string", value: "array" },
+            ],
+          },
+          inMethod,
+          paramMap,
+        );
+      }
+      if (inner && inner.type === "Member") {
+        const chain = inner.chain || [];
+        if (chain.length >= 2) {
+          const prop = chain[chain.length - 1];
+          const recvChain = chain.slice(0, -1);
+          const receiverNested =
+            recvChain.length === 1 && typeof recvChain[0] === "string"
+              ? exprToNested({ type: "Var", name: recvChain[0] }, inMethod, paramMap)
+              : exprToNested({ type: "Member", chain: recvChain }, inMethod, paramMap);
+          return exprToNested(
+            {
+              type: "Call",
+              name: "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__",
+              args: [
+                receiverNested,
+                { type: "Literal", litType: "boolean", value: false },
+                { type: "Literal", litType: "string", value: "" },
+                { type: "Literal", litType: "boolean", value: true },
+                { type: "Literal", litType: "string", value: String(prop) },
+                { type: "Literal", litType: "string", value: "object" },
+              ],
+            },
+            inMethod,
+            paramMap,
+          );
+        }
       }
 
       // Non-variable, non-compile-time-resolvable expression: pass the
