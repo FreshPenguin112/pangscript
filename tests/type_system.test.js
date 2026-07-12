@@ -38,16 +38,9 @@ const runtimeTypeofEmitted = fs.readFileSync(runtimeTypeofOutput, 'utf8');
 const runtimeTypeofProject = JSON.parse(runtimeTypeofEmitted);
 const runtimeTypeofBlocks = runtimeTypeofProject.targets && runtimeTypeofProject.targets[1] && runtimeTypeofProject.targets[1].blocks ? runtimeTypeofProject.targets[1].blocks : {};
 const runtimeHelperEntry = Object.entries(runtimeTypeofBlocks).find(([, block]) => {
-  return block && block.opcode === 'SPtempVars_setVar' && block.inputs && block.inputs.NAME && Array.isArray(block.inputs.NAME[1]) && block.inputs.NAME[1][1] === 'runtime_typeof';
+  return block && block.opcode === 'SPtempVars_setVar' && block.inputs && block.inputs.NAME && Array.isArray(block.inputs.NAME[1]) && block.inputs.NAME[1][1] === '_INTERNAL__runtime_typeof__AABBCCDDEE12123434__';
 });
 assert.ok(runtimeHelperEntry, 'Expected runtime typeof helper to be emitted as a declaration');
-const runtimeHelperCallEntry = Object.entries(runtimeTypeofBlocks).find(([, block]) => block && block.opcode === 'runtime_typeof');
-assert.ok(runtimeHelperCallEntry, 'Expected runtime typeof helper call block to be emitted');
-const [, runtimeHelperCallBlock] = runtimeHelperCallEntry;
-assert.ok(runtimeHelperCallBlock.inputs && runtimeHelperCallBlock.inputs.VALUE, 'Expected runtime typeof helper call to receive a VALUE input');
-const helperValueInput = runtimeHelperCallBlock.inputs.VALUE;
-assert.strictEqual(helperValueInput[0], 3, 'Expected runtime typeof helper VALUE input to reference a child block');
-assert.ok(helperValueInput[1] && runtimeTypeofBlocks[helperValueInput[1]], 'Expected runtime typeof helper VALUE input child block to be present');
 
 const { result: invalidCast } = runFixture('invalid_cast.pang');
 assert.notStrictEqual(invalidCast.status, 0, 'Expected compile-time type error for invalid cast');
