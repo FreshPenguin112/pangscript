@@ -1,0 +1,5 @@
+on("flag", {
+  class Calculator {
+    
+  }
+});
