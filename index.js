@@ -6178,9 +6178,8 @@ if (String(outJSONLocation).toLowerCase().endsWith(".pmp")) {
   archive.finalize();
 } else {
   fs.writeFileSync(outJSONLocation, JSON.stringify(out, null, 2), "utf8");
+  let bytes = new Blob([JSON.stringify(out, null, 2)]).size;
   console.log(
-    `✅ ${outJSONLocation.split(path.sep).pop()} written with`,
-    Object.keys(emitResult.blocks).length,
-    "blocks.",
+    `✅ ${outJSONLocation.split(path.sep).pop()} written with ${bytes} bytes`,
   );
 }
