@@ -472,7 +472,7 @@ class AstBuilder extends PangVisitor {
                   : [prevChild.IDENT().getText()]
                 : [];
               if (ids && ids.length > 0) methodName = ids[ids.length - 1];
-            } catch (e) {}
+            } catch (e) { }
           }
           calls.push({ methodName, args });
         }
@@ -639,14 +639,14 @@ class AstBuilder extends PangVisitor {
     try {
       const ann = ctx.typeAnnotation ? ctx.typeAnnotation() : null;
       typeAnnotation = ann ? this.visit(ann) : null;
-    } catch (e) {}
+    } catch (e) { }
     let defaultValue = null;
     try {
       if (ctx.expr && typeof ctx.expr === "function") {
         const dflt = ctx.expr();
         if (dflt) defaultValue = this.visit(dflt);
       }
-    } catch (e) {}
+    } catch (e) { }
     return { name, typeAnnotation, defaultValue };
   }
 
@@ -667,7 +667,7 @@ class AstBuilder extends PangVisitor {
           if (info && info.name) paramInfos.push(info);
         }
       }
-    } catch (e) {}
+    } catch (e) { }
     const body = ctx.block
       ? this.visit(ctx.block())
       : ctx.inlineBlock
@@ -838,7 +838,7 @@ class AstBuilder extends PangVisitor {
           }
         }
       }
-    } catch (e) {}
+    } catch (e) { }
     // If name still empty but the literal 'constructor' appeared, use that
     if (!name && parenIndex !== -1) {
       for (let i = 0; i < parenIndex; i++) {
@@ -853,7 +853,7 @@ class AstBuilder extends PangVisitor {
     try {
       const ann = ctx.typeAnnotation ? ctx.typeAnnotation() : null;
       returnType = ann ? this.visit(ann) : null;
-    } catch (e) {}
+    } catch (e) { }
     const body = ctx.block ? this.visit(ctx.block()) : { type: "Block", body: [] };
     return {
       type: "Method",
@@ -880,7 +880,7 @@ class AstBuilder extends PangVisitor {
     try {
       const ann = ctx.typeAnnotation ? ctx.typeAnnotation() : null;
       typeAnnotation = ann ? this.visit(ann) : null;
-    } catch (e) {}
+    } catch (e) { }
     const inferredType = value ? this.inferType(value) : null;
     if (!hasExplicitKind && ctx.expr && ctx.expr()) {
       return { type: "Assign", name, value, targetType: typeAnnotation || null };
@@ -907,7 +907,7 @@ class AstBuilder extends PangVisitor {
         const chain = raw ? raw.split(".") : [];
         return { type: "Assign", memberChain: chain, value };
       }
-    } catch (e) {}
+    } catch (e) { }
 
     // Fallback: attempt to extract left-hand side from the full text of
     // the ctx (handles cases where the ANTLR parser wasn't regenerated
@@ -928,7 +928,7 @@ class AstBuilder extends PangVisitor {
           }
         }
       }
-    } catch (e) {}
+    } catch (e) { }
 
     // Final fallback: IDENT or THIS token (single-name assignment)
     const name = ctx.IDENT ? ctx.IDENT().getText() : ctx.THIS ? ctx.THIS().getText() : "";
@@ -985,7 +985,7 @@ class AstBuilder extends PangVisitor {
         if (Array.isArray(exprs)) cond = this.visit(exprs[0]);
         else cond = this.visit(exprs);
       }
-    } catch (e) {}
+    } catch (e) { }
 
     // update part: assignStmt | functionCall | expr
     let update = null;
@@ -1006,7 +1006,7 @@ class AstBuilder extends PangVisitor {
             if (Array.isArray(exprs) && exprs.length > 1) update = this.visit(exprs[1]);
             else if (!Array.isArray(exprs) && exprs) update = this.visit(exprs);
           }
-        } catch (e) {}
+        } catch (e) { }
       }
     }
 
@@ -1922,7 +1922,7 @@ if (!nestedInput) {
     //console.error("DEBUG_AST:\n" + JSON.stringify(ast, null, 2));
     try {
       //fs.writeFileSync("/tmp/pang_ast_debug.json", JSON.stringify(ast, null, 2), "utf8");
-    } catch (e) {}
+    } catch (e) { }
     // Normalize odd array-shaped nodes that sometimes appear from the
     // ANTLR visitor (e.g., [null, expr] representing a return). This
     // ensures downstream passes see a consistent AST shape.
@@ -3371,22 +3371,21 @@ if (!nestedInput) {
     if (expr.type === "Literal") return expr.value;
 
     if (expr.type === "Typeof") {
-      const inner = [expr.expr, { type: "Literal", litType: "boolean", value: false },
-      { type: "Literal", litType: "string", value: "" },];
+      const inner = expr.expr;
       // If forceRuntime is true, skip compile-time resolution and always use runtime helper
       if (!expr.forceRuntime) {
         const innerType =
-        inner && typeof inner === "object" && inner.inferredType
-        ? inner.inferredType
-        : inner && typeof inner === "object" && inner.type === "Literal"
-        ? inner.litType === "number"
-        ? "Number"
-        : inner.litType === "string"
-        ? "String"
-        : inner.litType === "boolean"
-        ? "Boolean"
-        : "Any"
-        : null;
+          inner && typeof inner === "object" && inner.inferredType
+            ? inner.inferredType
+            : inner && typeof inner === "object" && inner.type === "Literal"
+              ? inner.litType === "number"
+                ? "Number"
+                : inner.litType === "string"
+                  ? "String"
+                  : inner.litType === "boolean"
+                    ? "Boolean"
+                    : "Any"
+              : null;
         const resolved = getTypeofLabel(innerType);
         if (resolved) return resolved;
       }
@@ -3402,7 +3401,7 @@ if (!nestedInput) {
         const varNested = exprToNested(inner, inMethod, paramMap);
         const varName = varNested && varNested.name ? varNested.name : inner.name;
         const scope =
-        varNested && varNested.scope ? varNested.scope : varScopeForName(inner.name, inMethod, paramMap, undefined);
+          varNested && varNested.scope ? varNested.scope : varScopeForName(inner.name, inMethod, paramMap, undefined);
         return exprToNested(
           {
             type: "Call",
@@ -3421,7 +3420,10 @@ if (!nestedInput) {
       // Non-variable, non-compile-time-resolvable expression: pass the
       // evaluated value directly as v; isVarName/type stay unset (blank),
       // which the helper's isVarName-false branch already handles correctly.
-      return exprToNested({ type: "Call", name: "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__", args: inner }, inMethod, paramMap);
+      return exprToNested({
+        type: "Call", name: "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__", args: [inner, { type: "Literal", litType: "boolean", value: false },
+          { type: "Literal", litType: "string", value: "" },]
+      }, inMethod, paramMap);
     }
 
     // Prefix ++/-- used as unary: `++x` or `--x`
@@ -3496,9 +3498,9 @@ if (!nestedInput) {
           const setter =
             chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
               ? getClassStaticSet(emittingClass, propName, {
-                  opcode: "SPtempVars_getVar",
-                  inputs: ["thread", newTmp],
-                })
+                opcode: "SPtempVars_getVar",
+                inputs: ["thread", newTmp],
+              })
               : makeSet(propName, receiverRef, { opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] });
           const ret = {
             opcode: "procedures_return",
@@ -4692,9 +4694,9 @@ if (!nestedInput) {
       // If we didn't map constructor params, pass the first arg as fallback
       const ctorArg =
         (!Array.isArray(ctorParams) || ctorParams.length === 0) &&
-        expr.callee &&
-        expr.callee.args &&
-        expr.callee.args.length > 0
+          expr.callee &&
+          expr.callee.args &&
+          expr.callee.args.length > 0
           ? exprToNested(expr.callee.args[0], inMethod, paramMap)
           : "";
       const ctorArgSetters = [];
@@ -4823,8 +4825,8 @@ if (!nestedInput) {
       );
       const elseSeq = stmt.elseBlock
         ? flattenNestedResults(
-            stmt.elseBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean),
-          )
+          stmt.elseBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean),
+        )
         : null;
       const cases = [];
       for (let i = 0; i < stmt.cases.length; i++) {
@@ -5572,9 +5574,9 @@ if (!nestedInput) {
           }
           const setterReceiver =
             typeof chain[0] === "string" &&
-            chain[0] !== "this" &&
-            classRegistry[chain[0]] &&
-            hasMethodFlag(detectedClass, propName, "static")
+              chain[0] !== "this" &&
+              classRegistry[chain[0]] &&
+              hasMethodFlag(detectedClass, propName, "static")
               ? getClassGlobalRef(detectedClass)
               : objReceiver;
           const setterGetter = hasMethodFlag(detectedClass, propName, "static")
@@ -5942,7 +5944,7 @@ if (!nestedInput) {
         default: opcode = s.event;
       }
       const rawChildren =
-      s.body && s.body.body ? s.body.body.map((c) => stmtToNested(c, false)).filter(Boolean) : [];
+        s.body && s.body.body ? s.body.body.map((c) => stmtToNested(c, false)).filter(Boolean) : [];
       const children = [];
       for (const c of rawChildren) {
         if (Array.isArray(c)) children.push(...c);
@@ -5965,9 +5967,9 @@ if (!nestedInput) {
   if (runtimeTypeofHelperUsed && !userDefinedRuntimeTypeof) {
     const helperOn = buildRuntimeTypeofHelperDecl();
     const rawChildren =
-    helperOn.body && helperOn.body.body
-    ? helperOn.body.body.map((c) => stmtToNested(c, false)).filter(Boolean)
-    : [];
+      helperOn.body && helperOn.body.body
+        ? helperOn.body.body.map((c) => stmtToNested(c, false)).filter(Boolean)
+        : [];
     const children = [];
     for (const c of rawChildren) {
       if (Array.isArray(c)) children.push(...c);
@@ -5983,12 +5985,12 @@ try {
   // DEBUG: dump nested representation to inspect emitted class/new/method shapes
   try {
     //require("fs").writeFileSync("/tmp/pang_nested_debug.json", JSON.stringify(nestedInput, null, 2), "utf8");
-  } catch (e) {}
+  } catch (e) { }
   //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
   emitResult = generator.generateFromNested(nestedInput);
   try {
     //require("fs").writeFileSync("/tmp/emitResult_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
-  } catch (e) {}
+  } catch (e) { }
   // quick validation: ensure emitted pseudocode blocks look reasonable
   try {
     if (emitResult && Array.isArray(emitResult.blocks)) {

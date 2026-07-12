@@ -2,5 +2,7 @@ on("flag", () => {
     let obj = { Number a: 1, b: 2 };
     obj.a = 3;
     print(obj.a);
-    print(typeof obj.a)
+    print(*typeof obj.a);
+    let foo;
+    print(typeof foo);
 });
