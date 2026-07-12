@@ -37,6 +37,23 @@ const InputTypes = {
   data_listcontents: 13,
 };
 
+function getTypeofLabel(type) {
+  if (type == null) return null;
+  const raw = String(type).trim();
+  if (!raw) return null;
+  const lowered = raw.toLowerCase();
+  if (["string", "str", "text"].includes(lowered)) return "string";
+  if (["number", "num", "int", "float", "double"].includes(lowered)) return "number";
+  if (["boolean", "bool"].includes(lowered)) return "boolean";
+  if (["array", "list", "tuple"].includes(lowered)) return "array";
+  if (["object", "obj", "class"].includes(lowered)) return "object";
+  if (["function", "func", "lambda"].includes(lowered)) return "function";
+  if (["void", "undefined", "null"].includes(lowered)) return "undefined";
+  if (raw.endsWith("[]")) return "array";
+  if (raw.startsWith("Object{")) return "object";
+  return null;
+}
+
 /* -------------------------
   Preprocess: extract quoted strings -> placeholders
 --------------------------*/
@@ -90,6 +107,46 @@ const PangParser = require("./lib/PangParser").default;
 const PangVisitor = require("./lib/PangVisitor").default;
 // pm-blocks metadata for input names/types
 const blocksMeta = require("./blocks").processedBlocks;
+// Load DogeisCut processedBlocks additions (mutates blocks.processedBlocks)
+require("./blocks_dogeiscut_additions");
+
+// Helpers to choose DogeisCut opcodes when available in blocks metadata.
+function makeGet(prop, receiver) {
+  // dogeiscut 'get' expects (OBJECT, KEY)
+  if (blocksMeta && blocksMeta["dogeiscutObject_get"])
+    return { opcode: "dogeiscutObject_get", inputs: [receiver, prop] };
+  return { opcode: "jwClass_getProp", inputs: [prop, receiver] };
+}
+function makeGetPath(arrayParam, receiver) {
+  // dogeiscut 'getPath' expects (ARRAY, OBJECT)
+  if (blocksMeta && blocksMeta["dogeiscutObject_getPath"])
+    return { opcode: "dogeiscutObject_getPath", inputs: [arrayParam, receiver] };
+  // fallback: chain gets using jwClass_getProp for array-paths not supported
+  return { opcode: "jwClass_getProp", inputs: [arrayParam, receiver] };
+}
+function makeSet(prop, receiver, val) {
+  // dogeiscut 'set' expects (OBJECT, KEY, VALUE)
+  if (blocksMeta && blocksMeta["dogeiscutObject_set"])
+    return { opcode: "dogeiscutObject_set", inputs: [receiver, prop, val] };
+  // fallback to jwClass_setProp but ensure parameter ordering matches older shape
+  return { opcode: "jwClass_setProp", inputs: [prop, receiver, val] };
+}
+function makeSetPath(arrayParam, receiver, val) {
+  if (blocksMeta && blocksMeta["dogeiscutObject_setPath"])
+    return { opcode: "dogeiscutObject_setPath", inputs: [receiver, arrayParam, val] };
+  // fallback: not supporting setPath specially; use jwClass_setProp
+  return { opcode: "jwClass_setProp", inputs: [arrayParam, receiver, val] };
+}
+
+// Map a receiver name to its tagged thread temp (e.g. a lambda param `a`
+// becomes `__arg0`) when it appears in the active paramMap; otherwise emit a
+// plain Var node. This keeps method calls on lambda arguments resolving to
+// `__arg0` thread temps instead of falling back to a global variable get.
+function mapReceiverName(name, paramMap) {
+  if (name && paramMap && Object.prototype.hasOwnProperty.call(paramMap, name))
+    return { type: "Var", name: paramMap[name], scope: "thread" };
+  return { type: "Var", name };
+}
 
 // helper counter for generating short temporary variable names used by
 // inline wrappers (e.g., constructor invocation sequences)
@@ -121,16 +178,97 @@ function __pw_newTemp(prefix = "temp") {
 }
 
 // If a scopeKey is provided, reuse a UID for that key so the generated
-// arg name is stable across uses; otherwise produce a fresh synthetic name.
+// arg name is stable across uses. Otherwise, prefer deterministic indexed
+// names like __arg0 so lambda call wrappers share the same naming as the
+// lambda definition.
 function __pw_newArgTemp(base = "value", scopeKey = null) {
   __pw_arg_counter += 1;
   const clean = String(base).replace(/^_+/, "");
   if (scopeKey) return getTaggedArgName(scopeKey, clean);
-  return `__${genRandomUid()}_${clean}${__pw_arg_counter}`;
+  return `__arg${__pw_arg_counter - 1}`;
 }
 
 // Build a simple AST visitor by extending the generated visitor
 class AstBuilder extends PangVisitor {
+  normalizeTypeName(type) {
+    if (!type) return "Any";
+    const raw = String(type).trim();
+    if (!raw) return "Any";
+    const lowered = raw.toLowerCase();
+    if (["string", "str", "text"].includes(lowered)) return "String";
+    if (["number", "num", "int", "float", "double"].includes(lowered)) return "Number";
+    if (["boolean", "bool"].includes(lowered)) return "Boolean";
+    if (["array", "list", "tuple"].includes(lowered)) return "Array";
+    if (["object", "obj", "class"].includes(lowered)) return "Object";
+    if (["function", "func", "lambda"].includes(lowered)) return "Function";
+    if (["void", "undefined", "null"].includes(lowered)) return "Void";
+    if (["any", "unknown", "mixed"].includes(lowered)) return "Any";
+    if (raw.endsWith("[]")) return `${this.normalizeTypeName(raw.slice(0, -2))}[]`;
+    return raw;
+  }
+
+  inferType(node) {
+    if (!node) return "Any";
+    if (typeof node === "string") return this.normalizeTypeName(node);
+    if (node.type === "Literal") {
+      if (node.litType === "number") return "Number";
+      if (node.litType === "string") return "String";
+      if (node.litType === "boolean") return "Boolean";
+      return "Any";
+    }
+    if (node.type === "Array") {
+      if (!Array.isArray(node.elements) || node.elements.length === 0) return "Array";
+      let elementType = null;
+      for (const item of node.elements) {
+        const itemType = this.inferType(item);
+        if (!itemType || itemType === "Any") return "Any";
+        if (elementType === null) elementType = itemType;
+        else if (itemType !== elementType) return "Array";
+      }
+      return `${this.normalizeTypeName(elementType)}[]`;
+    }
+    if (node.type === "Lambda") return "Function";
+    if (node.type === "New") return "Object";
+    if (node.type === "Object") {
+      // Structural object literal inference: if all properties have concrete types,
+      // produce a shaped Object type string; otherwise mark as Any (ambiguous).
+      if (!node.props || !Array.isArray(node.props)) return "Object";
+      const parts = [];
+      for (const p of node.props) {
+        if (p && p.computed) return "Any";
+        if (!p || typeof p.key !== "string") return "Any";
+        const t = this.inferType(p && p.value ? p.value : null);
+        if (!t || t === "Any") return "Any";
+        // escape ':' and ',' in keys if needed (simple identifier keys expected)
+        parts.push(`${p.key}:${t}`);
+      }
+      return `Object{${parts.join(",")}}`;
+    }
+    if (node.type === "Typeof") return "String";
+    if (node.type === "Cast") return this.normalizeTypeName(node.typeName || node.inferredType || "Any");
+    if (node.type === "Member" || node.type === "MemberCall" || node.type === "Call") return "Any";
+    if (node.type === "Binary") {
+      const op = node.op;
+      if (["+", "-", "*", "/", "%", "**", "<<", ">>", ">>>", "&", "^", "|"].includes(op)) return "Number";
+      if (["<", "<=", ">", ">=", "==", "!=", "===", "!==", "&&", "||"].includes(op)) return "Boolean";
+      if (op === "..") return "String";
+      return "Any";
+    }
+    if (node.type === "Unary") {
+      if (node.op === "!" || node.op === "&&" || node.op === "||") return "Boolean";
+      return "Number";
+    }
+    if (node.type === "Ternary") {
+      const thenType = this.inferType(node.thenExpr);
+      const elseType = this.inferType(node.elseExpr);
+      if (thenType && elseType && thenType === elseType) return thenType;
+      return "Any";
+    }
+    if (node.type === "Declare")
+      return this.normalizeTypeName(node.typeAnnotation || node.inferredType || "Any");
+    return null;
+  }
+
   // visit program: list of statements
   visitProgram(ctx) {
     const stmts = [];
@@ -420,16 +558,114 @@ class AstBuilder extends PangVisitor {
     return ast;
   }
 
-  visitArrowFunction(ctx) {
-    // arrowFunction : '(' (IDENT (',' IDENT)*)? ')' '=>' (block | inlineBlock)
-    //               | IDENT '=>' (block | inlineBlock)
-    const params = [];
+  visitTypeAnnotation(ctx) {
+    if (!ctx || !ctx.typeName || typeof ctx.typeName !== "function") return null;
+    const tn = ctx.typeName();
+    return tn ? this.visit(tn) : null;
+  }
+
+  visitTypeName(ctx) {
+    if (!ctx) return null;
+    const idNodes = ctx.IDENT ? ctx.IDENT() : [];
+    const names = [];
+    if (Array.isArray(idNodes)) {
+      for (const node of idNodes) if (node && node.getText) names.push(node.getText());
+    } else if (idNodes && idNodes.getText) {
+      names.push(idNodes.getText());
+    }
+    const base = names.length > 0 ? names[0] : null;
+    const isArray = !!(ctx.children && ctx.children.some((ch) => ch && ch.getText && ch.getText() === "["));
+    return base ? (isArray ? `${base}[]` : base) : null;
+  }
+
+  visitObjectKey(ctx) {
+    if (!ctx) return { key: null, typeAnnotation: null, computed: false, computedExpr: null };
+    const typed = ctx.typedObjectKey ? ctx.typedObjectKey() : null;
+    if (typed) return this.visit(typed);
+    const computed = ctx.computedObjectKey ? ctx.computedObjectKey() : null;
+    if (computed)
+      return {
+        key: this.visit(computed),
+        typeAnnotation: null,
+        computed: true,
+        computedExpr: this.visit(computed),
+      };
+    if (ctx.STRING && ctx.STRING()) {
+      const raw = ctx.STRING().getText();
+      let value = raw;
+      try {
+        value = JSON.parse(raw);
+      } catch (e) {
+        value = raw.replace(/^"|"$/g, "");
+      }
+      return { key: value, typeAnnotation: null, computed: false, computedExpr: null };
+    }
+    if (ctx.IDENT && ctx.IDENT())
+      return { key: ctx.IDENT().getText(), typeAnnotation: null, computed: false, computedExpr: null };
+    return {
+      key: ctx.getText ? ctx.getText() : null,
+      typeAnnotation: null,
+      computed: false,
+      computedExpr: null,
+    };
+  }
+
+  visitTypedObjectKey(ctx) {
+    if (!ctx) return { key: null, typeAnnotation: null, computed: false, computedExpr: null };
+    const typeName = ctx.typeName ? this.visit(ctx.typeName()) : null;
+    const identNode = ctx.IDENT ? ctx.IDENT() : null;
+    if (identNode)
+      return { key: identNode.getText(), typeAnnotation: typeName, computed: false, computedExpr: null };
+    const computed = ctx.computedObjectKey ? ctx.computedObjectKey() : null;
+    if (computed)
+      return {
+        key: this.visit(computed),
+        typeAnnotation: typeName,
+        computed: true,
+        computedExpr: this.visit(computed),
+      };
+    return { key: null, typeAnnotation: typeName, computed: false, computedExpr: null };
+  }
+
+  visitComputedObjectKey(ctx) {
+    const exprCtx = ctx.expr ? (Array.isArray(ctx.expr()) ? ctx.expr(0) : ctx.expr()) : null;
+    return exprCtx ? this.visit(exprCtx) : null;
+  }
+
+  visitParamDecl(ctx) {
+    if (!ctx) return { name: null, typeAnnotation: null, defaultValue: null };
+    const name = ctx.IDENT && typeof ctx.IDENT === "function" ? ctx.IDENT().getText() : null;
+    let typeAnnotation = null;
     try {
-      if (ctx.IDENT && typeof ctx.IDENT === "function") {
-        const idNodes = ctx.IDENT();
-        if (Array.isArray(idNodes)) {
-          for (let i = 0; i < idNodes.length; i++) params.push(idNodes[i].getText());
-        } else if (idNodes) params.push(idNodes.getText());
+      const ann = ctx.typeAnnotation ? ctx.typeAnnotation() : null;
+      typeAnnotation = ann ? this.visit(ann) : null;
+    } catch (e) {}
+    let defaultValue = null;
+    try {
+      if (ctx.expr && typeof ctx.expr === "function") {
+        const dflt = ctx.expr();
+        if (dflt) defaultValue = this.visit(dflt);
+      }
+    } catch (e) {}
+    return { name, typeAnnotation, defaultValue };
+  }
+
+  visitArrowFunction(ctx) {
+    // arrowFunction : '(' (paramDecl (',' paramDecl)*)? ')' '=>' (block | inlineBlock)
+    //               | paramDecl '=>' (block | inlineBlock)
+    const paramInfos = [];
+    try {
+      if (ctx.paramDecl && typeof ctx.paramDecl === "function") {
+        const paramNodes = ctx.paramDecl();
+        if (Array.isArray(paramNodes)) {
+          for (const node of paramNodes) {
+            const info = this.visit(node);
+            if (info && info.name) paramInfos.push(info);
+          }
+        } else if (paramNodes) {
+          const info = this.visit(paramNodes);
+          if (info && info.name) paramInfos.push(info);
+        }
       }
     } catch (e) {}
     const body = ctx.block
@@ -437,7 +673,13 @@ class AstBuilder extends PangVisitor {
       : ctx.inlineBlock
         ? this.visit(ctx.inlineBlock())
         : { type: "Block", body: [] };
-    return { type: "Lambda", params, body };
+    return {
+      type: "Lambda",
+      params: paramInfos.map((p) => p.name),
+      paramTypes: paramInfos.map((p) => p.typeAnnotation),
+      paramDefaults: paramInfos.map((p) => p.defaultValue),
+      body,
+    };
   }
 
   visitMemberExpr(ctx) {
@@ -458,6 +700,58 @@ class AstBuilder extends PangVisitor {
       if (e) elements.push(this.visit(e));
     }
     return { type: "Array", elements };
+  }
+
+  visitObjectLiteral(ctx) {
+    const pairs = ctx.objectPair
+      ? Array.isArray(ctx.objectPair())
+        ? ctx.objectPair()
+        : [ctx.objectPair()]
+      : [];
+    const props = [];
+    for (let i = 0; i < pairs.length; i++) {
+      const p = pairs[i];
+      if (!p) continue;
+      let keyInfo = { key: null, typeAnnotation: null, computed: false, computedExpr: null };
+      const keyCtx = p.objectKey ? p.objectKey() : null;
+      if (keyCtx) keyInfo = this.visit(keyCtx);
+      else if (p.optionKey) {
+        const legacy = p.optionKey();
+        if (legacy && legacy.STRING && legacy.STRING()) {
+          let value = legacy.STRING().getText();
+          try {
+            value = JSON.parse(value);
+          } catch (e) {
+            value = value.replace(/^"|"$/g, "");
+          }
+          keyInfo = { key: value, typeAnnotation: null, computed: false, computedExpr: null };
+        } else if (legacy && legacy.IDENT && legacy.IDENT()) {
+          keyInfo = {
+            key: legacy.IDENT().getText(),
+            typeAnnotation: null,
+            computed: false,
+            computedExpr: null,
+          };
+        }
+      }
+
+      // value expression
+      let expr = null;
+      const exprCtx = p.expr ? (Array.isArray(p.expr()) ? p.expr(0) : p.expr()) : null;
+      if (exprCtx) expr = this.visit(exprCtx);
+
+      props.push({
+        key: keyInfo.key,
+        value: expr,
+        keyType: keyInfo.typeAnnotation,
+        computed: !!keyInfo.computed,
+        computedExpr: keyInfo.computedExpr,
+      });
+    }
+    // Diagnostic: log props and inferred types (temporary)
+    // mark that objects are used so emitter includes the Objects extension
+    objectsUsed = true;
+    return { type: "Object", props };
   }
 
   visitClassDecl(ctx) {
@@ -516,51 +810,83 @@ class AstBuilder extends PangVisitor {
         const ch = children[i];
         if (!ch || !ch.getText) continue;
         const t = ch.getText();
-        if (t === 'static') isStatic = true;
-        else if (t === 'get') isGetter = true;
-        else if (t === 'set') isSetter = true;
-        else if (t === '*') isGenerator = true;
+        if (t === "static") isStatic = true;
+        else if (t === "get") isGetter = true;
+        else if (t === "set") isSetter = true;
+        else if (t === "*") isGenerator = true;
         else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(t)) name = t;
       }
     }
     const params = [];
-    if (ctx.IDENT && typeof ctx.IDENT === "function") {
-      const idNodes = ctx.IDENT();
-      const idTexts = [];
-      if (Array.isArray(idNodes)) {
-        for (const idNode of idNodes) {
-          if (idNode && idNode.getText) idTexts.push(idNode.getText());
+    const paramTypes = [];
+    try {
+      if (ctx.paramDecl && typeof ctx.paramDecl === "function") {
+        const paramNodes = ctx.paramDecl();
+        if (Array.isArray(paramNodes)) {
+          for (const node of paramNodes) {
+            const info = this.visit(node);
+            if (info && info.name) {
+              params.push(info.name);
+              paramTypes.push(info.typeAnnotation);
+            }
+          }
+        } else if (paramNodes) {
+          const info = this.visit(paramNodes);
+          if (info && info.name) {
+            params.push(info.name);
+            paramTypes.push(info.typeAnnotation);
+          }
         }
-      } else if (idNodes && idNodes.getText) {
-        idTexts.push(idNodes.getText());
       }
-      if (idTexts.length > 0) {
-        if (!name) name = idTexts[0];
-        if (name === "constructor") params.push(...idTexts);
-        else params.push(...idTexts.slice(1));
-      }
-    }
+    } catch (e) {}
     // If name still empty but the literal 'constructor' appeared, use that
     if (!name && parenIndex !== -1) {
       for (let i = 0; i < parenIndex; i++) {
         const ch = children[i];
-        if (ch && ch.getText && ch.getText() === 'constructor') {
-          name = 'constructor';
+        if (ch && ch.getText && ch.getText() === "constructor") {
+          name = "constructor";
           break;
         }
       }
     }
+    let returnType = null;
+    try {
+      const ann = ctx.typeAnnotation ? ctx.typeAnnotation() : null;
+      returnType = ann ? this.visit(ann) : null;
+    } catch (e) {}
     const body = ctx.block ? this.visit(ctx.block()) : { type: "Block", body: [] };
-    return { type: "Method", name, params, body, static: isStatic, getter: isGetter, setter: isSetter, generator: isGenerator };
+    return {
+      type: "Method",
+      name,
+      params,
+      paramTypes,
+      returnType,
+      body,
+      static: isStatic,
+      getter: isGetter,
+      setter: isSetter,
+      generator: isGenerator,
+    };
   }
 
   visitVarDecl(ctx) {
-    // ('let' | 'const') IDENT ('=' expr)?
-    const kind = ctx.getChild(0).getText();
+    // ('let' | 'const') IDENT typeAnnotation? ('=' expr)?
+    const kindToken = ctx.getChild(0).getText();
+    const hasExplicitKind = kindToken === "let" || kindToken === "const";
     const name = ctx.IDENT().getText();
     let value = null;
     if (ctx.expr && ctx.expr()) value = this.visit(ctx.expr());
-    return { type: "Declare", kind, name, value };
+    let typeAnnotation = null;
+    try {
+      const ann = ctx.typeAnnotation ? ctx.typeAnnotation() : null;
+      typeAnnotation = ann ? this.visit(ann) : null;
+    } catch (e) {}
+    const inferredType = value ? this.inferType(value) : null;
+    if (!hasExplicitKind && ctx.expr && ctx.expr()) {
+      return { type: "Assign", name, value, targetType: typeAnnotation || null };
+    }
+    if (!value) return; // this way variables made like this: `let foo;` get their type as undefined, if they were made they would be set to an empty string, which runtime typeof resolves to type string and not undefined, it only does undefined for non existant variables, so we just dont make a declaration
+    return { type: "Declare", kind: kindToken, name, value, typeAnnotation, inferredType };
   }
 
   visitReturn(ctx) {
@@ -614,7 +940,11 @@ class AstBuilder extends PangVisitor {
     const exprs = ctx.expr ? (Array.isArray(ctx.expr()) ? ctx.expr() : [ctx.expr()]) : [];
     // Blocks and single-statement forms can both appear as clause bodies.
     const blocksCtx = ctx.block ? (Array.isArray(ctx.block()) ? ctx.block() : [ctx.block()]) : [];
-    const stmtCtxs = ctx.statement ? (Array.isArray(ctx.statement()) ? ctx.statement().slice() : [ctx.statement()]) : [];
+    const stmtCtxs = ctx.statement
+      ? Array.isArray(ctx.statement())
+        ? ctx.statement().slice()
+        : [ctx.statement()]
+      : [];
     const cases = [];
     // For each condition, prefer corresponding block() when present; otherwise consume a statement() and wrap it as a Block.
     for (let i = 0; i < exprs.length; i++) {
@@ -635,7 +965,8 @@ class AstBuilder extends PangVisitor {
     } else if (stmtCtxs && stmtCtxs.length > 0) {
       const last = stmtCtxs.shift();
       const s = this.visit(last);
-      elseBlock = s && s.type === "Block" ? s : { type: "Block", body: s ? (Array.isArray(s) ? s : [s]) : [] };
+      elseBlock =
+        s && s.type === "Block" ? s : { type: "Block", body: s ? (Array.isArray(s) ? s : [s]) : [] };
     }
     return { type: "If", cases, elseBlock };
   }
@@ -720,9 +1051,22 @@ class AstBuilder extends PangVisitor {
   }
 
   visitExpr(ctx) {
+    if (ctx.children && ctx.children.some((c) => c && c.getText && c.getText() === "as")) {
+      const targetExpr = this.visit(ctx.expr(0));
+      const targetType = ctx.typeName ? this.visit(ctx.typeName()) : null;
+      return { type: "Cast", expr: targetExpr, typeName: targetType };
+    }
+
     // Prefer explicit unary handling for leading unary operators
     if (ctx.children && ctx.children[0] && ctx.children[0].getText) {
       const firstTok = ctx.children[0].getText();
+      if (firstTok === "typeof") {
+        return { type: "Typeof", expr: this.visit(ctx.expr(0)) };
+      }
+      // Handle *typeof (force runtime typeof, bypassing compile-time resolution)
+      if (firstTok === "*" && ctx.children[1] && ctx.children[1].getText && ctx.children[1].getText() === "typeof") {
+        return { type: "Typeof", expr: this.visit(ctx.expr(0)), forceRuntime: true };
+      }
       if (firstTok === "new") {
         // new <functionCall>
         if (ctx.functionCall && ctx.functionCall())
@@ -918,6 +1262,7 @@ class AstBuilder extends PangVisitor {
     }
     if (ctx.arrowFunction && ctx.arrowFunction()) return this.visit(ctx.arrowFunction());
     if (ctx.arrayLiteral && ctx.arrayLiteral()) return this.visit(ctx.arrayLiteral());
+    if (ctx.objectLiteral && ctx.objectLiteral()) return this.visit(ctx.objectLiteral());
     if (ctx.functionCall && ctx.functionCall()) return this.visit(ctx.functionCall());
     if (ctx.memberExpr && ctx.memberExpr()) {
       const chain = this.visit(ctx.memberExpr());
@@ -963,6 +1308,8 @@ class AstBuilder extends PangVisitor {
         base = this.visit(ctx.arrowFunction());
       } else if (ctx.arrayLiteral && ctx.arrayLiteral()) {
         base = this.visit(ctx.arrayLiteral());
+      } else if (ctx.objectLiteral && ctx.objectLiteral()) {
+        base = this.visit(ctx.objectLiteral());
       } else if (ctx.functionCall && ctx.functionCall()) {
         base = this.visit(ctx.functionCall());
       } else if (ctx.memberExpr && ctx.memberExpr()) {
@@ -980,6 +1327,39 @@ class AstBuilder extends PangVisitor {
     // Postfix ++/--: when present wrap the base into a Postfix AST node
     if (ctx.INCR && ctx.INCR()) return { type: "Postfix", op: "++", operand: base };
     if (ctx.DECR && ctx.DECR()) return { type: "Postfix", op: "--", operand: base };
+
+    const bracketExprs = [];
+    if (ctx.children) {
+      for (let i = 0; i < ctx.children.length; i++) {
+        const ch = ctx.children[i];
+        const text = ch && ch.getText ? ch.getText() : null;
+        if (text === "[") {
+          let j = i + 1;
+          let inner = null;
+          while (j < ctx.children.length) {
+            const innerCh = ctx.children[j];
+            if (innerCh && innerCh.getText && innerCh.getText() === "]") break;
+            if (
+              innerCh &&
+              innerCh.constructor &&
+              innerCh.constructor.name &&
+              innerCh.constructor.name.endsWith("ExprContext")
+            ) {
+              inner = innerCh;
+            }
+            j++;
+          }
+          if (inner) bracketExprs.push(inner);
+        }
+      }
+    }
+    if (bracketExprs.length > 0) {
+      let current = base;
+      for (const exprCtx of bracketExprs) {
+        current = { type: "Index", receiver: current, index: this.visit(exprCtx) };
+      }
+      return current;
+    }
 
     return base;
   }
@@ -1085,6 +1465,404 @@ function parseWithAntlr(source) {
 --------------------------*/
 // Delegate block/project generation to lib/generator.js so index.js contains no
 // manual block generation logic.
+function performStaticTypeAnalysis(rootAst) {
+  const scopes = [new Map()];
+
+  function pushScope() {
+    scopes.push(new Map());
+  }
+
+  function popScope() {
+    scopes.pop();
+  }
+
+  function normalizeTypeName(type) {
+    return new AstBuilder().normalizeTypeName(type);
+  }
+
+  function isTypeCompatible(declaredType, inferredType) {
+    const declared = normalizeTypeName(declaredType);
+    const inferred = normalizeTypeName(inferredType);
+    if (!declared || !inferred || declared === "Any" || inferred === "Any") return true;
+    if (declared === inferred) return true;
+    if (declared === "Object" && inferred && inferred.startsWith("Object{")) return true;
+    if (declared === "Array" && inferred && inferred.endsWith("[]")) return true;
+    if (declared.endsWith("[]") && inferred.endsWith("[]")) {
+      const declaredItem = normalizeTypeName(declared.slice(0, -2));
+      const inferredItem = normalizeTypeName(inferred.slice(0, -2));
+      return isTypeCompatible(declaredItem, inferredItem);
+    }
+    if (declared === "Number" && inferred === "Number") return true;
+    if (declared === "String" && inferred === "String") return true;
+    if (declared === "Boolean" && inferred === "Boolean") return true;
+    if (declared === "Array" && inferred === "Array") return true;
+    if (declared === "Object" && inferred === "Object") return true;
+    if (declared === "Function" && inferred === "Function") return true;
+    return false;
+  }
+
+  function isConcreteType(type) {
+    const normalized = normalizeTypeName(type);
+    return Boolean(normalized && normalized !== "Any" && normalized !== "Unknown" && normalized !== "Void");
+  }
+
+  function inferPropertyTypeFromShape(type, propertyName) {
+    const normalized = normalizeTypeName(type);
+    if (!normalized || !propertyName) return null;
+    const shapeMatch = normalized.match(/^Object\{(.+)\}$/);
+    if (!shapeMatch) return null;
+    const parts = shapeMatch[1].split(",");
+    for (const part of parts) {
+      const [name, valueType] = part.split(":");
+      if (name && name.trim() === String(propertyName)) return normalizeTypeName(valueType);
+    }
+    return null;
+  }
+
+  function lookupType(name) {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (scopes[i].has(name)) return scopes[i].get(name);
+    }
+    return null;
+  }
+
+  function setType(name, type) {
+    if (!name) return;
+    scopes[scopes.length - 1].set(name, normalizeTypeName(type));
+  }
+
+  function visitExpression(node) {
+    if (!node) return "Any";
+    if (Array.isArray(node)) {
+      let inferred = "Any";
+      for (const item of node) {
+        const itemType = visitExpression(item);
+        if (itemType && itemType !== "Any") inferred = itemType;
+      }
+      return inferred;
+    }
+
+    switch (node.type) {
+      case "Literal": {
+        const litType =
+          node.litType === "number"
+            ? "Number"
+            : node.litType === "string"
+              ? "String"
+              : node.litType === "boolean"
+                ? "Boolean"
+                : "Any";
+        node.inferredType = litType;
+        return litType;
+      }
+      case "Var": {
+        const found = lookupType(node.name);
+        node.inferredType = found || "Any";
+        return node.inferredType;
+      }
+      case "Typeof": {
+        // If forceRuntime is true, do NOT resolve at compile time.
+        if (node.forceRuntime) {
+          node.inferredType = "String";
+          return "String";
+        }
+
+        const innerType = visitExpression(node.expr);
+        const resolvedType = getTypeofLabel(innerType);
+        if (resolvedType) {
+          Object.assign(node, {
+            type: "Literal",
+            litType: "string",
+            value: resolvedType,
+            inferredType: "String",
+          });
+        } else {
+          node.inferredType = "String";
+        }
+        return "String";
+      }
+      case "Binary": {
+        const leftType = visitExpression(node.left);
+        const rightType = visitExpression(node.right);
+        let inferred = "Any";
+        if (["+", "-", "*", "/", "%", "**", "<<", ">>", ">>>", "&", "^", "|"].includes(node.op))
+          inferred = "Number";
+        else if (["<", "<=", ">", ">=", "==", "!=", "===", "!==", "&&", "||"].includes(node.op))
+          inferred = "Boolean";
+        else if (node.op === "..") inferred = "String";
+        if (node.op === "+" && (leftType === "String" || rightType === "String")) inferred = "String";
+        node.inferredType = inferred;
+        return inferred;
+      }
+      case "Unary": {
+        const operandType = visitExpression(node.operand);
+        const inferred = node.op === "!" ? "Boolean" : operandType === "String" ? "String" : "Number";
+        node.inferredType = inferred;
+        return inferred;
+      }
+      case "Cast": {
+        const innerType = visitExpression(node.expr);
+        const target = normalizeTypeName(node.typeName);
+        if (
+          target &&
+          target !== "Any" &&
+          innerType &&
+          innerType !== "Any" &&
+          !isTypeCompatible(target, innerType)
+        ) {
+          throw new Error(`Type error: cannot cast ${innerType} to ${target}`);
+        }
+        node.inferredType = target || innerType || "Any";
+        return node.inferredType;
+      }
+      case "Index": {
+        const receiverType = node.receiver ? visitExpression(node.receiver) : "Any";
+        let inferred = "Any";
+        if (receiverType && receiverType.endsWith("[]")) {
+          inferred = normalizeTypeName(receiverType.slice(0, -2));
+        }
+        node.inferredType = inferred;
+        return inferred;
+      }
+      case "Ternary": {
+        const thenType = visitExpression(node.thenExpr);
+        const elseType = visitExpression(node.elseExpr);
+        const inferred = thenType === elseType ? thenType : "Any";
+        node.inferredType = inferred;
+        return inferred;
+      }
+      case "Array": {
+        if (!Array.isArray(node.elements) || node.elements.length === 0) {
+          node.inferredType = "Array";
+          return "Array";
+        }
+        let elementType = null;
+        for (const item of node.elements) {
+          const itemType = visitExpression(item);
+          if (!itemType || itemType === "Any") {
+            node.inferredType = "Any";
+            return "Any";
+          }
+          if (elementType === null) elementType = itemType;
+          else if (itemType !== elementType) {
+            node.inferredType = "Array";
+            return "Array";
+          }
+        }
+        const arrayType = `${normalizeTypeName(elementType)}[]`;
+        node.inferredType = arrayType;
+        return arrayType;
+      }
+      case "Object": {
+        if (!node.props || !Array.isArray(node.props) || node.props.length === 0) {
+          node.inferredType = "Object";
+          return "Object";
+        }
+        const staticParts = [];
+        for (const p of node.props) {
+          if (!p) continue;
+          if (p.computed && p.computedExpr) {
+            visitExpression(p.computedExpr);
+            continue;
+          }
+          if (!p.key || typeof p.key !== "string") {
+            continue;
+          }
+          const t = visitExpression(p && p.value ? p.value : null);
+          if (!t || t === "Any") {
+            node.inferredType = "Any";
+            return "Any";
+          }
+          staticParts.push(`${p.key}:${t}`);
+        }
+        if (staticParts.length === 0) {
+          node.inferredType = "Object";
+          return "Object";
+        }
+        const shaped = `Object{${staticParts.join(",")}}`;
+        node.inferredType = shaped;
+        return node.inferredType;
+      }
+      case "Lambda": {
+        node.inferredType = "Function";
+        return "Function";
+      }
+      case "New": {
+        node.inferredType = "Object";
+        return "Object";
+      }
+      case "Call": {
+        node.inferredType = "Any";
+        return "Any";
+      }
+      case "Member":
+      case "MemberCall": {
+        const chain = Array.isArray(node.chain) ? node.chain : [];
+        const receiverNode = chain.length > 0 ? chain[0] : null;
+        const propertyName = chain.length > 1 ? chain[chain.length - 1] : null;
+        const receiverType =
+          typeof receiverNode === "string" ? lookupType(receiverNode) : visitExpression(receiverNode);
+        const inferredPropertyType = propertyName
+          ? inferPropertyTypeFromShape(receiverType, propertyName)
+          : null;
+        node.inferredType = inferredPropertyType || "Any";
+        return node.inferredType;
+      }
+      default:
+        return "Any";
+    }
+  }
+
+  function visitStatements(stmts, scopeOverride = null, methodReturnType = null) {
+    const activeScope = scopeOverride || scopes[scopes.length - 1];
+    if (!stmts || !Array.isArray(stmts)) return;
+    for (const stmt of stmts) {
+      visitStatement(stmt, activeScope, methodReturnType);
+    }
+  }
+
+  function visitStatement(stmt, currentScope = scopes[scopes.length - 1], methodReturnType = null) {
+    if (!stmt) return;
+    if (Array.isArray(stmt)) {
+      for (const item of stmt) visitStatement(item, currentScope, methodReturnType);
+      return;
+    }
+
+    switch (stmt.type) {
+      case "Declare": {
+        const explicitType = stmt.typeAnnotation ? normalizeTypeName(stmt.typeAnnotation) : null;
+        const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
+        let effectiveType = explicitType || valueType || "Any";
+        if (stmt.typeAnnotation && stmt.value && !isTypeCompatible(effectiveType, valueType)) {
+          throw new Error(`Type error: cannot assign ${valueType} to ${effectiveType}`);
+        }
+        if (stmt.typeAnnotation && !stmt.value) {
+          effectiveType = explicitType;
+        } else if (!stmt.typeAnnotation && stmt.value && !isConcreteType(valueType)) {
+          throw new Error(
+            `Type inference error: cannot infer a concrete type for ${stmt.name} without an explicit type annotation`,
+          );
+        }
+        stmt.inferredType = effectiveType;
+        setType(stmt.name, effectiveType);
+        break;
+      }
+      case "Assign": {
+        const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
+        const targetType = lookupType(stmt.name) || stmt.targetType || null;
+        if (targetType && !isTypeCompatible(targetType, valueType)) {
+          throw new Error(`Type error: cannot assign ${valueType} to ${targetType}`);
+        }
+        if (stmt.name) {
+          const mergedType = targetType || valueType;
+          if (targetType && mergedType && mergedType !== "Any") {
+            setType(stmt.name, mergedType);
+          } else if (!targetType) {
+            setType(stmt.name, valueType);
+          }
+        }
+        break;
+      }
+      case "Return": {
+        const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
+        if (methodReturnType && !isTypeCompatible(methodReturnType, valueType)) {
+          throw new Error(`Type error: return value ${valueType} does not match ${methodReturnType}`);
+        }
+        break;
+      }
+      case "Print": {
+        if (stmt.expr) visitExpression(stmt.expr);
+        break;
+      }
+      case "Block": {
+        pushScope();
+        visitStatements(stmt.body, scopes[scopes.length - 1]);
+        popScope();
+        break;
+      }
+      case "If": {
+        for (const clause of stmt.cases || []) {
+          visitExpression(clause.cond);
+          const branchBlock = clause.thenBlock;
+          if (branchBlock && Array.isArray(branchBlock.body)) {
+            for (const child of branchBlock.body) {
+              if (child && child.type === "Assign" && child.name) {
+                const declaredType = lookupType(child.name);
+                if (declaredType && declaredType !== "Any") {
+                  const valueType = child.value ? visitExpression(child.value) : "Any";
+                  if (!isTypeCompatible(declaredType, valueType)) {
+                    throw new Error(`Type error: cannot assign ${valueType} to ${declaredType}`);
+                  }
+                }
+              }
+            }
+          }
+          visitStatement(branchBlock, currentScope, methodReturnType);
+        }
+        if (stmt.elseBlock) {
+          if (stmt.elseBlock && Array.isArray(stmt.elseBlock.body)) {
+            for (const child of stmt.elseBlock.body) {
+              if (child && child.type === "Assign" && child.name) {
+                const declaredType = lookupType(child.name);
+                if (declaredType && declaredType !== "Any") {
+                  const valueType = child.value ? visitExpression(child.value) : "Any";
+                  if (!isTypeCompatible(declaredType, valueType)) {
+                    throw new Error(`Type error: cannot assign ${valueType} to ${declaredType}`);
+                  }
+                }
+              }
+            }
+          }
+          visitStatement(stmt.elseBlock, currentScope, methodReturnType);
+        }
+        break;
+      }
+      case "For": {
+        if (stmt.init) visitStatement(stmt.init, currentScope, methodReturnType);
+        if (stmt.cond) visitExpression(stmt.cond);
+        if (stmt.update) visitStatement(stmt.update, currentScope, methodReturnType);
+        if (stmt.body) visitStatement(stmt.body, currentScope, methodReturnType);
+        break;
+      }
+      case "While": {
+        if (stmt.cond) visitExpression(stmt.cond);
+        if (stmt.body) visitStatement(stmt.body, currentScope, methodReturnType);
+        break;
+      }
+      case "On": {
+        if (stmt.body) visitStatement(stmt.body, currentScope, methodReturnType);
+        break;
+      }
+      case "Method": {
+        const methodScope = new Map();
+        if (Array.isArray(stmt.params) && Array.isArray(stmt.paramTypes)) {
+          stmt.params.forEach((name, index) => {
+            const declaredType = stmt.paramTypes[index] ? normalizeTypeName(stmt.paramTypes[index]) : "Any";
+            methodScope.set(name, declaredType);
+          });
+        }
+        const returnType = stmt.returnType ? normalizeTypeName(stmt.returnType) : null;
+        if (stmt.body && stmt.body.body) visitStatements(stmt.body.body, methodScope, returnType);
+        break;
+      }
+      case "Class": {
+        for (const member of stmt.members || []) visitStatement(member, currentScope, methodReturnType);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  for (const node of rootAst) {
+    if (node && node.type === "On" && node.body && node.body.body) {
+      visitStatements(node.body.body);
+    } else {
+      visitStatement(node);
+    }
+  }
+}
+
 const generator = require("./lib/generator");
 
 /* -------------------------
@@ -1103,6 +1881,7 @@ const cleaned = input;
 let nestedInput = null;
 let usedClasses = false;
 let arraysUsed = false;
+let objectsUsed = false;
 let lambdasUsed = false;
 // Try parse as JSON first (user may have provided nested JSON file)
 try {
@@ -1125,12 +1904,15 @@ if (!nestedInput) {
     function preprocessSource(src) {
       let s = src;
       // throw new Error("...") -> jw_throw("...")
-      s = s.replace(/throw\s+new\s+Error\s*\(\s*("([^"\\]|\\.)*"|'([^'\\]|\\.)*'|[^)]*?)\s*\)/g, 'jw_throw($1)');
+      s = s.replace(
+        /throw\s+new\s+Error\s*\(\s*("([^"\\]|\\.)*"|'([^'\\]|\\.)*'|[^)]*?)\s*\)/g,
+        "jw_throw($1)",
+      );
       // general throw <expr> up to a semicolon, newline, or closing brace
-      s = s.replace(/\bthrow\b\s+([^;\n\}]+)/g, 'jw_throw($1)');
+      s = s.replace(/\bthrow\b\s+([^;\n\}]+)/g, "jw_throw($1)");
       // yield <expr> -> jw_yield(<expr>) (handle both paren and non-paren forms)
-      s = s.replace(/\byield\b\s*\(\s*([^)]*?)\s*\)/g, 'jw_yield($1)');
-      s = s.replace(/\byield\b\s+([^;\n\}]+)/g, 'jw_yield($1)');
+      s = s.replace(/\byield\b\s*\(\s*([^)]*?)\s*\)/g, "jw_yield($1)");
+      s = s.replace(/\byield\b\s+([^;\n\}]+)/g, "jw_yield($1)");
       return s;
     }
 
@@ -1186,8 +1968,12 @@ if (!nestedInput) {
     try {
       normalizeAstArrays(ast);
       try {
+        performStaticTypeAnalysis(ast);
         //fs.writeFileSync("/tmp/pang_ast_debug_normalized.json", JSON.stringify(ast, null, 2), "utf8");
-      } catch (e) {}
+      } catch (e) {
+        console.error("Type analysis error:", e && e.message ? e.message : e);
+        process.exit(1);
+      }
     } catch (e) {
       // non-fatal; continue with original ast
     }
@@ -1329,7 +2115,8 @@ if (!nestedInput) {
         const s = stmts[i];
         if (!s) continue;
         if (s.type === "Break" || s.type === "Continue") {
-          if (i < stmts.length - 1) throw new Error(`Cannot have code after '${s.type.toLowerCase()}' in the same block`);
+          if (i < stmts.length - 1)
+            throw new Error(`Cannot have code after '${s.type.toLowerCase()}' in the same block`);
         }
         // Recurse into nested blocks where break rules also apply
         if (s.type === "If") {
@@ -1371,26 +2158,42 @@ if (!nestedInput) {
       }
       if (node.type === "Class") return;
       if (node.type === "Block" && Array.isArray(node.body)) return walk(node.body, false);
-      if (node.type === "On" && node.body && Array.isArray(node.body.body)) return walk(node.body.body, false);
+      if (node.type === "On" && node.body && Array.isArray(node.body.body))
+        return walk(node.body.body, false);
       if (node.body && Array.isArray(node.body)) return walk(node.body, false);
     }
     walk(root, true);
   }
   collectGlobalVariables(ast);
+  globalNames.add("_INTERNAL__runtime_typeof__AABBCCDDEE12123434__");
 
   // Collect class definitions (name -> method param lists) so constructor
   // argument mapping can be emitted later during nested conversion.
   const classRegistry = {};
   // Map of variables assigned lambda values -> param name lists
   const varToLambda = {};
+  let currentMethodParams = null;
+  // Pre-register the potential _INTERNAL__runtime_typeof__AABBCCDDEE12123434__ helper as a lambda-valued
+  // global. Calls to it (emitted from the Typeof fallback in exprToNested)
+  // may happen before we know whether the helper declaration itself will
+  // be injected (that decision is only made at the very end of the
+  // pipeline). Without this, such calls fall through to being emitted as a
+  // raw, nonexistent opcode named "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__" instead of invoking the
+  // lambda stored in the global variable of the same name.
+  const RUNTIME_TYPEOF_PARAMS = ["v", "isVarName", "type"];
+  varToLambda["_INTERNAL__runtime_typeof__AABBCCDDEE12123434__"] = {
+    arr: RUNTIME_TYPEOF_PARAMS.map((_, i) => `__arg${i}`),
+    map: RUNTIME_TYPEOF_PARAMS.reduce((m, p, i) => {
+      m[p] = `__arg${i}`;
+      return m;
+    }, {}),
+    params: RUNTIME_TYPEOF_PARAMS.slice(),
+  };
   function getClassMethodKey(className, methodName, kind = "method") {
     if (!className || !methodName) return methodName;
-    const cls = classRegistry[className];
-    if (!cls || !cls.methodInfo || !cls.methodInfo[methodName]) return methodName;
-    const info = cls.methodInfo[methodName];
-    if (kind === "getter" && info.getterKey) return info.getterKey;
-    if (kind === "setter" && info.setterKey) return info.setterKey;
-    return info.key || info.getterKey || info.setterKey || methodName;
+    // Class methods should always use literal names to avoid UID-based
+    // selector mismatches across branches and simplify generated class code.
+    return methodName;
   }
   // Helpers to access method param/return metadata which may store
   // getter/setter/method variants. Returns arrays or null.
@@ -1401,7 +2204,7 @@ if (!nestedInput) {
     const v = cls.methods[methodName];
     if (!v) return null;
     if (Array.isArray(v)) return v;
-    if (typeof v === 'object') return v[kind] || v.method || v.getter || v.setter || null;
+    if (typeof v === "object") return v[kind] || v.method || v.getter || v.setter || null;
     return null;
   }
   function getMethodReturns(className, methodName, kind = "method") {
@@ -1411,7 +2214,7 @@ if (!nestedInput) {
     const v = cls.methodReturns[methodName];
     if (!v) return null;
     if (Array.isArray(v)) return v;
-    if (typeof v === 'object') return v[kind] || v.method || v.getter || v.setter || null;
+    if (typeof v === "object") return v[kind] || v.method || v.getter || v.setter || null;
     return null;
   }
   function getMethodReturnOriginals(className, methodName, kind = "method") {
@@ -1421,7 +2224,7 @@ if (!nestedInput) {
     const v = cls.methodReturnOriginals[methodName];
     if (!v) return null;
     if (Array.isArray(v)) return v;
-    if (typeof v === 'object') return v[kind] || v.method || v.getter || v.setter || null;
+    if (typeof v === "object") return v[kind] || v.method || v.getter || v.setter || null;
     return null;
   }
   // Helper to query method metadata flags (getter/setter/static)
@@ -1436,24 +2239,93 @@ if (!nestedInput) {
     return false;
   }
   // Helper to choose an argument temp name for method calls.
-  // Prefer recorded tagged param names when available, otherwise
-  // synthesize a per-method arg temp using a stable scopeKey so
-  // repeated call-sites use the same uid within a run.
+  // Prefer recorded tagged param names when available; otherwise use a
+  // deterministic indexed arg temp so lambda wrappers stay stable and
+  // consistent across object-property calls.
   function getArgTempForCall(className, methodName, kind = "method", base = "value", index = 0) {
     if (className && methodName) {
       const params = getMethodParams(className, methodName, kind);
       if (Array.isArray(params) && params.length > index) return params[index];
-      return __pw_newArgTemp(base, `class:${className}:${kind}:${methodName}:arg:${index}`);
     }
-    // fallback: use methodName if present to namespace the arg temp
-    return __pw_newArgTemp(base, methodName ? `call:${methodName}:arg:${index}` : undefined);
+    return `__arg${index}`;
+  }
+  // Record lambdas stored as properties of an object literal so that later
+  // calls like `obj.fn(a, b)` can set the proper indexed arg temps
+  // (`__arg0`, `__arg1`, ...) before invoking the lambda. Keyed by the
+  // dotted path `${targetName}.${propKey}`.
+  function recordObjectLambdaProps(targetName, objNode) {
+    if (!targetName || !objNode || objNode.type !== "Object" || !Array.isArray(objNode.props)) return;
+    for (const p of objNode.props) {
+      if (!p || !p.value || p.value.type !== "Lambda") continue;
+      const key = p.key;
+      if (typeof key !== "string") continue;
+      const lp = Array.isArray(p.value.params)
+        ? p.value.params.slice()
+        : p.value.params
+          ? [p.value.params]
+          : [];
+      const arr = lp.map((_, i) => `__arg${i}`);
+      const map = {};
+      lp.forEach((x, i) => {
+        if (x) map[x] = `__arg${i}`;
+      });
+      varToLambda[`${targetName}.${key}`] = { arr, map, params: lp.slice() };
+    }
+  }
+  // Build the thread-scoped setter blocks that bind each argument to its
+  // indexed lambda arg temp (`__arg0`, `__arg1`, ...) before a lambda call.
+  // Returns an array of `SPtempVars_setVar` nested blocks.
+  function buildLambdaArgSetters(vinfo, args, inMethod, paramMap) {
+    const setters = [];
+    const hasNamed = vinfo && Array.isArray(vinfo.arr) && vinfo.arr.length > 0;
+    const count = hasNamed ? Math.max(vinfo.arr.length, args ? args.length : 0) : args ? args.length : 0;
+    for (let i = 0; i < count; i++) {
+      const pname = hasNamed ? vinfo.arr[i] : `__arg${i}`;
+      const argExpr = args && args[i] ? exprToNested(args[i], inMethod, paramMap) : "";
+      setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
+    }
+    return setters;
+  }
+  // Resolve lambda tracking info for a member-call chain, supporting both
+  // top-level object properties (`obj.fn`) and static class members.
+  function getMemberLambdaInfo(chain) {
+    if (!Array.isArray(chain) || chain.length < 2) return null;
+    const first = chain[0];
+    if (typeof first !== "string") return null;
+    const prop = chain[chain.length - 1];
+    const dotted = `${first}.${prop}`;
+    if (varToLambda[dotted]) return varToLambda[dotted];
+    // also try intermediate chains for nested objects (e.g. a.b.fn)
+    for (let i = 1; i < chain.length - 1; i++) {
+      const prefix = chain.slice(0, i + 1).join(".");
+      const suffix = chain[chain.length - 1];
+      const key = `${prefix}.${suffix}`;
+      if (varToLambda[key]) return varToLambda[key];
+    }
+    return null;
   }
   function getClassGlobalRef(className) {
     if (!className) return null;
-    if ((className === emittingClass && emittingStaticMethod) || (className === emittingClass && emittingClassStaticInit)) {
+    if (
+      (className === emittingClass && emittingStaticMethod) ||
+      (className === emittingClass && emittingClassStaticInit)
+    ) {
       return { opcode: "jwClass_self", inputs: [], noPlaceholder: true };
     }
     return { opcode: "SPtempVars_getVar", inputs: ["global", String(className)], noPlaceholder: true };
+  }
+  function resolveReceiverClass(receiverName, fallbackClass = null, params = null) {
+    if (!receiverName) return fallbackClass || null;
+    if (receiverName === "this") return fallbackClass || emittingClass || null;
+    if (typeof receiverName === "string") {
+      if (varToClass[receiverName]) return varToClass[receiverName];
+      if (classRegistry[receiverName]) return receiverName;
+      if (fallbackClass && Array.isArray(params) && params.includes(receiverName)) return fallbackClass;
+      if (emittingClass && Array.isArray(params) && params.includes(receiverName)) return emittingClass;
+      if (currentMethodParams && currentMethodParams.includes(receiverName))
+        return emittingClass || fallbackClass || null;
+    }
+    return fallbackClass || null;
   }
   function getClassStaticGet(className, propName) {
     const classRef = getClassGlobalRef(className);
@@ -1466,14 +2338,47 @@ if (!nestedInput) {
     return { opcode: "jwClass_setStatic", inputs: [propName, classRef, value] };
   }
   function isClassStaticReceiverChain(chain) {
-    return Array.isArray(chain) && chain.length >= 2 && typeof chain[0] === "string" && chain[0] !== "this" && classRegistry[chain[0]];
+    return (
+      Array.isArray(chain) &&
+      chain.length >= 2 &&
+      typeof chain[0] === "string" &&
+      chain[0] !== "this" &&
+      classRegistry[chain[0]]
+    );
   }
   function buildClassStaticReceiver(chain) {
     const className = chain[0];
     const firstProp = chain[1];
     const classRef = getClassGlobalRef(className);
-    const receiver = getClassStaticGet(className, firstProp) || { opcode: "jwClass_getProp", inputs: [firstProp, classRef] };
-    for (let i = 2; i < chain.length - 1; i++) receiver = { opcode: "jwClass_getProp", inputs: [chain[i], receiver] };
+    let receiver = getClassStaticGet(className, firstProp) || makeGet(firstProp, classRef);
+    for (let i = 2; i < chain.length - 1; i++) receiver = makeGet(chain[i], receiver);
+    return receiver;
+  }
+  // Build an object/property receiver nested from a chain of names (used by
+  // array helper method dispatch). Remaps lambda-parameter receiver names to
+  // their tagged thread temps so method calls on lambda arguments resolve to
+  // `__arg0` rather than a global variable get.
+  function buildMemberChainReceiver(chainItems, inMethod, paramMap) {
+    if (!Array.isArray(chainItems) || chainItems.length === 0) return null;
+    const first = chainItems[0];
+    if (typeof first === "string" && first === "this" && emittingClass && emittingStaticMethod) {
+      let receiver = getClassStaticGet(emittingClass, chainItems[1]);
+      for (let i = 2; i < chainItems.length; i++) receiver = makeGet(chainItems[i], receiver);
+      return receiver;
+    }
+    if (isClassStaticReceiverChain(chainItems)) return buildClassStaticReceiver(chainItems);
+    let receiver = null;
+    if (typeof first === "string") {
+      receiver =
+        first === "this"
+          ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+          : mapReceiverName(first, paramMap);
+    } else if (typeof first === "object") {
+      receiver = exprToNested(first, inMethod, paramMap);
+    } else {
+      receiver = { type: "Var", name: String(first) };
+    }
+    for (let i = 1; i < chainItems.length; i++) receiver = makeGet(chainItems[i], receiver);
     return receiver;
   }
   function collectClasses(root) {
@@ -1485,23 +2390,29 @@ if (!nestedInput) {
       }
       if (node.type === "Class") {
         const name = node.name;
-        classRegistry[name] = { methods: {}, methodInfo: {}, methodReturns: {}, methodReturnOriginals: {} };
+        classRegistry[name] = {
+          methods: {},
+          methodInfo: {},
+          methodReturns: {},
+          methodReturnOriginals: {},
+          instanceReturningMethods: {},
+        };
         // Mark that classes are present/used as soon as we discover one.
         usedClasses = true;
         for (const m of node.members || []) {
-            // Detect simple static property assignments in the class body such as
-            // `MyClass.foo = ...` (these appear as Assign members with a
-            // memberChain whose first element is the class name). Record such
-            // names so the emitter can later treat them as static properties.
-            if (m && m.type === "Assign" && Array.isArray(m.memberChain) && m.memberChain.length >= 2) {
-              const base = m.memberChain[0];
-              const pname = m.memberChain[1];
-              if (base === name) {
-                classRegistry[name].staticProps = classRegistry[name].staticProps || {};
-                classRegistry[name].staticProps[pname] = true;
-                continue;
-              }
+          // Detect simple static property assignments in the class body such as
+          // `MyClass.foo = ...` (these appear as Assign members with a
+          // memberChain whose first element is the class name). Record such
+          // names so the emitter can later treat them as static properties.
+          if (m && m.type === "Assign" && Array.isArray(m.memberChain) && m.memberChain.length >= 2) {
+            const base = m.memberChain[0];
+            const pname = m.memberChain[1];
+            if (base === name) {
+              classRegistry[name].staticProps = classRegistry[name].staticProps || {};
+              classRegistry[name].staticProps[pname] = true;
+              continue;
             }
+          }
           // generate tagged param names for this method so call-sites
           // and the method body use the same synthetic thread-var names.
           const origParams = Array.isArray(m.params) ? m.params.slice() : m.params ? [m.params] : [];
@@ -1526,7 +2437,7 @@ if (!nestedInput) {
             else if (m.setter) obj.setter = tagged;
             else obj.method = tagged;
             classRegistry[name].methods[m.name] = obj;
-          } else if (typeof existing === 'object') {
+          } else if (typeof existing === "object") {
             if (m.getter) existing.getter = tagged;
             else if (m.setter) existing.setter = tagged;
             else existing.method = tagged;
@@ -1554,6 +2465,42 @@ if (!nestedInput) {
           if (m.getter && m.setter) {
             throw new Error(`Class '${name}': method '${m.name}' cannot be both a getter and a setter`);
           }
+          function findReturnedClass(node) {
+            if (!node) return null;
+            if (Array.isArray(node)) {
+              for (const x of node) {
+                const value = findReturnedClass(x);
+                if (value) return value;
+              }
+              return null;
+            }
+            if (node.type === "Return" && node.value && node.value.type === "New") {
+              const callee = node.value.callee;
+              if (callee && callee.type === "Call" && typeof callee.name === "string") return callee.name;
+              if (
+                callee &&
+                callee.type === "MemberCall" &&
+                Array.isArray(callee.chain) &&
+                callee.chain.length > 0
+              ) {
+                return callee.chain[0];
+              }
+            }
+            if (node.body && Array.isArray(node.body)) return findReturnedClass(node.body);
+            if (node.body && node.body.body) return findReturnedClass(node.body.body);
+            for (const k of Object.keys(node)) {
+              if (node[k] && typeof node[k] === "object") {
+                const value = findReturnedClass(node[k]);
+                if (value) return value;
+              }
+            }
+            return null;
+          }
+          const returnedClassName = findReturnedClass(m.body);
+          if (returnedClassName) {
+            classRegistry[name].instanceReturningMethods[m.name] = returnedClassName;
+          }
+
           // Detect if this method returns a lambda at the top level of its body
           let retLambdaParams = null;
           if (m && m.body && Array.isArray(m.body.body)) {
@@ -1571,7 +2518,7 @@ if (!nestedInput) {
           // getter/setter/method variants to coexist.
           const storeReturn = (keyKind) => {
             if (Array.isArray(retLambdaParams) && retLambdaParams.length > 0) {
-              return { orig: retLambdaParams.slice(), tagged: retLambdaParams.map((p, i) => 'arg' + i) };
+              return { orig: retLambdaParams.slice(), tagged: retLambdaParams.map((p, i) => "arg" + i) };
             }
             return { orig: retLambdaParams, tagged: retLambdaParams };
           };
@@ -1599,7 +2546,7 @@ if (!nestedInput) {
             }
           } else {
             // merge into existing object shapes
-            if (typeof prevOrig === 'object' && !Array.isArray(prevOrig)) {
+            if (typeof prevOrig === "object" && !Array.isArray(prevOrig)) {
               if (m.getter) prevOrig.getter = retInfo.orig;
               if (m.setter) prevOrig.setter = retInfo.orig;
               if (!m.getter && !m.setter) prevOrig.method = retInfo.orig;
@@ -1610,7 +2557,7 @@ if (!nestedInput) {
               if (m.setter) obj.setter = retInfo.orig;
               classRegistry[name].methodReturnOriginals[m.name] = obj;
             }
-            if (typeof prevTagged === 'object' && !Array.isArray(prevTagged)) {
+            if (typeof prevTagged === "object" && !Array.isArray(prevTagged)) {
               if (m.getter) prevTagged.getter = retInfo.tagged;
               if (m.setter) prevTagged.setter = retInfo.tagged;
               if (!m.getter && !m.setter) prevTagged.method = retInfo.tagged;
@@ -1639,33 +2586,78 @@ if (!nestedInput) {
   // Map thread-temp names (from inline wrappers) to class names so we can
   // resolve getters/setters on temps produced by `New` inline wrappers.
   const tempToClass = {};
+  const knownFactoryMethods = ["alloc", "allocUnsafe", "from", "create", "new"];
   function collectVarAssignments(root) {
-    function walk(node) {
-      if (!node) return;
-      if (Array.isArray(node)) {
-        for (const n of node) walk(n);
+    function recordAssignedClass(name, valueNode, currentClassName, methodParams) {
+      if (!name || !valueNode) return;
+      if (valueNode.type === "New") {
+        const callee = valueNode.callee;
+        if (callee && callee.type === "Call" && typeof callee.name === "string") {
+          varToClass[name] = callee.name;
+        }
         return;
       }
-      if (node.type === "Declare" && node.value && node.value.type === "New") {
-        const callee = node.value.callee;
-        if (callee && callee.type === "Call" && typeof callee.name === "string") {
-          varToClass[node.name] = callee.name;
+      if (valueNode.type === "Call") {
+        const call = valueNode;
+        if (typeof call.receiver === "string" && classRegistry[call.receiver]) {
+          if (knownFactoryMethods.includes(call.method)) {
+            varToClass[name] = call.receiver;
+          }
         }
+        return;
+      }
+      if (valueNode.type === "MemberCall") {
+        const call = valueNode;
+        if (Array.isArray(call.chain) && call.chain.length >= 2) {
+          const receiverName = call.chain[0];
+          const methodName = call.chain[call.chain.length - 1];
+          const receiverClass = resolveReceiverClass(receiverName, currentClassName, methodParams);
+          if (receiverClass) {
+            const cls = classRegistry[receiverClass];
+            if (cls && cls.instanceReturningMethods && cls.instanceReturningMethods[methodName]) {
+              varToClass[name] = cls.instanceReturningMethods[methodName];
+            }
+          }
+          if (
+            typeof receiverName === "string" &&
+            classRegistry[receiverName] &&
+            knownFactoryMethods.includes(methodName)
+          ) {
+            varToClass[name] = receiverName;
+          }
+        }
+      }
+    }
+
+    function walk(node, currentClassName = null, methodParams = null) {
+      if (!node) return;
+      if (Array.isArray(node)) {
+        for (const n of node) walk(n, currentClassName, methodParams);
+        return;
+      }
+      if (node.type === "Declare") {
+        recordAssignedClass(node.name, node.value, currentClassName, methodParams);
       }
       // Track variables initialized to lambda expressions so we know their arg names
       if (node.type === "Declare" && node.value && node.value.type === "Lambda") {
         const lp = node.value.params;
         if (Array.isArray(lp)) {
-          const arr = lp.map((p, i) => '__arg' + i);
+          const arr = lp.map((p, i) => `__arg${i}`);
           const map = {};
-          lp.forEach((p, i) => { if (p) map[p] = '__arg' + i; });
+          lp.forEach((p, i) => {
+            if (p) map[p] = `__arg${i}`;
+          });
           varToLambda[node.name] = { arr, map, params: lp.slice() };
         } else if (lp) {
-          const tmp = '__arg0';
+          const tmp = "__arg0";
           varToLambda[node.name] = { arr: [tmp], map: { [lp]: tmp }, params: [lp] };
         } else varToLambda[node.name] = { arr: [], map: {}, params: [] };
       }
-      // If a variable is declared with an Array literal that contains a Lambda
+      // Track lambdas stored as properties of an object literal so calls like
+      // `obj.fn(a, b)` set the correct indexed arg temps before invoking.
+      if (node.type === "Declare" && node.value && node.value.type === "Object") {
+        recordObjectLambdaProps(node.name, node.value);
+      }
       // element, record the lambda param tagging so later `get(var, idx)` can
       // reuse the same arg temp names. Use the first Lambda element found.
       if (node.type === "Declare" && node.value && node.value.type === "Array") {
@@ -1675,35 +2667,39 @@ if (!nestedInput) {
           if (el && el.type === "Lambda") {
             const lp = el.params;
             if (Array.isArray(lp)) {
-              const arr = lp.map((p, i) => 'arg' + i);
+              const arr = lp.map((p, i) => `__arg${i}`);
               const map = {};
-              lp.forEach((p, i) => { if (p) map[p] = 'arg' + i; });
+              lp.forEach((p, i) => {
+                if (p) map[p] = `__arg${i}`;
+              });
               varToLambda[node.name] = { arr, map, params: lp.slice() };
             } else if (lp) {
-              const tmp = 'arg0';
+              const tmp = "__arg0";
               varToLambda[node.name] = { arr: [tmp], map: { [lp]: tmp }, params: [lp] };
             } else varToLambda[node.name] = { arr: [], map: {}, params: [] };
             break;
           }
         }
       }
-      if (node.type === "Assign" && node.value && node.value.type === "New") {
-        const callee = node.value.callee;
-        if (callee && callee.type === "Call" && typeof callee.name === "string") {
-          varToClass[node.name] = callee.name;
-        }
+      if (node.type === "Assign") {
+        recordAssignedClass(node.name, node.value, currentClassName, methodParams);
       }
       if (node.type === "Assign" && node.value && node.value.type === "Lambda") {
         const lp = node.value.params;
         if (Array.isArray(lp)) {
-          const arr = lp.map((p, i) => (p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p));
+          const arr = lp.map((p, i) => (p ? `__arg${i}` : p));
           const map = {};
           for (let i = 0; i < lp.length; i++) if (lp[i]) map[lp[i]] = arr[i];
           varToLambda[node.name] = { arr, map, params: lp.slice() };
         } else if (lp) {
-          const tmp = __pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`);
+          const tmp = "__arg0";
           varToLambda[node.name] = { arr: [tmp], map: { [lp]: tmp }, params: [lp] };
         } else varToLambda[node.name] = { arr: [], map: {}, params: [] };
+      }
+      // Track lambdas stored as properties of an object literal so calls like
+      // `obj.fn(a, b)` set the correct indexed arg temps before invoking.
+      if (node.type === "Assign" && node.value && node.value.type === "Object") {
+        recordObjectLambdaProps(node.name, node.value);
       }
       // Also handle Assign where RHS is an Array containing a Lambda
       if (node.type === "Assign" && node.value && node.value.type === "Array") {
@@ -1713,24 +2709,52 @@ if (!nestedInput) {
           if (el && el.type === "Lambda") {
             const lp = el.params;
             if (Array.isArray(lp)) {
-              const arr = lp.map((p, i) => (p ? __pw_newArgTemp(p, `var:${node.name}:param:${i}:${p}`) : p));
+              const arr = lp.map((p, i) => (p ? `__arg${i}` : p));
               const map = {};
               for (let i = 0; i < lp.length; i++) if (lp[i]) map[lp[i]] = arr[i];
               varToLambda[node.name] = { arr, map, params: lp.slice() };
             } else if (lp) {
-              const tmp = __pw_newArgTemp(lp, `var:${node.name}:param:0:${lp}`);
+              const tmp = "__arg0";
               varToLambda[node.name] = { arr: [tmp], map: { [lp]: tmp }, params: [lp] };
             } else varToLambda[node.name] = { arr: [], map: {}, params: [] };
             break;
           }
         }
       }
-      if (node.type === "Block" && Array.isArray(node.body)) return walk(node.body);
-      if (node.type === "On" && node.body && Array.isArray(node.body.body)) return walk(node.body.body);
-      if (node.body && Array.isArray(node.body)) return walk(node.body);
+      if (node.type === "Class") {
+        const nextClassName = node.name;
+        for (const child of node.members || []) {
+          if (child && child.type === "Method") {
+            const nextParams = Array.isArray(child.params) ? child.params.slice() : [];
+            walk(child.body, nextClassName, nextParams);
+          } else {
+            walk(child, nextClassName, methodParams);
+          }
+        }
+        return;
+      }
+      if (node.type === "Method") {
+        const nextParams = Array.isArray(node.params) ? node.params.slice() : [];
+        walk(node.body, currentClassName, nextParams);
+        return;
+      }
+      if (node.type === "Block" && Array.isArray(node.body))
+        return walk(node.body, currentClassName, methodParams);
+      if (node.type === "On" && node.body && Array.isArray(node.body.body))
+        return walk(node.body.body, currentClassName, methodParams);
+      if (node.body && Array.isArray(node.body)) return walk(node.body, currentClassName, methodParams);
     }
     walk(root);
   }
+
+  // Emitter state referenced (via closures) during the precollection pass
+  // below, so it must be initialized before that pass runs to avoid a
+  // temporal-dead-zone error when `resolveReceiverClass` reads it.
+  let emittingClass = null;
+  let emittingStaticMethod = false;
+  let emittingClassStaticInit = false;
+  let runtimeTypeofHelperUsed = false;
+
   collectVarAssignments(ast);
 
   // Map of method-local declared variable names: { "Class:method": Set<name> }
@@ -1779,19 +2803,33 @@ if (!nestedInput) {
   }
   collectMethodLocalDecls(ast);
 
+  // Stack of loop-variable names currently in scope. A `for` loop pushes its
+  // counter before emitting its body and pops it afterward. Loop counters are
+  // always thread-scoped (they live only for the duration of the iteration),
+  // so any reference to one resolves to "thread" regardless of top-level/global
+  // classification. This keeps `forVar` (which hard-codes "thread" for the
+  // counter) consistent with the `getVar`/`setVar` references inside its body.
+  const loopVarStack = [];
   // Helper to decide whether a variable name should be emitted as a
   // thread-scoped temp or a global. Preferences:
   // - explicit `thread` kind -> thread
+  // - a loop counter currently in scope -> thread
   // - inside a method: params, synthetic `__` names, and any name declared
   //   in the current method -> thread
   // - otherwise, if a known top-level global -> global
   // - fallback: thread inside methods, global at top-level
   function varScopeForName(name, inMethod, paramMap, kind) {
     if (kind === "thread") return "thread";
+    if (name && loopVarStack.includes(name)) return "thread";
     if (inMethod) {
       if (name && paramMap && Object.prototype.hasOwnProperty.call(paramMap, name)) return "thread";
       if (name && name.startsWith("__")) return "thread";
-      if (currentEmittingMethodKey && methodLocalDecls[currentEmittingMethodKey] && methodLocalDecls[currentEmittingMethodKey].has(name)) return "thread";
+      if (
+        currentEmittingMethodKey &&
+        methodLocalDecls[currentEmittingMethodKey] &&
+        methodLocalDecls[currentEmittingMethodKey].has(name)
+      )
+        return "thread";
       if (name && globalNames.has(name)) return "global";
       return "thread";
     }
@@ -1802,9 +2840,327 @@ if (!nestedInput) {
   // name so `this` receiver lookups can be resolved to the proper
   // `classRegistry` entry (ensures `this.add(...)` uses the same
   // tagged param names as external calls like `num.add(...)`).
-  let emittingClass = null;
-  let emittingStaticMethod = false;
-  let emittingClassStaticInit = false;
+
+  function buildRuntimeTypeofHelperDecl() {
+    return {
+      type: "On",
+      event: "flag",
+      body: {
+        type: 'Block',
+        body: [
+          {
+            type: "Declare",
+            name: "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__",
+            kind: "let",
+            value: {
+              type: "Lambda",
+              params: ["v", "isVarName", "type"],
+              body: {
+                type: "Block",
+                body: [
+                  {
+                    type: "Declare",
+                    kind: "let",
+                    name: "value",
+                    value: { type: "Literal", litType: "string", value: "" },
+                  },
+                  {
+                    type: "If",
+                    cases: [
+                      {
+                        cond: { type: "Var", name: "isVarName" },
+                        thenBlock: {
+                          type: "Block",
+                          body: [
+                            {
+                              type: "If",
+                              cases: [
+                                {
+                                  cond: {
+                                    type: "Binary",
+                                    op: "==",
+                                    left: { type: "Var", name: "type" },
+                                    right: { type: "Literal", litType: "string", value: "global" },
+                                  },
+                                  thenBlock: {
+                                    type: "Block",
+                                    body: [
+                                      {
+                                        type: "If",
+                                        cases: [
+                                          {
+                                            cond: {
+                                              type: "Unary",
+                                              op: "!",
+                                              operand: {
+                                                type: "Call",
+                                                name: "SPtempVars_varExists",
+                                                args: [
+                                                  { type: "Literal", litType: "string", value: "global" },
+                                                  { type: "Var", name: "v" },
+                                                ],
+                                              },
+                                            },
+                                            thenBlock: {
+                                              type: "Block",
+                                              body: [
+                                                {
+                                                  type: "Return",
+                                                  value: {
+                                                    type: "Literal",
+                                                    litType: "string",
+                                                    value: "undefined",
+                                                  },
+                                                },
+                                              ],
+                                            },
+                                          },
+                                        ],
+                                        elseBlock: null,
+                                      },
+                                      {
+                                        type: "Assign",
+                                        name: "value",
+                                        value: {
+                                          type: "Call",
+                                          name: "SPtempVars_getVar",
+                                          args: [
+                                            { type: "Literal", litType: "string", value: "global" },
+                                            { type: "Var", name: "v" },
+                                          ],
+                                        },
+                                      },
+                                    ],
+                                  },
+                                },
+                              ],
+                              elseBlock: {
+                                type: "Block",
+                                body: [
+                                  {
+                                    type: "If",
+                                    cases: [
+                                      {
+                                        cond: {
+                                          type: "Unary",
+                                          op: "!",
+                                          operand: {
+                                            type: "Call",
+                                            name: "SPtempVars_varExists",
+                                            args: [
+                                              { type: "Literal", litType: "string", value: "thread" },
+                                              { type: "Var", name: "v" },
+                                            ],
+                                          },
+                                        },
+                                        thenBlock: {
+                                          type: "Block",
+                                          body: [
+                                            {
+                                              type: "Return",
+                                              value: { type: "Literal", litType: "string", value: "undefined" },
+                                            },
+                                          ],
+                                        },
+                                      },
+                                    ],
+                                    elseBlock: null,
+                                  },
+                                  {
+                                    type: "Assign",
+                                    name: "value",
+                                    value: {
+                                      type: "Call",
+                                      name: "SPtempVars_getVar",
+                                      args: [
+                                        { type: "Literal", litType: "string", value: "thread" },
+                                        { type: "Var", name: "v" },
+                                      ],
+                                    },
+                                  },
+                                ],
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                    elseBlock: {
+                      type: "Block",
+                      body: [
+                        {
+                          type: "Assign",
+                          name: "value",
+                          value: { type: "Var", name: "v" },
+                        },
+                      ],
+                    },
+                  },
+                  {
+                    type: "If",
+                    cases: [
+                      {
+                        cond: {
+                          type: "Call",
+                          name: "dogeiscutObject_is",
+                          args: [
+                            {
+                              type: "Call",
+                              name: "operator_stringify",
+                              args: [{ type: "Var", name: "value" }],
+                            },
+                          ],
+                        },
+                        thenBlock: {
+                          type: "Block",
+                          body: [
+                            {
+                              type: "Return",
+                              value: { type: "Literal", litType: "string", value: "object" },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                    elseBlock: {
+                      type: "Block",
+                      body: [
+                        {
+                          type: "If",
+                          cases: [
+                            {
+                              cond: {
+                                type: "Call",
+                                name: "jwArray_validate",
+                                args: [
+                                  {
+                                    type: "Call",
+                                    name: "operator_stringify",
+                                    args: [{ type: "Var", name: "value" }],
+                                  },
+                                ],
+                              },
+                              thenBlock: {
+                                type: "Block",
+                                body: [
+                                  {
+                                    type: "Return",
+                                    value: { type: "Literal", litType: "string", value: "array" },
+                                  },
+                                ],
+                              },
+                            },
+                          ],
+                          elseBlock: {
+                            type: "Block",
+                            body: [
+                              {
+                                type: "If",
+                                cases: [
+                                  {
+                                    cond: {
+                                      type: "Call",
+                                      name: "sensing_regextest",
+                                      args: [
+                                        { type: "Var", name: "value" },
+                                        {
+                                          type: "Literal",
+                                          litType: "string",
+                                          value: "^[+-]?(?:\\d+\.?\d*|\\.\d+)$",
+                                        },
+                                        { type: "Literal", litType: "string", value: "g" },
+                                      ],
+                                    },
+                                    thenBlock: {
+                                      type: "Block",
+                                      body: [
+                                        {
+                                          type: "Return",
+                                          value: { type: "Literal", litType: "string", value: "number" },
+                                        },
+                                      ],
+                                    },
+                                  },
+                                ],
+                                elseBlock: {
+                                  type: "Block",
+                                  body: [
+                                    {
+                                      type: "If",
+                                      cases: [
+                                        {
+                                          cond: {
+                                            type: "Call",
+                                            name: "sensing_regextest",
+                                            args: [
+                                              { type: "Var", name: "value" },
+                                              { type: "Literal", litType: "string", value: "^(?:true|false)$" },
+                                              { type: "Literal", litType: "string", value: "g" },
+                                            ],
+                                          },
+                                          thenBlock: {
+                                            type: "Block",
+                                            body: [
+                                              {
+                                                type: "Return",
+                                                value: { type: "Literal", litType: "string", value: "boolean" },
+                                              },
+                                            ],
+                                          },
+                                        },
+                                      ],
+                                      elseBlock: {
+                                        type: "Block",
+                                        body: [
+                                          {
+                                            type: "Return",
+                                            value: { type: "Literal", litType: "string", value: "string" },
+                                          },
+                                        ],
+                                      },
+                                    },
+                                  ],
+                                },
+                              },
+                            ],
+                          },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        ]
+      }
+    };
+  }
+
+  function hasRuntimeTypeofDefinition(astNodes) {
+    let found = false;
+    function walk(node) {
+      if (!node || found) return;
+      if (Array.isArray(node)) {
+        for (const child of node) walk(child);
+        return;
+      }
+      if (node.type === "Declare" && node.name === "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__") {
+        found = true;
+        return;
+      }
+      if (node.type === "Assign" && node.name === "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__") {
+        found = true;
+        return;
+      }
+      for (const key of Object.keys(node)) {
+        const child = node[key];
+        if (child && typeof child === "object") walk(child);
+      }
+    }
+    walk(astNodes);
+    return found;
+  }
 
   // Adjust array index for one-indexed arrays:
   // - If index is a numeric literal, add 1 at compile time.
@@ -1821,7 +3177,10 @@ if (!nestedInput) {
     if (idxNested && typeof idxNested === "object" && idxNested.type === "Var") {
       const vname = idxNested.name;
       const getterType = varScopeForName(vname, inMethod, paramMap, undefined);
-      return { opcode: "operator_add", inputs: [{ opcode: "SPtempVars_getVar", inputs: [getterType, String(vname)] }, 1] };
+      return {
+        opcode: "operator_add",
+        inputs: [{ opcode: "SPtempVars_getVar", inputs: [getterType, String(vname)] }, 1],
+      };
     }
     return { opcode: "operator_add", inputs: [idxNested, 1] };
   }
@@ -1843,7 +3202,7 @@ if (!nestedInput) {
       if (!localParamMap) {
         localParamMap = {};
         origParams.forEach((p, i) => {
-          if (p) localParamMap[p] = '__arg' + i;
+          if (p) localParamMap[p] = "__arg" + i;
         });
       }
       let lambdaArg;
@@ -1853,7 +3212,35 @@ if (!nestedInput) {
       else lambdaArg = origParams.map((p) => localParamMap[p]);
       let lambdaBody = [];
       if (expr.body && Array.isArray(expr.body.body)) {
-        const raw = expr.body.body.map((s) => stmtToNested(s, true, localParamMap)).filter(Boolean);
+        // For parameters with default values, prepend a guard that applies the
+        // default when the corresponding arg temp was not supplied by the caller
+        // (an unset thread temp reads as an empty string in the runtime).
+        const defaultGuards = [];
+        const defaults = Array.isArray(expr.paramDefaults) ? expr.paramDefaults : [];
+        for (let i = 0; i < origParams.length; i++) {
+          const dflt = defaults[i];
+          if (dflt == null) continue;
+          const paramName = origParams[i];
+          // Only apply the default when the supplied arg temp is empty (an
+          // unset thread temp reads as "" in the runtime).
+          const cond = {
+            type: "Binary",
+            op: "==",
+            left: { type: "Var", name: paramName },
+            right: { type: "Literal", litType: "string", value: "" },
+          };
+          const setDefault = {
+            type: "Assign",
+            name: paramName,
+            value: dflt,
+          };
+          defaultGuards.push({
+            type: "If",
+            cases: [{ cond, thenBlock: { type: "Block", body: [setDefault] } }],
+          });
+        }
+        const bodyStmts = defaultGuards.concat(expr.body.body);
+        const raw = bodyStmts.map((s) => stmtToNested(s, true, localParamMap)).filter(Boolean);
         lambdaBody = flattenNestedResults(raw);
         assertReturnTerminal(lambdaBody, "lambda body");
       }
@@ -1864,12 +3251,13 @@ if (!nestedInput) {
       function containsYieldNode(node) {
         if (!node) return false;
         if (Array.isArray(node)) return node.some(containsYieldNode);
-        if (typeof node === 'object') {
-          if ((node.opcode || node.name) === 'jw_yield') return true;
+        if (typeof node === "object") {
+          if ((node.opcode || node.name) === "jw_yield") return true;
           if (Array.isArray(node.inputs)) {
             for (const inp of node.inputs) if (containsYieldNode(inp)) return true;
           }
-          if (Array.isArray(node.children)) for (const c of node.children) if (containsYieldNode(c)) return true;
+          if (Array.isArray(node.children))
+            for (const c of node.children) if (containsYieldNode(c)) return true;
         }
         return false;
       }
@@ -1878,22 +3266,28 @@ if (!nestedInput) {
         function replaceYields(node) {
           if (!node) return node;
           if (Array.isArray(node)) return node.map(replaceYields);
-          if (typeof node === 'object') {
+          if (typeof node === "object") {
             const op = node.opcode || node.name;
-            if (op === 'jw_yield') {
+            if (op === "jw_yield") {
               const val = Array.isArray(node.inputs) && node.inputs.length > 0 ? node.inputs[0] : "";
-              return { opcode: 'jwArray_builderAppend', inputs: [val] };
+              return { opcode: "jwArray_builderAppend", inputs: [val] };
             }
             const out = Object.assign({}, node);
-            if (Array.isArray(out.inputs)) out.inputs = out.inputs.map((i) => (Array.isArray(i) ? i.map(replaceYields) : typeof i === 'object' ? replaceYields(i) : i));
+            if (Array.isArray(out.inputs))
+              out.inputs = out.inputs.map((i) =>
+                Array.isArray(i) ? i.map(replaceYields) : typeof i === "object" ? replaceYields(i) : i,
+              );
             if (Array.isArray(out.children)) out.children = out.children.map(replaceYields);
             return out;
           }
           return node;
         }
         const builderSubstack = lambdaBody.map(replaceYields);
-        const builderBlock = { opcode: 'jwArray_builder', inputs: [{ opcode: 'jwArray_builderCurrent', shadow: true, noPlaceholder: true }, builderSubstack] };
-        return { opcode: 'jwLambda_newLambdaR', inputs: [lambdaArg, builderBlock] };
+        const builderBlock = {
+          opcode: "jwArray_builder",
+          inputs: [{ opcode: "jwArray_builderCurrent", shadow: true, noPlaceholder: true }, builderSubstack],
+        };
+        return { opcode: "jwLambda_newLambdaR", inputs: [lambdaArg, builderBlock] };
       }
       return { opcode: "jwLambda_newLambda", inputs: [lambdaArg, lambdaBody] };
     }
@@ -1909,9 +3303,15 @@ if (!nestedInput) {
         const getter = { opcode: "SPtempVars_getVar", inputs: [destType, vname] };
         const tmp = __pw_newTemp("__i");
         const setTmp = { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, getter] };
-        const newVal = { opcode: op === "++" ? "operator_add" : "operator_subtract", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", tmp] }, 1] };
+        const newVal = {
+          opcode: op === "++" ? "operator_add" : "operator_subtract",
+          inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", tmp] }, 1],
+        };
         const setter = { opcode: "SPtempVars_setVar", inputs: [destType, vname, newVal] };
-        const ret = { opcode: "procedures_return", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", tmp] }] };
+        const ret = {
+          opcode: "procedures_return",
+          inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", tmp] }],
+        };
         return { opcode: "control_inline_stack_output", inputs: [[setTmp, setter, ret]] };
       }
       // Member case: obj.prop++
@@ -1925,11 +3325,11 @@ if (!nestedInput) {
           if (chain.length > 2) {
             if (chain[0] === "this" && emittingClass && emittingStaticMethod) {
               objReceiver = getClassStaticGet(emittingClass, chain[1]);
-              for (let i = 2; i < chain.length - 1; i++) objReceiver = { opcode: "jwClass_getProp", inputs: [chain[i], objReceiver] };
+              for (let i = 2; i < chain.length - 1; i++) objReceiver = makeGet(chain[i], objReceiver);
             } else if (isClassStaticReceiverChain(chain)) {
               objReceiver = buildClassStaticReceiver(chain);
             } else {
-              for (let i = 1; i < chain.length - 1; i++) objReceiver = { opcode: "jwClass_getProp", inputs: [chain[i], objReceiver] };
+              for (let i = 1; i < chain.length - 1; i++) objReceiver = makeGet(chain[i], objReceiver);
             }
           } else if (chain[0] === "this" && emittingClass && emittingStaticMethod) {
             objReceiver = getClassStaticGet(emittingClass, chain[1]);
@@ -1943,16 +3343,24 @@ if (!nestedInput) {
             setup.push({ opcode: "SPtempVars_setVar", inputs: ["thread", rtmp, receiverRef] });
             receiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", rtmp] };
           }
-          const currentVal = chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
-            ? getClassStaticGet(emittingClass, propName)
-            : { opcode: "jwClass_getProp", inputs: [propName, receiverRef] };
+          const currentVal =
+            chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
+              ? getClassStaticGet(emittingClass, propName)
+              : makeGet(propName, receiverRef);
           const oldTmp = __pw_newTemp("__i");
           setup.push({ opcode: "SPtempVars_setVar", inputs: ["thread", oldTmp, currentVal] });
-          const newVal = { opcode: op === "++" ? "operator_add" : "operator_subtract", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldTmp] }, 1] };
-          const setter = chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
-            ? getClassStaticSet(emittingClass, propName, newVal)
-            : { opcode: "jwClass_setProp", inputs: [propName, receiverRef, newVal] };
-          const ret = { opcode: "procedures_return", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldTmp] }] };
+          const newVal = {
+            opcode: op === "++" ? "operator_add" : "operator_subtract",
+            inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldTmp] }, 1],
+          };
+          const setter =
+            chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
+              ? getClassStaticSet(emittingClass, propName, newVal)
+              : makeSet(propName, receiverRef, newVal);
+          const ret = {
+            opcode: "procedures_return",
+            inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldTmp] }],
+          };
           return { opcode: "control_inline_stack_output", inputs: [setup.concat([setter, ret])] };
         }
       }
@@ -1961,6 +3369,60 @@ if (!nestedInput) {
     }
 
     if (expr.type === "Literal") return expr.value;
+
+    if (expr.type === "Typeof") {
+      const inner = [expr.expr, { type: "Literal", litType: "boolean", value: false },
+      { type: "Literal", litType: "string", value: "" },];
+      // If forceRuntime is true, skip compile-time resolution and always use runtime helper
+      if (!expr.forceRuntime) {
+        const innerType =
+        inner && typeof inner === "object" && inner.inferredType
+        ? inner.inferredType
+        : inner && typeof inner === "object" && inner.type === "Literal"
+        ? inner.litType === "number"
+        ? "Number"
+        : inner.litType === "string"
+        ? "String"
+        : inner.litType === "boolean"
+        ? "Boolean"
+        : "Any"
+        : null;
+        const resolved = getTypeofLabel(innerType);
+        if (resolved) return resolved;
+      }
+      runtimeTypeofHelperUsed = true;
+
+      // Variable operand: don't pass its evaluated value — pass its NAME plus
+      // isVarName=true plus its scope ("thread"/"global"), so the helper does
+      // a live SPtempVars_getVar lookup instead of testing a value snapshot.
+      // Reuse exprToNested's own Var resolution (paramMap tagging, scope calc)
+      // rather than duplicating that logic here, so the name/scope always
+      // matches what a normal read of the same variable would use.
+      if (inner && inner.type === "Var") {
+        const varNested = exprToNested(inner, inMethod, paramMap);
+        const varName = varNested && varNested.name ? varNested.name : inner.name;
+        const scope =
+        varNested && varNested.scope ? varNested.scope : varScopeForName(inner.name, inMethod, paramMap, undefined);
+        return exprToNested(
+          {
+            type: "Call",
+            name: "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__",
+            args: [
+              { type: "Literal", litType: "string", value: varName },
+              { type: "Literal", litType: "boolean", value: true },
+              { type: "Literal", litType: "string", value: scope },
+            ],
+          },
+          inMethod,
+          paramMap,
+        );
+      }
+
+      // Non-variable, non-compile-time-resolvable expression: pass the
+      // evaluated value directly as v; isVarName/type stay unset (blank),
+      // which the helper's isVarName-false branch already handles correctly.
+      return exprToNested({ type: "Call", name: "_INTERNAL__runtime_typeof__AABBCCDDEE12123434__", args: inner }, inMethod, paramMap);
+    }
 
     // Prefix ++/-- used as unary: `++x` or `--x`
     if (expr.type === "Unary" && (expr.op === "++" || expr.op === "--")) {
@@ -1974,7 +3436,10 @@ if (!nestedInput) {
         const getter = { opcode: "SPtempVars_getVar", inputs: [destType, vname] };
         const newVal = { opcode: op === "++" ? "operator_add" : "operator_subtract", inputs: [getter, 1] };
         const setter = { opcode: "SPtempVars_setVar", inputs: [destType, vname, newVal] };
-        const ret = { opcode: "procedures_return", inputs: [{ opcode: "SPtempVars_getVar", inputs: [destType, vname] }] };
+        const ret = {
+          opcode: "procedures_return",
+          inputs: [{ opcode: "SPtempVars_getVar", inputs: [destType, vname] }],
+        };
         return { opcode: "control_inline_stack_output", inputs: [[setter, ret]] };
       }
       // Member case
@@ -1988,11 +3453,11 @@ if (!nestedInput) {
           if (chain.length > 2) {
             if (chain[0] === "this" && emittingClass && emittingStaticMethod) {
               objReceiver = getClassStaticGet(emittingClass, chain[1]);
-              for (let i = 2; i < chain.length - 1; i++) objReceiver = { opcode: "jwClass_getProp", inputs: [chain[i], objReceiver] };
+              for (let i = 2; i < chain.length - 1; i++) objReceiver = makeGet(chain[i], objReceiver);
             } else if (isClassStaticReceiverChain(chain)) {
               objReceiver = buildClassStaticReceiver(chain);
             } else {
-              for (let i = 1; i < chain.length - 1; i++) objReceiver = { opcode: "jwClass_getProp", inputs: [chain[i], objReceiver] };
+              for (let i = 1; i < chain.length - 1; i++) objReceiver = makeGet(chain[i], objReceiver);
             }
           } else if (chain[0] === "this" && emittingClass && emittingStaticMethod) {
             objReceiver = getClassStaticGet(emittingClass, chain[1]);
@@ -2006,17 +3471,112 @@ if (!nestedInput) {
             receiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", rtmp] };
           }
           const oldTmp = __pw_newTemp("__i");
-          setup.push({ opcode: "SPtempVars_setVar", inputs: ["thread", oldTmp, chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod ? getClassStaticGet(emittingClass, propName) : { opcode: "jwClass_getProp", inputs: [propName, receiverRef] }] });
+          setup.push({
+            opcode: "SPtempVars_setVar",
+            inputs: [
+              "thread",
+              oldTmp,
+              chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
+                ? getClassStaticGet(emittingClass, propName)
+                : makeGet(propName, receiverRef),
+            ],
+          });
           const newTmp = __pw_newTemp("__n");
-          setup.push({ opcode: "SPtempVars_setVar", inputs: ["thread", newTmp, { opcode: op === "++" ? "operator_add" : "operator_subtract", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldTmp] }, 1] }] });
-          const setter = chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
-            ? getClassStaticSet(emittingClass, propName, { opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] })
-            : { opcode: "jwClass_setProp", inputs: [propName, receiverRef, { opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] }] };
-          const ret = { opcode: "procedures_return", inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] }] };
+          setup.push({
+            opcode: "SPtempVars_setVar",
+            inputs: [
+              "thread",
+              newTmp,
+              {
+                opcode: op === "++" ? "operator_add" : "operator_subtract",
+                inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldTmp] }, 1],
+              },
+            ],
+          });
+          const setter =
+            chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
+              ? getClassStaticSet(emittingClass, propName, {
+                  opcode: "SPtempVars_getVar",
+                  inputs: ["thread", newTmp],
+                })
+              : makeSet(propName, receiverRef, { opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] });
+          const ret = {
+            opcode: "procedures_return",
+            inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] }],
+          };
           return { opcode: "control_inline_stack_output", inputs: [setup.concat([setter, ret])] };
         }
       }
       return "";
+    }
+    if (expr.type === "Object") {
+      objectsUsed = true;
+      const items = Array.isArray(expr.props) ? expr.props : [];
+      if (blocksMeta && blocksMeta["dogeiscutObject_builder"]) {
+        const substack = [];
+        for (const p of items) {
+          if (!p) continue;
+          const keyNode = p.key !== undefined && p.key !== null ? p.key : "";
+          const keyExpr =
+            p.computed && p.computedExpr
+              ? p.computedExpr
+              : p.key && typeof p.key === "object" && p.key.type
+                ? p.key
+                : null;
+          const keyVal =
+            typeof keyNode === "string"
+              ? String(keyNode)
+              : keyExpr
+                ? exprToNested(keyExpr, inMethod, paramMap)
+                : keyNode;
+          if (!p.value) {
+            const appendBlk = {
+              opcode: "dogeiscutObject_builderAppendEmpty",
+              inputs: [keyVal],
+            };
+            if (p && p.shadow !== undefined) appendBlk.shadow = !!p.shadow;
+            if (p && p.noPlaceholder !== undefined) appendBlk.noPlaceholder = !!p.noPlaceholder;
+            substack.push(appendBlk);
+            continue;
+          }
+          const valRes = exprToNested(p.value, inMethod, paramMap);
+          const val = valRes && typeof valRes === "object" && valRes.type === "lit" ? valRes.value : valRes;
+          const appendBlk = {
+            opcode: "dogeiscutObject_builderAppend",
+            inputs: [keyVal, val],
+          };
+          if (p && p.shadow !== undefined) appendBlk.shadow = !!p.shadow;
+          if (p && p.noPlaceholder !== undefined) appendBlk.noPlaceholder = !!p.noPlaceholder;
+          substack.push(appendBlk);
+        }
+        const builder = {
+          opcode: "dogeiscutObject_builder",
+          inputs: [{ opcode: "dogeiscutObject_currentObject", shadow: true, noPlaceholder: true }, substack],
+        };
+        if (expr && expr.shadow !== undefined) builder.shadow = !!expr.shadow;
+        if (expr && expr.noPlaceholder !== undefined) builder.noPlaceholder = !!expr.noPlaceholder;
+        return builder;
+      }
+      const obj = {};
+      for (const p of items) {
+        if (!p) continue;
+        const keyNode = p.key !== undefined ? p.key : "";
+        const keyExpr =
+          p.computed && p.computedExpr
+            ? p.computedExpr
+            : p.key && typeof p.key === "object" && p.key.type
+              ? p.key
+              : null;
+        const key =
+          typeof keyNode === "string"
+            ? keyNode
+            : keyExpr
+              ? exprToNested(keyExpr, inMethod, paramMap)
+              : keyNode;
+        const valRes = p.value ? exprToNested(p.value, inMethod, paramMap) : null;
+        obj[key] = valRes && typeof valRes === "object" && valRes.type === "lit" ? valRes.value : valRes;
+      }
+      return obj;
     }
     if (expr.type === "Array") {
       arraysUsed = true;
@@ -2042,6 +3602,13 @@ if (!nestedInput) {
       return { type: "Var", name: expr.name, scope };
     }
     if (expr.type === "This") return { opcode: "jwClass_self", inputs: [] };
+    if (expr.type === "Index") {
+      // Square-bracket array access: map to `jwArray_get` (1-based index).
+      const arrNested = exprToNested(expr.receiver, inMethod, paramMap);
+      const rawIdx = exprToNested(expr.index, inMethod, paramMap);
+      const idxArg = adjustArrayIndex(rawIdx, inMethod, paramMap);
+      return { opcode: "jwArray_get", inputs: [{ ...arrNested, noPlaceholder: true }, idxArg] };
+    }
     if (expr.type === "Member" || expr.type === "MemberExpr") {
       const chain = expr.chain || [];
       if (chain.length < 1) return "";
@@ -2083,16 +3650,20 @@ if (!nestedInput) {
                 // Try to resolve temp->class so we can detect accessor methods
                 const tmpName = Array.isArray(retVal.inputs) ? retVal.inputs[1] : null;
                 const cls = tmpName && tempToClass[tmpName] ? tempToClass[tmpName] : null;
+                // Debug: log temp -> class resolution
+                if (tmpName) console.error("[emit] inline tempToClass", tmpName, "=>", cls);
                 // compose accessor/call if first prop is a getter on the class
                 const firstProp = props && props.length > 0 ? props[0] : null;
-                console.log(classRegistry[cls])
                 if (cls && firstProp && hasMethodFlag(cls, firstProp, "getter")) {
                   // call the getter and then apply any further property accesses
 
                   const methodKey = getClassMethodKey(cls, firstProp, "getter");
-                  const methodGetter = (cls && hasMethodFlag(cls, firstProp, "static")) ? getClassStaticGet(cls, methodKey) : { opcode: "jwClass_getProp", inputs: [methodKey, receiverRef] };
+                  const methodGetter =
+                    cls && hasMethodFlag(cls, firstProp, "static")
+                      ? getClassStaticGet(cls, methodKey)
+                      : makeGet(methodKey, receiverRef);
                   let base = { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
-                  for (let pi = 1; pi < props.length; pi++) base = { opcode: "jwClass_getProp", inputs: [props[pi], base] };
+                  for (let pi = 1; pi < props.length; pi++) base = makeGet(props[pi], base);
                   inlineChildren[i] = { opcode: "procedures_return", inputs: [base] };
                   return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
                 }
@@ -2102,10 +3673,14 @@ if (!nestedInput) {
                 for (let pi = 0; pi < props.length; pi++) {
                   const pname = props[pi];
                   if (pi === 0) {
-                    const useStatic = cls && (hasMethodFlag(cls, pname, "static") || (classRegistry[cls] && classRegistry[cls].staticProps && classRegistry[cls].staticProps[pname]));
-                    propGet = useStatic ? getClassStaticGet(cls, pname) : { opcode: "jwClass_getProp", inputs: [pname, receiverRef] };
-                  }
-                  else propGet = { opcode: "jwClass_getProp", inputs: [pname, propGet] };
+                    const useStatic =
+                      cls &&
+                      (hasMethodFlag(cls, pname, "static") ||
+                        (classRegistry[cls] &&
+                          classRegistry[cls].staticProps &&
+                          classRegistry[cls].staticProps[pname]));
+                    propGet = useStatic ? getClassStaticGet(cls, pname) : makeGet(pname, receiverRef);
+                  } else propGet = makeGet(pname, propGet);
                 }
                 // replace the procedures_return value with property getter
                 inlineChildren[i] = { opcode: "procedures_return", inputs: [propGet] };
@@ -2117,7 +3692,12 @@ if (!nestedInput) {
               let receiverRefAlt = node.inputs && node.inputs[0] ? node.inputs[0] : null;
               // Try to resolve accessor on known class receiver
               let resolvedClass = null;
-              if (receiverRefAlt && receiverRefAlt.opcode === "SPtempVars_getVar" && Array.isArray(receiverRefAlt.inputs) && receiverRefAlt.inputs[0] === "thread") {
+              if (
+                receiverRefAlt &&
+                receiverRefAlt.opcode === "SPtempVars_getVar" &&
+                Array.isArray(receiverRefAlt.inputs) &&
+                receiverRefAlt.inputs[0] === "thread"
+              ) {
                 const tmp = receiverRefAlt.inputs[1];
                 if (tmp && tempToClass[tmp]) resolvedClass = tempToClass[tmp];
               } else if (receiverRefAlt && receiverRefAlt.opcode === "jwClass_self") {
@@ -2129,9 +3709,12 @@ if (!nestedInput) {
               }
               if (resolvedClass && props.length > 0 && hasMethodFlag(resolvedClass, props[0], "getter")) {
                 const methodKey = getClassMethodKey(resolvedClass, props[0], "getter");
-                const methodGetter = (resolvedClass && hasMethodFlag(resolvedClass, props[0], "static")) ? getClassStaticGet(resolvedClass, methodKey) : { opcode: "jwClass_getProp", inputs: [methodKey, receiverRefAlt] };
+                const methodGetter =
+                  resolvedClass && hasMethodFlag(resolvedClass, props[0], "static")
+                    ? getClassStaticGet(resolvedClass, methodKey)
+                    : makeGet(methodKey, receiverRefAlt);
                 let base = { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
-                for (let pi = 1; pi < props.length; pi++) base = { opcode: "jwClass_getProp", inputs: [props[pi], base] };
+                for (let pi = 1; pi < props.length; pi++) base = makeGet(props[pi], base);
                 inlineChildren[i] = { opcode: "procedures_return", inputs: [base] };
                 return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
               }
@@ -2139,10 +3722,16 @@ if (!nestedInput) {
               for (let pi = 0; pi < props.length; pi++) {
                 const pname = props[pi];
                 if (pi === 0) {
-                  const useStaticAlt = resolvedClass && (hasMethodFlag(resolvedClass, pname, "static") || (classRegistry[resolvedClass] && classRegistry[resolvedClass].staticProps && classRegistry[resolvedClass].staticProps[pname]));
-                  propGetAlt = useStaticAlt ? getClassStaticGet(resolvedClass, pname) : { opcode: "jwClass_getProp", inputs: [pname, receiverRefAlt] };
-                }
-                else propGetAlt = { opcode: "jwClass_getProp", inputs: [pname, propGetAlt] };
+                  const useStaticAlt =
+                    resolvedClass &&
+                    (hasMethodFlag(resolvedClass, pname, "static") ||
+                      (classRegistry[resolvedClass] &&
+                        classRegistry[resolvedClass].staticProps &&
+                        classRegistry[resolvedClass].staticProps[pname]));
+                  propGetAlt = useStaticAlt
+                    ? getClassStaticGet(resolvedClass, pname)
+                    : makeGet(pname, receiverRefAlt);
+                } else propGetAlt = makeGet(pname, propGetAlt);
               }
               inlineChildren[i] = { opcode: "procedures_return", inputs: [propGetAlt] };
               return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
@@ -2154,7 +3743,7 @@ if (!nestedInput) {
         let receiverRef = recvNested;
         for (let i = 0; i < props.length; i++) {
           const prop = props[i];
-          receiverRef = { opcode: "jwClass_getProp", inputs: [prop, receiverRef] };
+          receiverRef = makeGet(prop, receiverRef);
         }
         return receiverRef;
       }
@@ -2162,7 +3751,7 @@ if (!nestedInput) {
       let objReceiver =
         typeof chain[0] === "string" && chain[0] === "this"
           ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
-          : { type: "Var", name: chain[0] };
+          : mapReceiverName(chain[0], paramMap);
       if (chain.length > 2) {
         // If the base is a static `this` inside a static class method, treat it
         // like a class name receiver and emit static property access.
@@ -2177,13 +3766,13 @@ if (!nestedInput) {
             result = call;
             for (let i = 2; i < chain.length; i++) {
               const prop = chain[i];
-              result = { opcode: "jwClass_getProp", inputs: [prop, result] };
+              result = makeGet(prop, result);
             }
           } else {
             result = getClassStaticGet(classNameBase, firstProp);
             for (let i = 2; i < chain.length; i++) {
               const prop = chain[i];
-              result = { opcode: "jwClass_getProp", inputs: [prop, result] };
+              result = makeGet(prop, result);
             }
           }
           const retNode = { opcode: "procedures_return", inputs: [result] };
@@ -2202,11 +3791,9 @@ if (!nestedInput) {
         const propName = chain[1];
         // Try to detect the receiver's class so we can handle getters
         let receiverClass = null;
-        if (typeof chain[0] === 'string') {
-          if (chain[0] === 'this' && emittingClass) receiverClass = emittingClass;
-          else if (varToClass[chain[0]]) receiverClass = varToClass[chain[0]];
-          else if (classRegistry[chain[0]]) receiverClass = chain[0];
-        } else if (objReceiver && objReceiver.opcode === 'jwClass_self' && emittingClass) {
+        if (typeof chain[0] === "string") {
+          receiverClass = resolveReceiverClass(chain[0], emittingClass, currentMethodParams);
+        } else if (objReceiver && objReceiver.opcode === "jwClass_self" && emittingClass) {
           receiverClass = emittingClass;
         }
         if (receiverClass && hasMethodFlag(receiverClass, propName, "getter")) {
@@ -2214,12 +3801,18 @@ if (!nestedInput) {
           // If this is a static getter on a class name or inside a static method,
           // call it via jwClass_getStatic.
           const useStaticGetter =
-            (typeof chain[0] === "string" && chain[0] !== "this" && classRegistry[chain[0]] && hasMethodFlag(receiverClass, propName, "static")) ||
-            (chain[0] === "this" && emittingClass && emittingStaticMethod && hasMethodFlag(receiverClass, propName, "static"));
+            (typeof chain[0] === "string" &&
+              chain[0] !== "this" &&
+              classRegistry[chain[0]] &&
+              hasMethodFlag(receiverClass, propName, "static")) ||
+            (chain[0] === "this" &&
+              emittingClass &&
+              emittingStaticMethod &&
+              hasMethodFlag(receiverClass, propName, "static"));
           const methodKey = getClassMethodKey(receiverClass, propName, "getter");
           const methodGetter = useStaticGetter
             ? getClassStaticGet(receiverClass, methodKey)
-            : { opcode: "jwClass_getProp", inputs: [methodKey, objReceiver] };
+            : makeGet(methodKey, objReceiver);
           return { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
         }
         // If accessing a static property on a class name, use jwClass_getStatic.
@@ -2230,14 +3823,18 @@ if (!nestedInput) {
         }
         if (typeof chain[0] === "string" && chain[0] !== "this" && classRegistry[chain[0]]) {
           const classNameBase = chain[0];
-          const useStaticBase = hasMethodFlag(classNameBase, propName, "static") || (classRegistry[classNameBase] && classRegistry[classNameBase].staticProps && classRegistry[classNameBase].staticProps[propName]);
+          const useStaticBase =
+            hasMethodFlag(classNameBase, propName, "static") ||
+            (classRegistry[classNameBase] &&
+              classRegistry[classNameBase].staticProps &&
+              classRegistry[classNameBase].staticProps[propName]);
           if (useStaticBase) {
             const propGet = getClassStaticGet(classNameBase, propName);
             const retNode2 = { opcode: "procedures_return", inputs: [propGet] };
             return { opcode: "control_inline_stack_output", inputs: [[retNode2]] };
           }
         }
-        return { opcode: "jwClass_getProp", inputs: [propName, objReceiver] };
+        return makeGet(propName, objReceiver);
       }
       return objReceiver;
     }
@@ -2253,7 +3850,10 @@ if (!nestedInput) {
       let objReceiver = null;
       const first = chain[0];
       if (typeof first === "string") {
-        objReceiver = first === "this" ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true } : { type: "Var", name: first };
+        objReceiver =
+          first === "this"
+            ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+            : mapReceiverName(first, paramMap);
       } else {
         // do not call exprToNested(first) when `first` is an object;
         // flattenMemberCall will handle emitting the necessary steps.
@@ -2265,20 +3865,94 @@ if (!nestedInput) {
           objReceiver = getClassStaticGet(emittingClass, chain[1]);
           for (let i = 2; i < chain.length - 1; i++) {
             const prop = chain[i];
-            objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
+            objReceiver = makeGet(prop, objReceiver);
           }
         } else if (isClassStaticReceiverChain(chain)) {
           objReceiver = buildClassStaticReceiver(chain);
         } else {
           for (let i = 1; i < chain.length - 1; i++) {
             const prop = chain[i];
-            objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
+            objReceiver = makeGet(prop, objReceiver);
           }
         }
       }
       const methodName = chain[chain.length - 1];
-      const methodKey = typeof chain[0] === 'string' ? getClassMethodKey(chain[0] === 'this' && emittingClass ? emittingClass : chain[0], methodName) : methodName;
-      const methodGetter = { opcode: "jwClass_getProp", inputs: [methodKey, objReceiver] };
+      const arrayHelperMethods = new Set([
+        "push",
+        "append",
+        "get",
+        "set",
+        "concat",
+        "join",
+        "sum",
+        "length",
+        "splice",
+      ]);
+      if (arrayHelperMethods.has(methodName)) {
+        const readChain = chain.slice(0, chain.length - 1);
+        const arrayExpr = buildMemberChainReceiver(readChain, inMethod, paramMap);
+        if (arrayExpr) {
+          switch (methodName) {
+            case "push":
+            case "append": {
+              const valArg = expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+              return { opcode: "jwArray_append", inputs: [{ ...arrayExpr, noPlaceholder: true }, valArg] };
+            }
+            case "set": {
+              const rawIdxArg =
+                expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+              const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
+              const valArg = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+              return {
+                opcode: "jwArray_set",
+                inputs: [{ ...arrayExpr, noPlaceholder: true }, idxArg, valArg],
+              };
+            }
+            case "get": {
+              const rawIdxArg =
+                expr.args && expr.args[0] ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+              const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
+              return { opcode: "jwArray_get", inputs: [{ ...arrayExpr, noPlaceholder: true }, idxArg] };
+            }
+            case "sum":
+              return { opcode: "jwArray_sum", inputs: [{ ...arrayExpr, noPlaceholder: true }] };
+            case "length":
+              return { opcode: "jwArray_length", inputs: [{ ...arrayExpr, noPlaceholder: true }] };
+            case "concat": {
+              const a2 = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+              return {
+                opcode: "jwArray_concat",
+                inputs: [
+                  { ...arrayExpr, noPlaceholder: true },
+                  { ...a2, noPlaceholder: true },
+                ],
+              };
+            }
+            case "join": {
+              const div = expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+              return { opcode: "jwArray_join", inputs: [{ ...arrayExpr, noPlaceholder: true }, div] };
+            }
+            case "splice": {
+              const rawIdxArg =
+                expr.args && expr.args[1] ? exprToNested(expr.args[1], inMethod, paramMap) : "";
+              const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
+              const itemsArg =
+                expr.args && expr.args[2] ? exprToNested(expr.args[2], inMethod, paramMap) : "";
+              return {
+                opcode: "jwArray_splice",
+                inputs: [{ ...arrayExpr, noPlaceholder: true }, idxArg, itemsArg],
+              };
+            }
+          }
+        }
+      }
+      // Resolve the receiver's class for proper method key mapping
+      let receiverClass = null;
+      if (typeof chain[0] === "string") {
+        receiverClass = resolveReceiverClass(chain[0], emittingClass, currentMethodParams);
+      }
+      const methodKey = receiverClass ? getClassMethodKey(receiverClass, methodName) : methodName;
+      const methodGetter = makeGet(methodKey, objReceiver);
 
       // If this MemberCall represents a chain (previous call ASTs embedded)
       // flatten it into ordered steps and emit an inline wrapper that:
@@ -2312,9 +3986,8 @@ if (!nestedInput) {
           const method = ch[ch.length - 1];
           const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
           if (receiverChain.length > 0 && typeof receiverChain[0] === "string") {
-            if (receiverChain[0] === "this" && emittingClass) baseClassName = emittingClass;
-            else if (varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
-            else if (classRegistry[receiverChain[0]]) baseClassName = receiverChain[0];
+            const resolved = resolveReceiverClass(receiverChain[0], emittingClass, currentMethodParams);
+            if (resolved) baseClassName = resolved;
           }
           steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
@@ -2331,9 +4004,7 @@ if (!nestedInput) {
         // attempt to detect method params from varToClass/classRegistry
         let className = null;
         if (typeof chain[0] === "string") {
-          if (chain[0] === "this" && emittingClass) className = emittingClass;
-          else if (varToClass[chain[0]]) className = varToClass[chain[0]];
-          else if (classRegistry[chain[0]]) className = chain[0];
+          className = resolveReceiverClass(chain[0], emittingClass, currentMethodParams);
         } else if (baseClassName) {
           className = baseClassName;
         }
@@ -2355,7 +4026,10 @@ if (!nestedInput) {
             receiverRef = staticReceiverRef;
           } else if (!(objReceiver && objReceiver.opcode === "jwClass_self")) {
             const receiverTempName = __pw_newTemp("__m");
-            const setTemp = { opcode: "SPtempVars_setVar", inputs: ["thread", receiverTempName, objReceiver] };
+            const setTemp = {
+              opcode: "SPtempVars_setVar",
+              inputs: ["thread", receiverTempName, objReceiver],
+            };
             setters.push(setTemp);
             receiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", receiverTempName] };
           }
@@ -2364,14 +4038,27 @@ if (!nestedInput) {
             const argExpr = expr.args && expr.args[i] ? exprToNested(expr.args[i], inMethod, paramMap) : "";
             setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
           }
-          const boundMethodGetter = isStaticCall ? getClassStaticGet(className, actualMethodName) : { opcode: "jwClass_getProp", inputs: [actualMethodName, receiverRef] };
+          const boundMethodGetter = isStaticCall
+            ? getClassStaticGet(className, actualMethodName)
+            : makeGet(actualMethodName, receiverRef);
           const callMethod = { opcode: "jwLambda_executeR", inputs: [boundMethodGetter, ""] };
           const ret = { opcode: "procedures_return", inputs: [callMethod] };
           const inlineChildren = [].concat(setters, [ret]);
           return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
         }
+        // Lambda stored as an object property (e.g. `obj.fn(a, b)`): set the
+        // indexed arg temps for every argument, then execute the lambda.
+        const memberLambdaInfo = getMemberLambdaInfo(chain);
+        if (memberLambdaInfo) {
+          const setters = buildLambdaArgSetters(memberLambdaInfo, expr.args, inMethod, paramMap);
+          const callMethod = { opcode: "jwLambda_executeR", inputs: [methodGetter, ""] };
+          const ret = { opcode: "procedures_return", inputs: [callMethod] };
+          const inlineChildren = [].concat(setters, [ret]);
+          return { opcode: "control_inline_stack_output", inputs: [inlineChildren] };
+        }
         // fallback: single-step — set thread var for positional arg then return result
-        const argNested = expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const argNested =
+          expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
         if (argNested !== "") {
           // Prefer a tagged param name when available so calls like
           // `this.add(...)` reuse the same arg id as the method
@@ -2384,13 +4071,19 @@ if (!nestedInput) {
             else argTempName = getArgTempForCall(className, methodName);
           }
           const setters2 = [{ opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] }];
-          const callMethod2 = { opcode: "jwLambda_executeR", inputs: [isStaticCall ? getClassStaticGet(className, actualMethodName) : methodGetter, ""] };
+          const callMethod2 = {
+            opcode: "jwLambda_executeR",
+            inputs: [isStaticCall ? getClassStaticGet(className, actualMethodName) : methodGetter, ""],
+          };
           const ret2 = { opcode: "procedures_return", inputs: [callMethod2] };
           const inlineChildren2 = [].concat(setters2, [ret2]);
           return { opcode: "control_inline_stack_output", inputs: [inlineChildren2] };
         }
         if (isStaticCall) {
-          const call = { opcode: "jwLambda_executeR", inputs: [getClassStaticGet(className, actualMethodName), ""] };
+          const call = {
+            opcode: "jwLambda_executeR",
+            inputs: [getClassStaticGet(className, actualMethodName), ""],
+          };
           const retFinal = { opcode: "procedures_return", inputs: [call] };
           return { opcode: "control_inline_stack_output", inputs: [[retFinal]] };
         }
@@ -2445,7 +4138,9 @@ if (!nestedInput) {
           // execute the returned value, storing into a temp. Special-case
           // when the call name actually refers to a variable holding a
           // lambda so we don't emit a raw opcode named after the var.
-          const argsArr = (step.args || []).map((a) => (a === undefined ? "" : exprToNested(a, inMethod, paramMap)));
+          const argsArr = (step.args || []).map((a) =>
+            a === undefined ? "" : exprToNested(a, inMethod, paramMap),
+          );
           if (typeof cname === "string" && varToLambda && varToLambda[cname]) {
             const vinfo = varToLambda[cname];
             const getterType = varScopeForName(cname, inMethod, paramMap, undefined);
@@ -2454,19 +4149,24 @@ if (!nestedInput) {
             if (vinfo && Array.isArray(vinfo.arr) && vinfo.arr.length > 0) {
               for (let i = 0; i < vinfo.arr.length; i++) {
                 const pname = vinfo.arr[i];
-                const argExpr = step.args && step.args[i] ? exprToNested(step.args[i], inMethod, paramMap) : "";
+                const argExpr =
+                  step.args && step.args[i] ? exprToNested(step.args[i], inMethod, paramMap) : "";
                 inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
               }
               const callReporter = { opcode: "jwLambda_executeR", inputs: [lambdaGetter, ""] };
               const tempName = __pw_newTemp("__c");
-              inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
+              inlineChildren.push({
+                opcode: "SPtempVars_setVar",
+                inputs: ["thread", tempName, callReporter],
+              });
               prevTemp = tempName;
               prevReturnedLambdaArgs = null;
               prevStepMethodName = null;
               continue;
             }
             // Fallback: single-positional-arg synthetic temp
-            const argPos = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+            const argPos =
+              step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
             if (argPos !== "") {
               const at = getArgTempForCall(null, cname);
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", at, argPos] });
@@ -2499,17 +4199,14 @@ if (!nestedInput) {
             if (recvChain[0] === "this") {
               if (emittingClass && emittingStaticMethod && recvChain.length > 1) {
                 r = getClassStaticGet(emittingClass, recvChain[1]);
-                for (let k = 2; k < recvChain.length; k++)
-                  r = { opcode: "jwClass_getProp", inputs: [recvChain[k], r] };
+                for (let k = 2; k < recvChain.length; k++) r = makeGet(recvChain[k], r);
               } else {
                 r = { opcode: "jwClass_self", inputs: [], noPlaceholder: true };
-                for (let k = 1; k < recvChain.length; k++)
-                  r = { opcode: "jwClass_getProp", inputs: [recvChain[k], r] };
+                for (let k = 1; k < recvChain.length; k++) r = makeGet(recvChain[k], r);
               }
             } else {
               r = { type: "Var", name: recvChain[0] };
-              for (let k = 1; k < recvChain.length; k++)
-                r = { opcode: "jwClass_getProp", inputs: [recvChain[k], r] };
+              for (let k = 1; k < recvChain.length; k++) r = makeGet(recvChain[k], r);
             }
             receiverRef = r;
           }
@@ -2526,15 +4223,19 @@ if (!nestedInput) {
             step.receiverChain.length > 0 &&
             typeof step.receiverChain[0] === "string"
           ) {
-            if (step.receiverChain[0] === "this" && emittingClass) classNameForStep = emittingClass;
-            else if (varToClass[step.receiverChain[0]]) classNameForStep = varToClass[step.receiverChain[0]];
-            else if (classRegistry[step.receiverChain[0]]) classNameForStep = step.receiverChain[0];
+            classNameForStep = resolveReceiverClass(
+              step.receiverChain[0],
+              emittingClass,
+              currentMethodParams,
+            );
           }
         } else {
           classNameForStep = baseClassName;
         }
         const paramsForStep = classNameForStep ? getMethodParams(classNameForStep, step.methodName) : null;
-        const returnsLambdaArgsForMethod = classNameForStep ? getMethodReturns(classNameForStep, step.methodName) : null;
+        const returnsLambdaArgsForMethod = classNameForStep
+          ? getMethodReturns(classNameForStep, step.methodName)
+          : null;
 
         // If this step is a normal method call (methodName present)
         if (step.methodName) {
@@ -2543,22 +4244,30 @@ if (!nestedInput) {
           // invoke the function value stored in the previous temp rather than
           // re-looking-up the method on that temp (produces num.test()("bar ")()).
           const isReceiverPrevTemp =
-            receiverRef && receiverRef.opcode === "SPtempVars_getVar" && Array.isArray(receiverRef.inputs) &&
-            prevTemp && receiverRef.inputs[1] === prevTemp;
+            receiverRef &&
+            receiverRef.opcode === "SPtempVars_getVar" &&
+            Array.isArray(receiverRef.inputs) &&
+            prevTemp &&
+            receiverRef.inputs[1] === prevTemp;
           if (isReceiverPrevTemp && prevStepMethodName === step.methodName) {
             // If we know the returned lambda arg names, map them.
             if (Array.isArray(prevReturnedLambdaArgs) && prevReturnedLambdaArgs.length > 0) {
               for (let pi = 0; pi < prevReturnedLambdaArgs.length; pi++) {
                 const pname = prevReturnedLambdaArgs[pi];
-                const argExpr = step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
+                const argExpr =
+                  step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
                 inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
               }
             } else {
               // fallback: use a synthetic arg temp for a single positional arg
-              const argPosLocal = step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
+              const argPosLocal =
+                step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
               if (argPosLocal !== "") {
                 const argTemp = getArgTempForCall(classNameForStep, step.methodName);
-                inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPosLocal] });
+                inlineChildren.push({
+                  opcode: "SPtempVars_setVar",
+                  inputs: ["thread", argTemp, argPosLocal],
+                });
               }
             }
             const callReporter = { opcode: "jwLambda_executeR", inputs: [receiverRef, ""] };
@@ -2580,7 +4289,9 @@ if (!nestedInput) {
             }
             // call method via jwLambda_executeR on the bound getter and store into temp
             const methodKeyForStep = getClassMethodKey(classNameForStep, step.methodName);
-            const boundMethod = hasMethodFlag(classNameForStep, step.methodName, "static") ? getClassStaticGet(classNameForStep, methodKeyForStep) : { opcode: "jwClass_getProp", inputs: [methodKeyForStep, receiverRef] };
+            const boundMethod = hasMethodFlag(classNameForStep, step.methodName, "static")
+              ? getClassStaticGet(classNameForStep, methodKeyForStep)
+              : makeGet(methodKeyForStep, receiverRef);
             const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
             const tempName = __pw_newTemp("__c");
             inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
@@ -2597,7 +4308,9 @@ if (!nestedInput) {
           const argPos =
             step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
           const methodKeyForStep2 = getClassMethodKey(classNameForStep, step.methodName);
-          const boundMethod = hasMethodFlag(classNameForStep, step.methodName, "static") ? getClassStaticGet(classNameForStep, methodKeyForStep2) : { opcode: "jwClass_getProp", inputs: [methodKeyForStep2, receiverRef] };
+          const boundMethod = hasMethodFlag(classNameForStep, step.methodName, "static")
+            ? getClassStaticGet(classNameForStep, methodKeyForStep2)
+            : makeGet(methodKeyForStep2, receiverRef);
           if (argPos !== "") {
             const argTemp = getArgTempForCall(classNameForStep, step.methodName);
             inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPos] });
@@ -2635,15 +4348,19 @@ if (!nestedInput) {
                 step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
             }
-            const boundMethod = {
-              opcode: "jwClass_getProp",
-              inputs: [getClassMethodKey(classNameForStep, fakeMethod), { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
-            };
+            const boundMethod = makeGet(getClassMethodKey(classNameForStep, fakeMethod), {
+              opcode: "SPtempVars_getVar",
+              inputs: ["thread", prevTemp],
+            });
             const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
             const tempName = __pw_newTemp("__c");
             inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName, callReporter] });
             prevTemp = tempName;
-            prevReturnedLambdaArgs = classNameForStep ? (Array.isArray(getMethodReturns(classNameForStep, fakeMethod)) ? getMethodReturns(classNameForStep, fakeMethod).slice() : null) : null;
+            prevReturnedLambdaArgs = classNameForStep
+              ? Array.isArray(getMethodReturns(classNameForStep, fakeMethod))
+                ? getMethodReturns(classNameForStep, fakeMethod).slice()
+                : null
+              : null;
             prevStepMethodName = fakeMethod;
             continue;
           }
@@ -2654,15 +4371,19 @@ if (!nestedInput) {
             const argTemp = getArgTempForCall(classNameForStep, fakeMethod);
             inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, fakeArgExpr] });
           }
-          const boundMethod2 = {
-            opcode: "jwClass_getProp",
-            inputs: [getClassMethodKey(classNameForStep, fakeMethod), { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
-          };
+          const boundMethod2 = makeGet(getClassMethodKey(classNameForStep, fakeMethod), {
+            opcode: "SPtempVars_getVar",
+            inputs: ["thread", prevTemp],
+          });
           const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
           const tempName2 = __pw_newTemp("__c");
           inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", tempName2, callReporter2] });
           prevTemp = tempName2;
-          prevReturnedLambdaArgs = classNameForStep ? (Array.isArray(getMethodReturns(classNameForStep, fakeMethod)) ? getMethodReturns(classNameForStep, fakeMethod).slice() : null) : null;
+          prevReturnedLambdaArgs = classNameForStep
+            ? Array.isArray(getMethodReturns(classNameForStep, fakeMethod))
+              ? getMethodReturns(classNameForStep, fakeMethod).slice()
+              : null
+            : null;
           prevStepMethodName = fakeMethod;
           continue;
         }
@@ -2720,18 +4441,14 @@ if (!nestedInput) {
         const lambdaGetter = { opcode: "SPtempVars_getVar", inputs: [getterType, String(name)] };
         // If we know the lambda's tagged arg names, set them before call
         if (vinfo && Array.isArray(vinfo.arr) && vinfo.arr.length > 0) {
-          const setters = [];
-          for (let i = 0; i < vinfo.arr.length; i++) {
-            const pname = vinfo.arr[i];
-            const argExpr = expr.args && expr.args[i] ? exprToNested(expr.args[i], inMethod, paramMap) : "";
-            setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
-          }
+          const setters = buildLambdaArgSetters(vinfo, expr.args, inMethod, paramMap);
           const callReporter = { opcode: "jwLambda_executeR", inputs: [lambdaGetter, ""] };
           const ret = { opcode: "procedures_return", inputs: [callReporter] };
           return { opcode: "control_inline_stack_output", inputs: [setters.concat([ret])] };
         }
         // Fallback: use synthetic arg temp for a single positional arg
-        const argPos = expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const argPos =
+          expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
         if (argPos !== "") {
           const at = getArgTempForCall(null, name);
           const setters = [{ opcode: "SPtempVars_setVar", inputs: ["thread", at, argPos] }];
@@ -2834,7 +4551,8 @@ if (!nestedInput) {
             const ret = { opcode: "procedures_return", inputs: [callReporter] };
             return { opcode: "control_inline_stack_output", inputs: [setters.concat([ret])] };
           }
-          const argPos = expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+          const argPos =
+            expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
           if (argPos !== "") {
             const at = getArgTempForCall(null, name);
             const setters = [{ opcode: "SPtempVars_setVar", inputs: ["thread", at, argPos] }];
@@ -2853,7 +4571,7 @@ if (!nestedInput) {
         const setters = [];
         for (let i = 0; i < (expr.args || []).length; i++) {
           const argExpr = expr.args[i] ? exprToNested(expr.args[i], inMethod, paramMap) : "";
-          const pname = '__arg' + i;
+          const pname = "__arg" + i;
           setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
         }
         const callReporter = { opcode: "jwLambda_executeR", inputs: [lambdaGetter, ""] };
@@ -2879,7 +4597,8 @@ if (!nestedInput) {
           const ret = { opcode: "procedures_return", inputs: [callReporter] };
           return { opcode: "control_inline_stack_output", inputs: [setters.concat([ret])] };
         }
-        const argPos = expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
+        const argPos =
+          expr.args && expr.args.length > 0 ? exprToNested(expr.args[0], inMethod, paramMap) : "";
         if (argPos !== "") {
           const at = getArgTempForCall(null, name);
           const setters = [{ opcode: "SPtempVars_setVar", inputs: ["thread", at, argPos] }];
@@ -2950,6 +4669,7 @@ if (!nestedInput) {
       // Record mapping temp -> class so later property accessors on this temp
       // can resolve whether a getter/setter exists for that class.
       tempToClass[tempName] = className;
+      if (tempName) console.error("[emit] set tempToClass", tempName, "=>", className);
       // attempt to map constructor param names if we have class signature info
       const ctorParamSetters = [];
       //let className = null;
@@ -2968,7 +4688,7 @@ if (!nestedInput) {
       // subsequent getters/readers inside the inline wrapper reference the
       // thread-scoped temp, not a global variable.
       let receiver = { opcode: "SPtempVars_getVar", inputs: ["thread", tempName] };
-      const ctorGet = { opcode: "jwClass_getProp", inputs: [getClassMethodKey(className, "constructor"), receiver] };
+      const ctorGet = makeGet(getClassMethodKey(className, "constructor"), receiver);
       // If we didn't map constructor params, pass the first arg as fallback
       const ctorArg =
         (!Array.isArray(ctorParams) || ctorParams.length === 0) &&
@@ -3095,34 +4815,53 @@ if (!nestedInput) {
       return node;
     }
     if (stmt.type === "If") {
-        //console.log(JSON.stringify(stmt, null, 2));
-        const caseSeqs = stmt.cases.map(c => c.thenBlock.body.map(s => stmtToNested(s, inMethod, paramMap)).filter(Boolean));
-        const elseSeq = stmt.elseBlock ? stmt.elseBlock.body.map(s => stmtToNested(s, inMethod, paramMap)).filter(Boolean) : null;
-        const cases = [];
-        for (let i = 0; i < stmt.cases.length; i++) {
-          const c = stmt.cases[i];
-          const cres = c.cond ? exprToNested(c.cond, inMethod, paramMap) : null;
-          if (!cres) throw new Error("stmtToNested If: condition must be an expression");
-          const condVal = cres;
-          const thenBlocks = caseSeqs[i] || [];
-          cases.push({
-            cond: condVal,
-            then: thenBlocks
-          });
-        }
-        const mutation = {
-          branches: String(cases.length + (elseSeq ? 1 : 0)),
-          "ends-in-else": String(!!elseSeq)
-        };
-        return {
-          opcode: "control_expandableIf",
-          cases,
-          else: elseSeq,
-          mutation
-        };
+      //console.log(JSON.stringify(stmt, null, 2));
+      const caseSeqs = stmt.cases.map((c) =>
+        flattenNestedResults(
+          c.thenBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean),
+        ),
+      );
+      const elseSeq = stmt.elseBlock
+        ? flattenNestedResults(
+            stmt.elseBlock.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean),
+          )
+        : null;
+      const cases = [];
+      for (let i = 0; i < stmt.cases.length; i++) {
+        const c = stmt.cases[i];
+        const cres = c.cond ? exprToNested(c.cond, inMethod, paramMap) : null;
+        if (!cres) throw new Error("stmtToNested If: condition must be an expression");
+        const condVal = cres;
+        const thenBlocks = caseSeqs[i] || [];
+        cases.push({
+          cond: condVal,
+          then: thenBlocks,
+        });
+      }
+      const mutation = {
+        branches: String(cases.length + (elseSeq ? 1 : 0)),
+        "ends-in-else": String(!!elseSeq),
+      };
+      return {
+        opcode: "control_expandableIf",
+        cases,
+        else: elseSeq,
+        mutation,
+      };
     }
     if (stmt.type === "Call") {
       const name = stmt.name;
+      // If this Call targets a variable recorded as a lambda, emit an inline
+      // sequence that sets the indexed arg temps (`__arg0`, `__arg1`, ...) and
+      // then executes the stored lambda via `jwLambda_execute`.
+      if (typeof name === "string" && varToLambda && varToLambda[name]) {
+        const vinfo = varToLambda[name];
+        const getterType = varScopeForName(name, inMethod, paramMap, undefined);
+        const lambdaGetter = { opcode: "SPtempVars_getVar", inputs: [getterType, String(name)] };
+        const setters = buildLambdaArgSetters(vinfo, stmt.args, inMethod, paramMap);
+        const call = { opcode: "jwLambda_execute", inputs: [lambdaGetter, ""] };
+        return [].concat(setters, [call]);
+      }
       // Map common array helper calls to jwArray opcodes so they have
       // proper block metadata when emitted as top-level stack blocks.
       if (name === "push" || name === "append") {
@@ -3139,11 +4878,24 @@ if (!nestedInput) {
           const appendCall = { opcode: "jwArray_append", inputs: [getter, valArg] };
           return { opcode: "SPtempVars_setVar", inputs: [destType, varName, appendCall] };
         }
-        if (arrArg && typeof arrArg === "object" && arrArg.opcode === "jwClass_getProp") {
+        if (
+          arrArg &&
+          typeof arrArg === "object" &&
+          (arrArg.opcode === "jwClass_getProp" ||
+            arrArg.opcode === "dogeiscutObject_get" ||
+            arrArg.opcode === "dogeiscutObject_getPath")
+        ) {
           const propName = arrArg.inputs && arrArg.inputs[0];
           const receiver = arrArg.inputs && arrArg.inputs[1];
           const appendCall = { opcode: "jwArray_append", inputs: [arrArg, valArg] };
-          return { opcode: "jwClass_setProp", inputs: [propName, receiver, appendCall] };
+          const setExpr = makeSet(propName, receiver, appendCall);
+          if (receiver && typeof receiver === "object" && receiver.type === "Var") {
+            const varName = receiver.name || "";
+            const destType = resolveScope(varName);
+            return { opcode: "SPtempVars_setVar", inputs: [destType, varName, setExpr] };
+          }
+          const tmp = __pw_newTemp("__a");
+          return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, setExpr] };
         }
         // fallback: store result into a thread-temp so the top-level chain
         // points to a stack `SPtempVars_setVar` rather than a reporter.
@@ -3176,11 +4928,24 @@ if (!nestedInput) {
           return { opcode: "SPtempVars_setVar", inputs: [destType, varName, setCall] };
         }
         // Handle property access on class instances (e.g., `set(this._arr, ...)` or `set(out._arr, ...)`)
-        if (arrArg && typeof arrArg === "object" && arrArg.opcode === "jwClass_getProp") {
+        if (
+          arrArg &&
+          typeof arrArg === "object" &&
+          (arrArg.opcode === "jwClass_getProp" ||
+            arrArg.opcode === "dogeiscutObject_get" ||
+            arrArg.opcode === "dogeiscutObject_getPath")
+        ) {
           const propName = arrArg.inputs && arrArg.inputs[0];
           const receiver = arrArg.inputs && arrArg.inputs[1];
           const setCall = { opcode: "jwArray_set", inputs: [arrArg, idxArg, valArg] };
-          return { opcode: "jwClass_setProp", inputs: [propName, receiver, setCall] };
+          const setExpr = makeSet(propName, receiver, setCall);
+          if (receiver && typeof receiver === "object" && receiver.type === "Var") {
+            const varName = receiver.name || "";
+            const destType = resolveScope(varName);
+            return { opcode: "SPtempVars_setVar", inputs: [destType, varName, setExpr] };
+          }
+          const tmp = __pw_newTemp("__a");
+          return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, setExpr] };
         }
         const tmp = __pw_newTemp("__a");
         const setCall = {
@@ -3208,6 +4973,133 @@ if (!nestedInput) {
     if (stmt.type === "MemberCall") {
       const chain = stmt.chain || [];
       if (chain.length < 2) return null;
+      const methodName = chain[chain.length - 1];
+      const arrayHelperMethods = new Set([
+        "push",
+        "append",
+        "get",
+        "set",
+        "concat",
+        "join",
+        "sum",
+        "length",
+        "splice",
+      ]);
+      if (arrayHelperMethods.has(methodName)) {
+        const readChain = chain.slice(0, chain.length - 1);
+        const arrayExpr = buildMemberChainReceiver(readChain, inMethod, paramMap);
+        if (!arrayExpr) return null;
+        if (methodName === "push" || methodName === "append") {
+          const valArg = stmt.args && stmt.args[0] ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
+          const appendCall = {
+            opcode: "jwArray_append",
+            inputs: [{ ...arrayExpr, noPlaceholder: true }, valArg],
+          };
+          if (
+            readChain.length === 1 &&
+            arrayExpr &&
+            typeof arrayExpr === "object" &&
+            arrayExpr.type === "Var"
+          ) {
+            const varName = arrayExpr.name || "";
+            const destType = resolveScope(varName);
+            const getter = { opcode: "SPtempVars_getVar", inputs: [destType, varName] };
+            return {
+              opcode: "SPtempVars_setVar",
+              inputs: [destType, varName, { opcode: "jwArray_append", inputs: [getter, valArg] }],
+            };
+          }
+          if (readChain.length > 1) {
+            const parentReceiver = buildMemberChainReceiver(readChain.slice(0, -1), inMethod, paramMap);
+            const propName = readChain[readChain.length - 1];
+            if (parentReceiver) {
+              const setExpr = makeSet(propName, parentReceiver, appendCall);
+              if (parentReceiver && typeof parentReceiver === "object" && parentReceiver.type === "Var") {
+                const varName = parentReceiver.name || "";
+                const destType = resolveScope(varName);
+                return { opcode: "SPtempVars_setVar", inputs: [destType, varName, setExpr] };
+              }
+              const tmp = __pw_newTemp("__a");
+              return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, setExpr] };
+            }
+            const tmp = __pw_newTemp("__a");
+            return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, appendCall] };
+          }
+          return appendCall;
+        }
+        if (methodName === "set") {
+          const rawIdxArg = stmt.args && stmt.args[0] ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
+          const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
+          const valArg = stmt.args && stmt.args[1] ? exprToNested(stmt.args[1], inMethod, paramMap) : "";
+          const setCall = {
+            opcode: "jwArray_set",
+            inputs: [{ ...arrayExpr, noPlaceholder: true }, idxArg, valArg],
+          };
+          if (
+            readChain.length === 1 &&
+            arrayExpr &&
+            typeof arrayExpr === "object" &&
+            arrayExpr.type === "Var"
+          ) {
+            const varName = arrayExpr.name || "";
+            const destType = resolveScope(varName);
+            const getter = { opcode: "SPtempVars_getVar", inputs: [destType, varName], noPlaceholder: true };
+            return {
+              opcode: "SPtempVars_setVar",
+              inputs: [destType, varName, { opcode: "jwArray_set", inputs: [getter, idxArg, valArg] }],
+            };
+          }
+          if (readChain.length > 1) {
+            const parentReceiver = buildMemberChainReceiver(readChain.slice(0, -1), inMethod, paramMap);
+            const propName = readChain[readChain.length - 1];
+            if (parentReceiver) {
+              const setExpr = makeSet(propName, parentReceiver, setCall);
+              if (parentReceiver && typeof parentReceiver === "object" && parentReceiver.type === "Var") {
+                const varName = parentReceiver.name || "";
+                const destType = resolveScope(varName);
+                return { opcode: "SPtempVars_setVar", inputs: [destType, varName, setExpr] };
+              }
+              const tmp = __pw_newTemp("__a");
+              return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, setExpr] };
+            }
+            const tmp = __pw_newTemp("__a");
+            return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, setCall] };
+          }
+          return setCall;
+        }
+        if (methodName === "get") {
+          const rawIdxArg = stmt.args && stmt.args[0] ? exprToNested(stmt.args[0], inMethod, paramMap) : "";
+          const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
+          return { opcode: "jwArray_get", inputs: [{ ...arrayExpr, noPlaceholder: true }, idxArg] };
+        }
+        if (methodName === "sum")
+          return { opcode: "jwArray_sum", inputs: [{ ...arrayExpr, noPlaceholder: true }] };
+        if (methodName === "length")
+          return { opcode: "jwArray_length", inputs: [{ ...arrayExpr, noPlaceholder: true }] };
+        if (methodName === "concat") {
+          const a2 = stmt.args && stmt.args[1] ? exprToNested(stmt.args[1], inMethod, paramMap) : "";
+          return {
+            opcode: "jwArray_concat",
+            inputs: [
+              { ...arrayExpr, noPlaceholder: true },
+              { ...a2, noPlaceholder: true },
+            ],
+          };
+        }
+        if (methodName === "join") {
+          const div = stmt.args && stmt.args[1] ? exprToNested(stmt.args[1], inMethod, paramMap) : "";
+          return { opcode: "jwArray_join", inputs: [{ ...arrayExpr, noPlaceholder: true }, div] };
+        }
+        if (methodName === "splice") {
+          const rawIdxArg = stmt.args && stmt.args[1] ? exprToNested(stmt.args[1], inMethod, paramMap) : "";
+          const idxArg = adjustArrayIndex(rawIdxArg, inMethod, paramMap);
+          const itemsArg = stmt.args && stmt.args[2] ? exprToNested(stmt.args[2], inMethod, paramMap) : "";
+          return {
+            opcode: "jwArray_splice",
+            inputs: [{ ...arrayExpr, noPlaceholder: true }, idxArg, itemsArg],
+          };
+        }
+      }
       // Build receiver object nested (stop before final property).
       let objReceiver = null;
       const first = chain[0];
@@ -3215,7 +5107,7 @@ if (!nestedInput) {
         objReceiver =
           first === "this"
             ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
-            : { type: "Var", name: first };
+            : mapReceiverName(first, paramMap);
       } else if (typeof first === "object") {
         objReceiver = exprToNested(first, inMethod, paramMap);
       } else {
@@ -3227,12 +5119,11 @@ if (!nestedInput) {
         } else {
           for (let i = 1; i < chain.length - 1; i++) {
             const prop = chain[i];
-            objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
+            objReceiver = makeGet(prop, objReceiver);
           }
         }
       }
-      const methodName = chain[chain.length - 1];
-      const methodGetter = { opcode: "jwClass_getProp", inputs: [methodName, objReceiver] };
+      const methodGetter = makeGet(methodName, objReceiver);
 
       // Class detection and method param lookup deferred until after
       // the member-call flattening so we can consider `baseClassName` when
@@ -3260,9 +5151,8 @@ if (!nestedInput) {
           const method = ch[ch.length - 1];
           const receiverChain = ch.slice(0, Math.max(0, ch.length - 1));
           if (receiverChain.length > 0 && typeof receiverChain[0] === "string") {
-            if (receiverChain[0] === "this" && emittingClass) baseClassName = emittingClass;
-            else if (varToClass[receiverChain[0]]) baseClassName = varToClass[receiverChain[0]];
-            else if (classRegistry[receiverChain[0]]) baseClassName = receiverChain[0];
+            const resolved = resolveReceiverClass(receiverChain[0], emittingClass, currentMethodParams);
+            if (resolved) baseClassName = resolved;
           }
           steps.push({ receiverChain, methodName: method, args: n.args || [] });
         }
@@ -3280,8 +5170,7 @@ if (!nestedInput) {
       // is an expression rather than a plain identifier.
       let className = null;
       if (typeof chain[0] === "string") {
-        if (chain[0] === "this" && emittingClass) className = emittingClass;
-        else if (varToClass[chain[0]]) className = varToClass[chain[0]];
+        className = resolveReceiverClass(chain[0], emittingClass, currentMethodParams);
       } else if (baseClassName) {
         className = baseClassName;
       }
@@ -3296,7 +5185,10 @@ if (!nestedInput) {
       if (isStaticCall) {
         staticTempName = __pw_newTemp("__s");
         const classRefNestedLocal = getClassGlobalRef(className);
-        staticSetTemp = { opcode: "SPtempVars_setVar", inputs: ["thread", staticTempName, { opcode: "jwClass_new", inputs: [classRefNestedLocal] }] };
+        staticSetTemp = {
+          opcode: "SPtempVars_setVar",
+          inputs: ["thread", staticTempName, { opcode: "jwClass_new", inputs: [classRefNestedLocal] }],
+        };
         staticReceiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", staticTempName] };
         tempToClass[staticTempName] = className;
       }
@@ -3319,8 +5211,7 @@ if (!nestedInput) {
                 recvChain[0] === "this"
                   ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
                   : { type: "Var", name: recvChain[0] };
-              for (let k = 1; k < recvChain.length; k++)
-                r = { opcode: "jwClass_getProp", inputs: [recvChain[k], r] };
+              for (let k = 1; k < recvChain.length; k++) r = makeGet(recvChain[k], r);
               receiverRef = r;
             }
           } else {
@@ -3335,15 +5226,19 @@ if (!nestedInput) {
               step.receiverChain.length > 0 &&
               typeof step.receiverChain[0] === "string"
             ) {
-              if (step.receiverChain[0] === "this" && emittingClass) classNameForStep = emittingClass;
-              else if (varToClass[step.receiverChain[0]]) classNameForStep = varToClass[step.receiverChain[0]];
-              else if (classRegistry[step.receiverChain[0]]) classNameForStep = step.receiverChain[0];
+              classNameForStep = resolveReceiverClass(
+                step.receiverChain[0],
+                emittingClass,
+                currentMethodParams,
+              );
             }
           } else {
             classNameForStep = baseClassName;
           }
           const paramsForStep = classNameForStep ? getMethodParams(classNameForStep, step.methodName) : null;
-          const returnsLambdaArgsForMethod = classNameForStep ? getMethodReturns(classNameForStep, step.methodName) : null;
+          const returnsLambdaArgsForMethod = classNameForStep
+            ? getMethodReturns(classNameForStep, step.methodName)
+            : null;
 
           if (step.methodName) {
             if (Array.isArray(paramsForStep) && paramsForStep.length > 0) {
@@ -3353,7 +5248,7 @@ if (!nestedInput) {
                   step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
                 inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
               }
-              const boundMethod = { opcode: "jwClass_getProp", inputs: [getClassMethodKey(classNameForStep, step.methodName), receiverRef] };
+              const boundMethod = makeGet(getClassMethodKey(classNameForStep, step.methodName), receiverRef);
               const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
               const tempName = __pw_newTemp("__c");
               inlineChildren.push({
@@ -3369,7 +5264,7 @@ if (!nestedInput) {
             }
             const argPos =
               step.args && step.args.length > 0 ? exprToNested(step.args[0], inMethod, paramMap) : "";
-            const boundMethod = { opcode: "jwClass_getProp", inputs: [getClassMethodKey(classNameForStep, step.methodName), receiverRef] };
+            const boundMethod = makeGet(getClassMethodKey(classNameForStep, step.methodName), receiverRef);
             if (argPos !== "") {
               const argTemp = getArgTempForCall(classNameForStep, step.methodName);
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, argPos] });
@@ -3406,10 +5301,10 @@ if (!nestedInput) {
                   step.args && step.args[pi] ? exprToNested(step.args[pi], inMethod, paramMap) : "";
                 inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
               }
-              const boundMethod = {
-                opcode: "jwClass_getProp",
-                inputs: [getClassMethodKey(classNameForStep, fakeMethod), { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
-              };
+              const boundMethod = makeGet(getClassMethodKey(classNameForStep, fakeMethod), {
+                opcode: "SPtempVars_getVar",
+                inputs: ["thread", prevTemp],
+              });
               const callReporter = { opcode: "jwLambda_executeR", inputs: [boundMethod, ""] };
               const tempName = __pw_newTemp("__c");
               inlineChildren.push({
@@ -3417,7 +5312,11 @@ if (!nestedInput) {
                 inputs: ["thread", tempName, callReporter],
               });
               prevTemp = tempName;
-              prevReturnedLambdaArgs = classNameForStep ? (Array.isArray(getMethodReturns(classNameForStep, fakeMethod)) ? getMethodReturns(classNameForStep, fakeMethod).slice() : null) : null;
+              prevReturnedLambdaArgs = classNameForStep
+                ? Array.isArray(getMethodReturns(classNameForStep, fakeMethod))
+                  ? getMethodReturns(classNameForStep, fakeMethod).slice()
+                  : null
+                : null;
               prevStepMethodName = fakeMethod;
               continue;
             }
@@ -3427,10 +5326,10 @@ if (!nestedInput) {
               const argTemp = getArgTempForCall(classNameForStep, fakeMethod);
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp, fakeArg] });
             }
-            const boundMethod2 = {
-              opcode: "jwClass_getProp",
-              inputs: [getClassMethodKey(classNameForStep, fakeMethod), { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
-            };
+            const boundMethod2 = makeGet(getClassMethodKey(classNameForStep, fakeMethod), {
+              opcode: "SPtempVars_getVar",
+              inputs: ["thread", prevTemp],
+            });
             const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
             const tempName2 = __pw_newTemp("__c");
             inlineChildren.push({
@@ -3438,7 +5337,11 @@ if (!nestedInput) {
               inputs: ["thread", tempName2, callReporter2],
             });
             prevTemp = tempName2;
-            prevReturnedLambdaArgs = classNameForStep ? (Array.isArray(getMethodReturns(classNameForStep, fakeMethod)) ? getMethodReturns(classNameForStep, fakeMethod).slice() : null) : null;
+            prevReturnedLambdaArgs = classNameForStep
+              ? Array.isArray(getMethodReturns(classNameForStep, fakeMethod))
+                ? getMethodReturns(classNameForStep, fakeMethod).slice()
+                : null
+              : null;
             prevStepMethodName = fakeMethod;
             continue;
           }
@@ -3477,10 +5380,13 @@ if (!nestedInput) {
               const argTemp2 = getArgTempForCall(classNameForStep, prevStepMethodName || null);
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp2, argPos2] });
             }
-            const boundMethod2 = {
-              opcode: "jwClass_getProp",
-              inputs: [prevStepMethodName, { opcode: "SPtempVars_getVar", inputs: ["thread", prevTemp] }],
-            };
+            const mappedPrevMethod = classNameForStep
+              ? getClassMethodKey(classNameForStep, prevStepMethodName)
+              : prevStepMethodName;
+            const boundMethod2 = makeGet(mappedPrevMethod, {
+              opcode: "SPtempVars_getVar",
+              inputs: ["thread", prevTemp],
+            });
             const callReporter2 = { opcode: "jwLambda_executeR", inputs: [boundMethod2, ""] };
             const tempName2 = __pw_newTemp("__c");
             inlineChildren.push({
@@ -3488,11 +5394,15 @@ if (!nestedInput) {
               inputs: ["thread", tempName2, callReporter2],
             });
             prevTemp = tempName2;
-            prevReturnedLambdaArgs = classNameForStep ? (Array.isArray(getMethodReturns(classNameForStep, prevStepMethodName)) ? getMethodReturns(classNameForStep, prevStepMethodName).slice() : null) : null;
+            prevReturnedLambdaArgs = classNameForStep
+              ? Array.isArray(getMethodReturns(classNameForStep, prevStepMethodName))
+                ? getMethodReturns(classNameForStep, prevStepMethodName).slice()
+                : null
+              : null;
             prevStepMethodName = prevStepMethodName;
           } else {
             const methodForBound = step.methodName || prevStepMethodName;
-            const boundMethod2 = { opcode: "jwClass_getProp", inputs: [getClassMethodKey(classNameForStep, methodForBound), receiverRef] };
+            const boundMethod2 = makeGet(getClassMethodKey(classNameForStep, methodForBound), receiverRef);
             if (argPos2 !== "") {
               const argTemp2 = getArgTempForCall(classNameForStep, methodForBound);
               inlineChildren.push({ opcode: "SPtempVars_setVar", inputs: ["thread", argTemp2, argPos2] });
@@ -3525,8 +5435,17 @@ if (!nestedInput) {
         if (isStaticCall) setters.unshift(staticSetTemp);
         const call = {
           opcode: "jwLambda_execute",
-          inputs: [isStaticCall ? { opcode: "jwClass_getProp", inputs: [actualMethodName, staticReceiverRef] } : methodGetter, ""],
+          inputs: [isStaticCall ? makeGet(actualMethodName, staticReceiverRef) : methodGetter, ""],
         };
+        return [].concat(setters, [call]);
+      }
+
+      // Lambda stored as an object property (e.g. `obj.fn(a, b)`): set the
+      // indexed arg temps for every argument, then execute the lambda.
+      const memberLambdaInfo = getMemberLambdaInfo(chain);
+      if (memberLambdaInfo) {
+        const setters = buildLambdaArgSetters(memberLambdaInfo, stmt.args, inMethod, paramMap);
+        const call = { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
         return [].concat(setters, [call]);
       }
 
@@ -3544,27 +5463,33 @@ if (!nestedInput) {
           else argTempName = getArgTempForCall(className, methodName);
         }
         const setter = { opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] };
-        if (isStaticCall) return [].concat([staticSetTemp, setter, { opcode: "jwLambda_execute", inputs: [{ opcode: "jwClass_getProp", inputs: [actualMethodName, staticReceiverRef] }, ""] }]);
+        if (isStaticCall)
+          return [].concat([
+            staticSetTemp,
+            setter,
+            { opcode: "jwLambda_execute", inputs: [makeGet(actualMethodName, staticReceiverRef), ""] },
+          ]);
         const call = { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
         return [].concat([setter], [call]);
       }
-      if (isStaticCall) return { opcode: "jwLambda_execute", inputs: [{ opcode: "jwClass_getProp", inputs: [actualMethodName, staticReceiverRef] }, ""] };
+      if (isStaticCall)
+        return { opcode: "jwLambda_execute", inputs: [makeGet(actualMethodName, staticReceiverRef), ""] };
       return { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
     }
-      if (stmt.type === "Declare") {
-        // Determine destination scope for declared variable
-        const destType = varScopeForName(stmt.name, inMethod, paramMap, stmt.kind);
-        if (stmt.value) {
-          const vinfo = varToLambda[stmt.name];
-          const mapped = vinfo && vinfo.map ? vinfo.map : paramMap;
-          const valueNested = exprToNested(stmt.value, inMethod, mapped);
-          return {
-            opcode: "SPtempVars_setVar",
-            inputs: [destType, stmt.name, valueNested],
-          };
-        }
-        return { opcode: "SPtempVars_setVar", inputs: [destType, stmt.name, ""] };
+    if (stmt.type === "Declare") {
+      // Determine destination scope for declared variable
+      const destType = varScopeForName(stmt.name, inMethod, paramMap, stmt.kind);
+      if (stmt.value) {
+        const vinfo = varToLambda[stmt.name];
+        const mapped = vinfo && vinfo.map ? vinfo.map : paramMap;
+        const valueNested = exprToNested(stmt.value, inMethod, mapped);
+        return {
+          opcode: "SPtempVars_setVar",
+          inputs: [destType, stmt.name, valueNested],
+        };
       }
+      return { opcode: "SPtempVars_setVar", inputs: [destType, stmt.name, ""] };
+    }
     if (stmt.type === "Return") {
       // Only allowed inside class methods or lambdas (inMethod flag)
       if (!inMethod) throw new Error("'return' used outside of a method or lambda is not allowed");
@@ -3603,7 +5528,7 @@ if (!nestedInput) {
         if (chain.length > 2) {
           for (let i = 1; i < chain.length - 1; i++) {
             const prop = chain[i];
-            objReceiver = { opcode: "jwClass_getProp", inputs: [prop, objReceiver] };
+            objReceiver = makeGet(prop, objReceiver);
           }
         }
         const propName = chain[chain.length - 1];
@@ -3619,10 +5544,7 @@ if (!nestedInput) {
         ) {
           let leftNested = null;
           if (chain[0] === "this") {
-            leftNested = {
-              opcode: "jwClass_getProp",
-              inputs: [propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }],
-            };
+            leftNested = makeGet(propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true });
           } else {
             leftNested = exprToNested({ type: "Member", chain: chain.slice() }, inMethod, paramMap);
           }
@@ -3635,12 +5557,10 @@ if (!nestedInput) {
         // If the class defines a setter for this property, emit a call to
         // the setter method instead of a direct jwClass_setProp.
         let detectedClass = null;
-        if (chain[0] === 'this' && emittingClass) detectedClass = emittingClass;
-        else if (varToClass[chain[0]]) detectedClass = varToClass[chain[0]];
-        else if (classRegistry[chain[0]]) detectedClass = chain[0];
+        detectedClass = resolveReceiverClass(chain[0], emittingClass, currentMethodParams);
         if (detectedClass && hasMethodFlag(detectedClass, propName, "setter")) {
           // Prepare argument for setter
-          const setterParams = getMethodParams(detectedClass, propName, 'setter');
+          const setterParams = getMethodParams(detectedClass, propName, "setter");
           const setters = [];
           if (Array.isArray(setterParams) && setterParams.length > 1) {
             // Setter params include [propertyName, actualParam, ...], so use index 1
@@ -3650,36 +5570,47 @@ if (!nestedInput) {
             const at = getArgTempForCall(detectedClass, propName, "setter");
             setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", at, val] });
           }
-          const setterReceiver = typeof chain[0] === 'string' && chain[0] !== 'this' && classRegistry[chain[0]] && hasMethodFlag(detectedClass, propName, "static")
-            ? getClassGlobalRef(detectedClass)
-            : objReceiver;
+          const setterReceiver =
+            typeof chain[0] === "string" &&
+            chain[0] !== "this" &&
+            classRegistry[chain[0]] &&
+            hasMethodFlag(detectedClass, propName, "static")
+              ? getClassGlobalRef(detectedClass)
+              : objReceiver;
           const setterGetter = hasMethodFlag(detectedClass, propName, "static")
             ? getClassStaticGet(detectedClass, getClassMethodKey(detectedClass, propName, "setter"))
-            : { opcode: "jwClass_getProp", inputs: [getClassMethodKey(detectedClass, propName, "setter"), setterReceiver] };
+            : makeGet(getClassMethodKey(detectedClass, propName, "setter"), setterReceiver);
           const call = { opcode: "jwLambda_execute", inputs: [setterGetter, ""] };
           return [].concat(setters, [call]);
         }
-        if (chain[0] === 'this' && emittingClass && emittingStaticMethod) {
+        if (chain[0] === "this" && emittingClass && emittingStaticMethod) {
           if (chain.length === 2) {
             return getClassStaticSet(emittingClass, propName, val);
           }
           let receiverRef = getClassStaticGet(emittingClass, chain[1]);
           for (let i = 2; i < chain.length - 1; i++) {
-            receiverRef = { opcode: "jwClass_getProp", inputs: [chain[i], receiverRef] };
+            receiverRef = makeGet(chain[i], receiverRef);
           }
-          return { opcode: "jwClass_setProp", inputs: [propName, receiverRef, val] };
+          return makeSet(propName, receiverRef, val);
         }
-        if (typeof chain[0] === 'string' && classRegistry[chain[0]]) {
+        if (typeof chain[0] === "string" && classRegistry[chain[0]]) {
           if (chain.length === 2) {
             return getClassStaticSet(chain[0], propName, val);
           }
           let receiverRef = getClassStaticGet(chain[0], chain[1]);
           for (let i = 2; i < chain.length - 1; i++) {
-            receiverRef = { opcode: "jwClass_getProp", inputs: [chain[i], receiverRef] };
+            receiverRef = makeGet(chain[i], receiverRef);
           }
-          return { opcode: "jwClass_setProp", inputs: [propName, receiverRef, val] };
+          return makeSet(propName, receiverRef, val);
         }
-        return { opcode: "jwClass_setProp", inputs: [propName, objReceiver, val] };
+        if (chain.length === 2 && typeof chain[0] === "string" && chain[0] !== "this") {
+          const destType = varScopeForName(chain[0], inMethod, paramMap, undefined);
+          return {
+            opcode: "SPtempVars_setVar",
+            inputs: [destType, chain[0], makeSet(propName, objReceiver, val)],
+          };
+        }
+        return makeSet(propName, objReceiver, val);
       }
       const destType = varScopeForName(stmt.name, inMethod, paramMap, stmt.kind);
       return {
@@ -3752,10 +5683,14 @@ if (!nestedInput) {
           inc = exprToNested(stmt.update, inMethod, paramMap);
         }
       }
+      // Track the loop counter so references to it inside the body resolve to
+      // "thread", matching the hard-coded "thread" used for the forVar itself.
+      if (varName) loopVarStack.push(varName);
       const raw =
         stmt.body && stmt.body.body
           ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean)
           : [];
+      if (varName) loopVarStack.pop();
       const body = flattenNestedResults(raw);
       assertReturnTerminal(body, "for body");
       return { opcode: "SPtempVars_forVar", inputs: ["thread", varName, start, end, body, inc] };
@@ -3783,7 +5718,11 @@ if (!nestedInput) {
           lambdasUsed = true;
           // Use pre-collected tagged param names when available so
           // method declarations and call-sites agree on the thread-var names.
-          const taggedParams = getMethodParams(className, m.name, m.getter ? 'getter' : m.setter ? 'setter' : 'method');
+          const taggedParams = getMethodParams(
+            className,
+            m.name,
+            m.getter ? "getter" : m.setter ? "setter" : "method",
+          );
           let lambdaArg = null;
           if (Array.isArray(taggedParams) && taggedParams.length > 0) lambdaArg = taggedParams.slice();
           else if (m.params && m.params.length > 0)
@@ -3803,7 +5742,7 @@ if (!nestedInput) {
           // If this method has a recorded returned-lambda, merge its param mappings
           // into the methodParamMap so inner returned-lambda params are emitted
           // using the same tagged names inside the method body.
-          const kind = m.getter ? 'getter' : m.setter ? 'setter' : 'method';
+          const kind = m.getter ? "getter" : m.setter ? "setter" : "method";
           const retOrig = getMethodReturnOriginals(className, m.name, kind);
           const retTagged = getMethodReturns(className, m.name, kind);
           if (Array.isArray(retOrig) && Array.isArray(retTagged) && retOrig.length === retTagged.length) {
@@ -3819,13 +5758,16 @@ if (!nestedInput) {
           if (m.body && Array.isArray(m.body.body)) {
             const _prevMethodKey = currentEmittingMethodKey;
             const _prevEmittingStaticMethod = emittingStaticMethod;
+            const _prevMethodParams = currentMethodParams;
             emittingStaticMethod = !!m.static;
             currentEmittingMethodKey = `${className}:${m.name}`;
+            currentMethodParams = Array.isArray(m.params) ? m.params.slice() : [];
             const raw = m.body.body.map((s) => stmtToNested(s, true, methodParamMap)).filter(Boolean);
             methodBody = flattenNestedResults(raw);
             assertReturnTerminal(methodBody, `method '${m.name}' body`);
             currentEmittingMethodKey = _prevMethodKey;
             emittingStaticMethod = _prevEmittingStaticMethod;
+            currentMethodParams = _prevMethodParams;
           }
           let lambdaBlock = null;
           // Getters and setters are emitted as ordinary class methods;
@@ -3839,19 +5781,19 @@ if (!nestedInput) {
             // generator factory lambda.
             function replaceYields(node) {
               if (Array.isArray(node)) return node.map(replaceYields);
-              if (!node || typeof node !== 'object') return node;
+              if (!node || typeof node !== "object") return node;
               // Detect builder-yield call shapes (opcode or name)
               const op = node.opcode || node.name;
-              if (op === 'jw_yield') {
+              if (op === "jw_yield") {
                 const val = Array.isArray(node.inputs) && node.inputs.length > 0 ? node.inputs[0] : "";
-                return { opcode: 'jwArray_builderAppend', inputs: [val] };
+                return { opcode: "jwArray_builderAppend", inputs: [val] };
               }
               // Recurse into inputs arrays and children/substacks
               const out = Object.assign({}, node);
               if (Array.isArray(out.inputs)) {
                 out.inputs = out.inputs.map((inp) => {
                   if (Array.isArray(inp)) return inp.map(replaceYields);
-                  if (inp && typeof inp === 'object') return replaceYields(inp);
+                  if (inp && typeof inp === "object") return replaceYields(inp);
                   return inp;
                 });
               }
@@ -3862,26 +5804,26 @@ if (!nestedInput) {
             const builderSubstack = methodBody.map(replaceYields);
             const builderBlock = {
               opcode: "jwArray_builder",
-              inputs: [{ opcode: "jwArray_builderCurrent", shadow: true, noPlaceholder: true }, builderSubstack],
+              inputs: [
+                { opcode: "jwArray_builderCurrent", shadow: true, noPlaceholder: true },
+                builderSubstack,
+              ],
             };
             lambdaBlock = { opcode: "jwLambda_newLambdaR", inputs: [lambdaArg, builderBlock] };
           } else {
             lambdaBlock = { opcode: "jwLambda_newLambda", inputs: [lambdaArg, methodBody] };
           }
           // If method marked `static`, attach to the class object via static setter.
-          const methodKey = getClassMethodKey(className, m.name, m.getter ? "getter" : m.setter ? "setter" : "method");
+          const methodKey = getClassMethodKey(
+            className,
+            m.name,
+            m.getter ? "getter" : m.setter ? "setter" : "method",
+          );
           const _prevEmittingClassStaticInit = emittingClassStaticInit;
           if (m.static) emittingClassStaticInit = true;
           const setProp = m.static
             ? getClassStaticSet(className, methodKey, lambdaBlock)
-            : {
-                opcode: "jwClass_setProp",
-                inputs: [
-                  methodKey,
-                  { opcode: "jwClass_self", inputs: [], noPlaceholder: true },
-                  lambdaBlock,
-                ],
-              };
+            : makeSet(methodKey, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }, lambdaBlock);
           emittingClassStaticInit = _prevEmittingClassStaticInit;
           if (m.static) staticSubstackBlocks.push(setProp);
           else substackBlocks.push(setProp);
@@ -3906,10 +5848,11 @@ if (!nestedInput) {
             let leftNested = null;
             const propNameLocal = propName;
             if (chain[0] === "this") {
-              leftNested = {
-                opcode: "jwClass_getProp",
-                inputs: [propNameLocal, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }],
-              };
+              leftNested = makeGet(propNameLocal, {
+                opcode: "jwClass_self",
+                inputs: [],
+                noPlaceholder: true,
+              });
             } else {
               leftNested = exprToNested({ type: "Member", chain: chain.slice() }, inMethod, paramMap);
             }
@@ -3928,9 +5871,9 @@ if (!nestedInput) {
             } else {
               let receiverRef = getClassStaticGet(className, chain[1]);
               for (let i = 2; i < chain.length - 1; i++) {
-                receiverRef = { opcode: "jwClass_getProp", inputs: [chain[i], receiverRef] };
+                receiverRef = makeGet(chain[i], receiverRef);
               }
-              setProp = { opcode: "jwClass_setProp", inputs: [propName, receiverRef, val] };
+              setProp = makeSet(propName, receiverRef, val);
             }
             emittingClassStaticInit = _prevEmittingClassStaticInit;
             staticSubstackBlocks.push(setProp);
@@ -3942,17 +5885,14 @@ if (!nestedInput) {
             } else {
               let receiverRef = getClassStaticGet(chain[0], chain[1]);
               for (let i = 2; i < chain.length - 1; i++) {
-                receiverRef = { opcode: "jwClass_getProp", inputs: [chain[i], receiverRef] };
+                receiverRef = makeGet(chain[i], receiverRef);
               }
-              setProp = { opcode: "jwClass_setProp", inputs: [propName, receiverRef, val] };
+              setProp = makeSet(propName, receiverRef, val);
             }
             emittingClassStaticInit = _prevEmittingClassStaticInit;
             staticSubstackBlocks.push(setProp);
           } else {
-            setProp = {
-              opcode: "jwClass_setProp",
-              inputs: [propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }, val],
-            };
+            setProp = makeSet(propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }, val);
             substackBlocks.push(setProp);
           }
           continue;
@@ -3989,21 +5929,20 @@ if (!nestedInput) {
   // into multiple top-level nested items so sequential statements
   // (e.g., setter blocks + a call) are emitted in order.
   nestedInput = [];
+  // Determine up front whether the user already wrote their own _INTERNAL__runtime_typeof__AABBCCDDEE12123434__.
+  // Whether *we* need to inject one is only known after conversion below.
+  const userDefinedRuntimeTypeof = hasRuntimeTypeofDefinition(ast);
+
   for (const s of ast) {
     if (s && s.type === "On") {
       let opcode = s.event;
       switch (s.event) {
-        case "flag":
-          opcode = "event_whenflagclicked";
-          break;
-        case "click":
-          opcode = "event_whenthisspriteclicked";
-          break;
-        default:
-          opcode = s.event;
+        case "flag": opcode = "event_whenflagclicked"; break;
+        case "click": opcode = "event_whenthisspriteclicked"; break;
+        default: opcode = s.event;
       }
       const rawChildren =
-        s.body && s.body.body ? s.body.body.map((c) => stmtToNested(c, false)).filter(Boolean) : [];
+      s.body && s.body.body ? s.body.body.map((c) => stmtToNested(c, false)).filter(Boolean) : [];
       const children = [];
       for (const c of rawChildren) {
         if (Array.isArray(c)) children.push(...c);
@@ -4020,6 +5959,22 @@ if (!nestedInput) {
       }
     }
   }
+
+  // Only NOW do we know whether any `typeof` fell back to the runtime helper
+  // (set inside exprToNested during the loop above). Inject it post hoc.
+  if (runtimeTypeofHelperUsed && !userDefinedRuntimeTypeof) {
+    const helperOn = buildRuntimeTypeofHelperDecl();
+    const rawChildren =
+    helperOn.body && helperOn.body.body
+    ? helperOn.body.body.map((c) => stmtToNested(c, false)).filter(Boolean)
+    : [];
+    const children = [];
+    for (const c of rawChildren) {
+      if (Array.isArray(c)) children.push(...c);
+      else children.push(c);
+    }
+    nestedInput.unshift({ opcode: "event_whenflagclicked", children });
+  }
 }
 
 // Now always use nested input for generation
@@ -4027,12 +5982,12 @@ let emitResult;
 try {
   // DEBUG: dump nested representation to inspect emitted class/new/method shapes
   try {
-    require('fs').writeFileSync('/tmp/pang_nested_debug.json', JSON.stringify(nestedInput, null, 2), 'utf8');
+    require("fs").writeFileSync("/tmp/pang_nested_debug.json", JSON.stringify(nestedInput, null, 2), "utf8");
   } catch (e) {}
   //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
   emitResult = generator.generateFromNested(nestedInput);
   try {
-    require('fs').writeFileSync('/tmp/emitResult_debug.json', JSON.stringify(emitResult, null, 2), 'utf8');
+    require("fs").writeFileSync("/tmp/emitResult_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
   } catch (e) {}
   // quick validation: ensure emitted pseudocode blocks look reasonable
   try {
@@ -4099,11 +6054,7 @@ if (!usedClasses) {
 // Convert pseudocode blocks into a real project.json `blocks` object
 const pseudoConverter = require("./lib/pseudocodeToProject");
 try {
-  require("fs").writeFileSync(
-    "/tmp/emitResult_debug.json",
-    JSON.stringify(emitResult, null, 2),
-    "utf8"
-  );
+  require("fs").writeFileSync("/tmp/emitResult_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
 } catch (e) {
   // ignore debug write errors
 }
@@ -4130,6 +6081,16 @@ if (lambdasUsed) {
   // Ensure lambdas extension declared if emitter created lambdas
   out.extensions = out.extensions || [];
   if (!out.extensions.includes("jwLambda")) out.extensions.push("jwLambda");
+}
+
+if (objectsUsed) {
+  // Ensure Objects extension declared if emitter created object literals
+  out.extensions = out.extensions || [];
+  if (!out.extensions.includes("dogeiscutObject")) out.extensions.push("dogeiscutObject");
+  out.extensionURLs = out.extensionURLs || {};
+  out.extensionURLs.dogeiscutObject =
+    out.extensionURLs.dogeiscutObject ||
+    "https://extensions.penguinmod.com/extensions/DogeisCut/dogeiscutObject.js";
 }
 
 // Ensure SPtempVars extension declared if emitter created variables (we keep variables in SPtempVars, not target.vars)

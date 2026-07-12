@@ -63,7 +63,19 @@ printCall
 
 // Variable declaration: let or const
 varDecl
-    : ('let' | 'const')? IDENT ('=' expr)?
+    : ('let' | 'const')? IDENT typeAnnotation? ('=' expr)?
+    ;
+
+paramDecl
+    : IDENT typeAnnotation? ('=' expr)?
+    ;
+
+typeAnnotation
+    : ':' typeName
+    ;
+
+typeName
+    : IDENT ('[' ']')*
     ;
 
 // Assignment statement (implicit let if variable not declared)
@@ -100,17 +112,20 @@ continueStmt
 primary
     : atom
       (INCR | DECR)? // optional post-increment/decrement
+      ( '[' expr ']' )*
     ;
 
 expr
     : THIS
     | primary
+    | '*'? 'typeof' expr
     | 'new' functionCall
     | '!' expr
     | '~' expr
     | ('+' | '-') expr
     | INCR expr
     | DECR expr
+    | expr 'as' typeName
     // power (right-associative)
     | <assoc=right> expr POWER expr
     // multiplicative
@@ -148,11 +163,36 @@ atom
     | functionCall
     | memberExpr
     | arrayLiteral
+    | objectLiteral
     | '(' expr ')'
     ;
 
 arrayLiteral
     : '[' (expr (',' expr)*)? ','? ']'
+    ;
+
+objectLiteral
+    : '{' (objectPair (',' objectPair)*)? ','? '}'
+    ;
+
+objectPair
+    : objectKey ':' expr
+    ;
+
+objectKey
+    : typedObjectKey
+    | computedObjectKey
+    | STRING
+    | IDENT
+    ;
+
+typedObjectKey
+    : typeName IDENT
+    | typeName computedObjectKey
+    ;
+
+computedObjectKey
+    : '[' expr ']'
     ;
 // have to use options_ since options is a reserved word in ANTLR
 // options_ accepts a simple JSON-like object with string keys (quoted or unquoted)
@@ -186,8 +226,8 @@ functionCall
     ;
 
 arrowFunction
-    : '(' (IDENT (',' IDENT)*)? ')' '=>' (block | inlineBlock)
-    | IDENT '=>' (block | inlineBlock)
+    : '(' (paramDecl (',' paramDecl)*)? ')' '=>' (block | inlineBlock)
+    | paramDecl '=>' (block | inlineBlock)
     ;
 
 memberExpr
@@ -199,8 +239,8 @@ classDecl
     ;
 
 classMember
-    : ('static')? (IDENT)? '*'? IDENT '(' (IDENT (',' IDENT)*)? ')' block
-    | 'constructor' '(' (IDENT (',' IDENT)*)? ')' block
+    : ('static')? '*'? IDENT '(' (paramDecl (',' paramDecl)*)? ')' typeAnnotation? block
+    | 'constructor' '(' (paramDecl (',' paramDecl)*)? ')' block
     ;
 
 IDENT

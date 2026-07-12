@@ -17,13 +17,12 @@ on("flag", *{
     const farewell = "Done";
 
     // ask returns a value via inline stack; demonstrate using it in a while
-    let times = ask("How many times to greet?");
+    let times: String = ask("How many times to greet?");
     let k = 0;
-    while (k < times) {
+    for (let k = 0; k < times; k++) {
         print(farewell .. " #" .. k);
         if (k === 2) {
             break;
         };
-        k = k + 1;
     }
 });

@@ -5,7 +5,7 @@ on("flag", *{
     print(!true);
     const foo = "bar";
     //foo = 5;
-    let name = ask("What is your name?");
+    let name: String = ask("What is your name?");
     if (name === "Alice") {
         print("Hello, Alice the Great!", {seconds: 2});
     } else if (name == "Bob") {

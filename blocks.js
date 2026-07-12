@@ -821,4 +821,10 @@ Object.assign(module.exports.processedBlocks, {
     ],
     "reporter",
   ],
+
+  jwArray_validate: [
+    [
+      { name: "INPUT", type: 1}
+    ]
+  ]
 });
