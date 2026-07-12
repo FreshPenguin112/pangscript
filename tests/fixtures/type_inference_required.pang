@@ -1,0 +1,23 @@
+class Service {
+    constructor(name) {
+        this.name = name;
+    }
+
+    load() {
+        return helper();
+    }
+}
+
+class Workflow {
+    constructor(service) {
+        this.service = service;
+    }
+
+    run() {
+        let payload = this.service.load();
+        return payload;
+    }
+}
+
+let app = new Workflow(new Service("demo"));
+let value = app.run();

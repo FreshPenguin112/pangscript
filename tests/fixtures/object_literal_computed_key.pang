@@ -1,0 +1,4 @@
+on("flag", () => {
+    let foo = "foo";
+    let obj = { [typeof foo]: 1 };
+});

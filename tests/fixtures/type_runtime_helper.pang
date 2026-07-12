@@ -1,0 +1,6 @@
+on("flag", () => {
+      let x = 42;
+      let y = *typeof x;
+      print(y);
+      print(typeof (operator_random(0, 1) === 0))
+  });

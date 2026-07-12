@@ -1,0 +1,12 @@
+on("flag", () => {
+    let foo = "foo";
+    let bar = "bar";
+    let obj = {String foo: "bar", String [foo .. bar]: "baz"};
+    let foo = obj.foo;
+    let arr: Number[] = [1, 2];
+    let entry = arr[1] as Number;
+    print(typeof entry);
+    let message: String = "baz";
+    message = "qux";
+    print(typeof message)
+});

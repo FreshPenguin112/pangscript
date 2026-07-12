@@ -1,0 +1,11 @@
+on("flag", () => {
+    // Object literal with a lambda as a property — should compile and preserve lambda
+    let obj2 = {
+        greet: () => {
+                print("hi");
+            },
+        arr: [1, 2, 3]
+        };
+    obj2.greet();
+    obj2.arr.push(4)
+})

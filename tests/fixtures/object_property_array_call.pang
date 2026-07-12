@@ -1,0 +1,2 @@
+var obj2 = { arr: [1] };
+obj2.arr.push(4);

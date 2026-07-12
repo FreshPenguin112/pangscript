@@ -1,0 +1,6 @@
+on("flag", () => {
+    let test = {
+        foo: a => { return a }
+    }
+    print(test.foo("foo"), {seconds: 2})
+})

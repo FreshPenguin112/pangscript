@@ -20,4 +20,4 @@ vscode-pang
 !advanced_demo.pang
 vm.js
 dogeiscutObjects.js
-!tests/*
+!tests/**

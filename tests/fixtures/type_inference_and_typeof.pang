@@ -1,0 +1,18 @@
+on("flag", () => {
+    let name = "Ada";
+    let count = 3;
+    let isReady = true;
+    let scores = [1, 2, 3];
+
+    let nameType = typeof name;
+    let countType = typeof count;
+    let scoresType = typeof scores;
+
+    let typedName: String = name;
+    let typedCount: Number = count;
+    let typedReady: Boolean = isReady;
+
+    print(nameType, {seconds: 2});
+    print(countType, {seconds: 2});
+    print(scoresType, {seconds: 2});
+})

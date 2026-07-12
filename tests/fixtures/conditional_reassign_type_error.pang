@@ -1,0 +1,9 @@
+on("flag", () => {
+    let foo: String = "baz";
+    if (true) {
+        foo = 1;
+    } else {
+        foo = "bar";
+    }
+    print(typeof foo)
+});
