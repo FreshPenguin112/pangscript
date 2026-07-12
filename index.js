@@ -5982,12 +5982,12 @@ let emitResult;
 try {
   // DEBUG: dump nested representation to inspect emitted class/new/method shapes
   try {
-    require("fs").writeFileSync("/tmp/pang_nested_debug.json", JSON.stringify(nestedInput, null, 2), "utf8");
+    //require("fs").writeFileSync("/tmp/pang_nested_debug.json", JSON.stringify(nestedInput, null, 2), "utf8");
   } catch (e) {}
   //console.error("DEBUG_NESTED:\n" + JSON.stringify(nestedInput, null, 2));
   emitResult = generator.generateFromNested(nestedInput);
   try {
-    require("fs").writeFileSync("/tmp/emitResult_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
+    //require("fs").writeFileSync("/tmp/emitResult_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
   } catch (e) {}
   // quick validation: ensure emitted pseudocode blocks look reasonable
   try {
@@ -6054,7 +6054,7 @@ if (!usedClasses) {
 // Convert pseudocode blocks into a real project.json `blocks` object
 const pseudoConverter = require("./lib/pseudocodeToProject");
 try {
-  require("fs").writeFileSync("/tmp/emitResult_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
+  //require("fs").writeFileSync("/tmp/emitResult_debug.json", JSON.stringify(emitResult, null, 2), "utf8");
 } catch (e) {
   // ignore debug write errors
 }
