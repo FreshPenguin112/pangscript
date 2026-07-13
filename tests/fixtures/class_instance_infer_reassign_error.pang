@@ -1,0 +1,14 @@
+class Foo {
+    constructor(a, b) {
+        this.a = a;
+        this.b = b;
+    }
+    bar() {
+        return this.a + this.b;
+    }
+}
+
+let a = new Foo(5, 10);
+a.bar();
+a = {bar: () => {return 1}};
+a.bar();

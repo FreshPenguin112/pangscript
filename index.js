@@ -110,32 +110,166 @@ const blocksMeta = require("./blocks").processedBlocks;
 // Load DogeisCut processedBlocks additions (mutates blocks.processedBlocks)
 require("./blocks_dogeiscut_additions");
 
+// Module-level maps populated during compilation (inside performStaticTypeAnalysis)
+// so module-scoped helpers like isClassReceiver can consult them.
+let varToClass = {};
+let tempToClass = {};
+
 // Helpers to choose DogeisCut opcodes when available in blocks metadata.
+// Decide whether a receiver refers to a class instance (in which case we must
+// use the jwClass property ops) versus a plain object (dogeiscutObject ops).
+function isClassReceiver(receiver) {
+  if (!receiver || typeof receiver !== "object") return false;
+  const op = receiver.opcode;
+  if (
+    op === "jwClass_self" ||
+    op === "jwClass_getProp" ||
+    op === "jwClass_getStatic" ||
+    op === "jwClass_getStaticProp"
+  )
+    return true;
+  // Class-typed variable receiver, e.g. `let a = new Foo(); a.x`
+  if (receiver.type === "Var" && receiver.name && varToClass && varToClass[receiver.name])
+    return true;
+  // Thread-temp produced by an inline `new`/class wrapper (resolved via tempToClass)
+  if (op === "SPtempVars_getVar" && Array.isArray(receiver.inputs) && tempToClass && tempToClass[receiver.inputs[1]])
+    return true;
+  return false;
+}
 function makeGet(prop, receiver) {
+  // Class instances (`this`, class property chains) use jwClass_getProp (KEY, POINTER).
+  if (isClassReceiver(receiver))
+    return { opcode: "jwClass_getProp", inputs: [prop, { ...receiver, noPlaceholder: true }] };
   // dogeiscut 'get' expects (OBJECT, KEY)
   if (blocksMeta && blocksMeta["dogeiscutObject_get"])
-    return { opcode: "dogeiscutObject_get", inputs: [receiver, prop] };
-  return { opcode: "jwClass_getProp", inputs: [prop, receiver] };
+    return { opcode: "dogeiscutObject_get", inputs: [{ ...receiver, noPlaceholder: true }, prop] };
+  return { opcode: "jwClass_getProp", inputs: [prop, { ...receiver, noPlaceholder: true }] };
 }
 function makeGetPath(arrayParam, receiver) {
+  // Class instances use jwClass_getProp (ARRAY, POINTER).
+  if (isClassReceiver(receiver))
+    return { opcode: "jwClass_getProp", inputs: [arrayParam, { ...receiver, noPlaceholder: true }] };
   // dogeiscut 'getPath' expects (ARRAY, OBJECT)
   if (blocksMeta && blocksMeta["dogeiscutObject_getPath"])
-    return { opcode: "dogeiscutObject_getPath", inputs: [arrayParam, receiver] };
+    return { opcode: "dogeiscutObject_getPath", inputs: [arrayParam, { ...receiver, noPlaceholder: true }] };
   // fallback: chain gets using jwClass_getProp for array-paths not supported
-  return { opcode: "jwClass_getProp", inputs: [arrayParam, receiver] };
+  return { opcode: "jwClass_getProp", inputs: [arrayParam, { ...receiver, noPlaceholder: true }] };
 }
 function makeSet(prop, receiver, val) {
+  // Class instances use jwClass_setProp (KEY, POINTER, VALUE).
+  if (isClassReceiver(receiver))
+    return { opcode: "jwClass_setProp", inputs: [prop, { ...receiver, noPlaceholder: true }, val] };
   // dogeiscut 'set' expects (OBJECT, KEY, VALUE)
   if (blocksMeta && blocksMeta["dogeiscutObject_set"])
-    return { opcode: "dogeiscutObject_set", inputs: [receiver, prop, val] };
+    return { opcode: "dogeiscutObject_set", inputs: [{ ...receiver, noPlaceholder: true }, prop, val] };
   // fallback to jwClass_setProp but ensure parameter ordering matches older shape
-  return { opcode: "jwClass_setProp", inputs: [prop, receiver, val] };
+  return { opcode: "jwClass_setProp", inputs: [prop, { ...receiver, noPlaceholder: true }, val] };
 }
 function makeSetPath(arrayParam, receiver, val) {
+  // Class instances use jwClass_setProp (ARRAY, POINTER, VALUE).
+  if (isClassReceiver(receiver))
+    return { opcode: "jwClass_setProp", inputs: [arrayParam, { ...receiver, noPlaceholder: true }, val] };
   if (blocksMeta && blocksMeta["dogeiscutObject_setPath"])
-    return { opcode: "dogeiscutObject_setPath", inputs: [receiver, arrayParam, val] };
+    return { opcode: "dogeiscutObject_setPath", inputs: [{ ...receiver, noPlaceholder: true }, arrayParam, val] };
   // fallback: not supporting setPath specially; use jwClass_setProp
-  return { opcode: "jwClass_setProp", inputs: [arrayParam, receiver, val] };
+  return { opcode: "jwClass_setProp", inputs: [arrayParam, { ...receiver, noPlaceholder: true }, val] };
+}
+
+// Objects/arrays are immutable: `dogeiscutObject_set` (and `_setPath`) are now
+// REPORTERS that return a brand-new object/array. A statement such as
+// `obj.x = 5` must therefore bind the returned object back into the variable
+// that held it. The helpers below make that wrapping uniform across every
+// emission site so a reporter is never left dangling as a bare stack block.
+
+// `this` is simply the `jwClass_self` reporter — never a threaded variable.
+function selfRef() {
+  return { opcode: "jwClass_self", inputs: [], noPlaceholder: true };
+}
+// Walk a property-get chain (dogeiscutObject_get / jwClass_getProp) to find the
+// root variable the chain is ultimately drawn from, so we can re-bind it after
+// an immutable set. Returns { name, scope } or null.
+function getSetReceiverRootVar(node, inMethod, paramMap) {
+  let cur = node;
+  while (
+    cur &&
+    typeof cur === "object" &&
+    cur.opcode === "dogeiscutObject_get" &&
+    cur.inputs &&
+    cur.inputs[0]
+  ) {
+    cur = cur.inputs[0]; // OBJECT is the first input
+  }
+  if (cur && cur.type === "Var")
+    return { name: cur.name, scope: varScopeForName(cur.name, inMethod, paramMap, undefined) };
+  cur = node;
+  while (
+    cur &&
+    typeof cur === "object" &&
+    cur.opcode === "jwClass_getProp" &&
+    cur.inputs &&
+    cur.inputs[1]
+  ) {
+    cur = cur.inputs[1]; // POINTER is the object input
+  }
+  if (cur && cur.type === "Var")
+    return { name: cur.name, scope: varScopeForName(cur.name, inMethod, paramMap, undefined) };
+  return null;
+}
+// Wrap an immutable object/array set into a SPtempVars_setVar that re-binds the
+// holder variable. Falls back to a thread temp when no re-bindable holder can
+// be determined (e.g. opaque static chains) so the reporter is never emitted
+// bare as a statement.
+function makeObjectSetStatement(receiver, prop, val, inMethod, paramMap) {
+  const build = (r) => makeSet(prop, r, val);
+  if (receiver && receiver.type === "Var") {
+    const scope = varScopeForName(receiver.name, inMethod, paramMap, undefined);
+    return {
+      opcode: "SPtempVars_setVar",
+      inputs: [scope, receiver.name, build({ opcode: "SPtempVars_getVar", inputs: [scope, receiver.name] })],
+    };
+  }
+  const root = getSetReceiverRootVar(receiver, inMethod, paramMap);
+  if (root)
+    return {
+      opcode: "SPtempVars_setVar",
+      inputs: [root.scope, root.name, build({ opcode: "SPtempVars_getVar", inputs: [root.scope, root.name] })],
+    };
+  const tmp = __pw_newTemp("__o");
+  return { opcode: "SPtempVars_setVar", inputs: ["thread", tmp, build(receiver)] };
+}
+
+// Immutable update for a member chain assignment such as `obj.a.b.x = v`.
+// Objects/arrays are immutable, so every level of the chain must be rebuilt:
+//   obj = obj.set("a", obj.a.set("b", obj.a.b.set("x", v)))
+// The outermost re-bind targets the root variable (or the threaded `this`).
+function emitImmutableMemberSet(chain, val, inMethod, paramMap) {
+  const L = chain.length;
+  const rootRecv = chain[0] === "this" ? selfRef() : { type: "Var", name: chain[0] };
+  const levels = [rootRecv];
+  let r = rootRecv;
+  for (let i = 1; i <= L - 2; i++) {
+    r = makeGet(chain[i], r);
+    levels.push(r);
+  }
+  let inner = val;
+  for (let i = L - 1; i >= 1; i--) {
+    inner = makeSet(chain[i], levels[i - 1], inner);
+  }
+  return makeObjectSetStatement(rootRecv, chain[1], inner, inMethod, paramMap);
+}
+
+// `this.x = v` (and nested `this.a.b.x = v`) mutate `this` in place via the
+// `jwClass_setProp` stack block. Inner levels use the immutable dogeiscut set
+// and only the outermost level re-binds onto `this` with jwClass_setProp.
+function emitThisMemberSet(chain, val) {
+  const L = chain.length;
+  let inner = val;
+  for (let i = L - 1; i >= 2; i--) {
+    let recv = selfRef();
+    for (let k = 1; k <= i - 1; k++) recv = makeGet(chain[k], recv);
+    inner = makeSet(chain[i], recv, inner);
+  }
+  return { opcode: "jwClass_setProp", inputs: [chain[1], selfRef(), inner] };
 }
 
 // Map a receiver name to its tagged thread temp (e.g. a lambda param `a`
@@ -228,7 +362,7 @@ class AstBuilder extends PangVisitor {
       return `${this.normalizeTypeName(elementType)}[]`;
     }
     if (node.type === "Lambda") return "Function";
-    if (node.type === "New") return "Object";
+    if (node.type === "New") return node.className || "Object";
     if (node.type === "Object") {
       // Structural object literal inference: if all properties have concrete types,
       // produce a shaped Object type string; otherwise mark as Any (ambiguous).
@@ -1069,8 +1203,14 @@ class AstBuilder extends PangVisitor {
       }
       if (firstTok === "new") {
         // new <functionCall>
-        if (ctx.functionCall && ctx.functionCall())
-          return { type: "New", callee: this.visit(ctx.functionCall()) };
+        if (ctx.functionCall && ctx.functionCall()) {
+          const callee = this.visit(ctx.functionCall());
+          let className = null;
+          if (callee && callee.type === "Call" && typeof callee.name === "string") className = callee.name;
+          else if (callee && callee.type === "MemberCall" && Array.isArray(callee.chain) && callee.chain.length > 0)
+            className = callee.chain[callee.chain.length - 1];
+          return { type: "New", callee, className };
+        }
       }
       if (
         firstTok === "!" ||
@@ -1486,6 +1626,8 @@ function performStaticTypeAnalysis(rootAst) {
     if (!declared || !inferred || declared === "Any" || inferred === "Any") return true;
     if (declared === inferred) return true;
     if (declared === "Object" && inferred && inferred.startsWith("Object{")) return true;
+    // A class instance (e.g. `Foo`) is assignable to a variable typed `Object`.
+    if (declared === "Object" && inferred && inferred !== "Any") return true;
     if (declared === "Array" && inferred && inferred.endsWith("[]")) return true;
     if (declared.endsWith("[]") && inferred.endsWith("[]")) {
       const declaredItem = normalizeTypeName(declared.slice(0, -2));
@@ -1688,8 +1830,8 @@ function performStaticTypeAnalysis(rootAst) {
         return "Function";
       }
       case "New": {
-        node.inferredType = "Object";
-        return "Object";
+        node.inferredType = node.className || "Object";
+        return node.inferredType;
       }
       case "Call": {
         node.inferredType = "Any";
@@ -2310,7 +2452,7 @@ if (!nestedInput) {
       (className === emittingClass && emittingStaticMethod) ||
       (className === emittingClass && emittingClassStaticInit)
     ) {
-      return { opcode: "jwClass_self", inputs: [], noPlaceholder: true };
+      return selfRef();
     }
     return { opcode: "SPtempVars_getVar", inputs: ["global", String(className)], noPlaceholder: true };
   }
@@ -2371,7 +2513,7 @@ if (!nestedInput) {
     if (typeof first === "string") {
       receiver =
         first === "this"
-          ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+          ? selfRef()
           : mapReceiverName(first, paramMap);
     } else if (typeof first === "object") {
       receiver = exprToNested(first, inMethod, paramMap);
@@ -2582,10 +2724,10 @@ if (!nestedInput) {
   collectClasses(ast);
   // Map local variables that are assigned `new ClassName(...)` so we can
   // later identify the class of a receiver variable when emitting method calls.
-  const varToClass = {};
+  varToClass = {};
   // Map thread-temp names (from inline wrappers) to class names so we can
   // resolve getters/setters on temps produced by `New` inline wrappers.
-  const tempToClass = {};
+  tempToClass = {};
   const knownFactoryMethods = ["alloc", "allocUnsafe", "from", "create", "new"];
   function collectVarAssignments(root) {
     function recordAssignedClass(name, valueNode, currentClassName, methodParams) {
@@ -3123,132 +3265,167 @@ if (!nestedInput) {
                       {
                         cond: {
                           type: "Call",
-                          name: "dogeiscutObject_is",
+                          name: "operator_notequal",
                           args: [
                             {
                               type: "Call",
-                              name: "operator_stringify",
-                              args: [{ type: "Var", name: "value" }],
-                            },
-                          ],
+                              name: "jwClass_getClass",
+                              args: [
+                                { type: "Var", name: "value", noPlaceholder: true }
+                              ]
+                            }, { type: "Literal", litType: "string", value: "null" }
+                          ]
                         },
                         thenBlock: {
                           type: "Block",
                           body: [
                             {
                               type: "Return",
-                              value: { type: "Literal", litType: "string", value: "object" },
+                              value: {
+                                type: "Call", name: "jwClass_getName", args: [
+                                  { type: "Call", name: "jwClass_getClass", args: [{ type: "Var", name: "value", noPlaceholder: true }], noPlaceholder: true }
+                                ]
+                              }
                             },
-                          ],
-                        },
-                      },
-                    ],
-                    elseBlock: {
+                          ]
+                        }
+                      }
+                    ], elseBlock: {
                       type: "Block",
-                      body: [
-                        {
-                          type: "If",
-                          cases: [
+                      body: [{
+                        type: "If",
+                        cases: [
+                          {
+                            cond: {
+                              type: "Call",
+                              name: "dogeiscutObject_is",
+                              args: [
+                                {
+                                  type: "Call",
+                                  name: "operator_stringify",
+                                  args: [{ type: "Var", name: "value" }],
+                                },
+                              ],
+                            },
+                            thenBlock: {
+                              type: "Block",
+                              body: [
+                                {
+                                  type: "Return",
+                                  value: { type: "Literal", litType: "string", value: "object" },
+                                },
+                              ],
+                            },
+                          },
+                        ],
+                        elseBlock: {
+                          type: "Block",
+                          body: [
                             {
-                              cond: {
-                                type: "Call",
-                                name: "jwArray_validate",
-                                args: [
-                                  {
+                              type: "If",
+                              cases: [
+                                {
+                                  cond: {
                                     type: "Call",
-                                    name: "operator_stringify",
-                                    args: [{ type: "Var", name: "value" }],
+                                    name: "jwArray_validate",
+                                    args: [
+                                      {
+                                        type: "Call",
+                                        name: "operator_stringify",
+                                        args: [{ type: "Var", name: "value" }],
+                                      },
+                                    ],
                                   },
-                                ],
-                              },
-                              thenBlock: {
+                                  thenBlock: {
+                                    type: "Block",
+                                    body: [
+                                      {
+                                        type: "Return",
+                                        value: { type: "Literal", litType: "string", value: "array" },
+                                      },
+                                    ],
+                                  },
+                                },
+                              ],
+                              elseBlock: {
                                 type: "Block",
                                 body: [
                                   {
-                                    type: "Return",
-                                    value: { type: "Literal", litType: "string", value: "array" },
-                                  },
-                                ],
-                              },
-                            },
-                          ],
-                          elseBlock: {
-                            type: "Block",
-                            body: [
-                              {
-                                type: "If",
-                                cases: [
-                                  {
-                                    cond: {
-                                      type: "Call",
-                                      name: "sensing_regextest",
-                                      args: [
-                                        { type: "Var", name: "value" },
-                                        {
-                                          type: "Literal",
-                                          litType: "string",
-                                          value: "^[+-]?(?:\\d+\.?\d*|\\.\d+)$",
+                                    type: "If",
+                                    cases: [
+                                      {
+                                        cond: {
+                                          type: "Call",
+                                          name: "sensing_regextest",
+                                          args: [
+                                            { type: "Var", name: "value" },
+                                            {
+                                              type: "Literal",
+                                              litType: "string",
+                                              value: "^[+-]?(?:\\d+\.?\\d*|\\.\\d+)$",
+                                            },
+                                            { type: "Literal", litType: "string", value: "g" },
+                                          ],
                                         },
-                                        { type: "Literal", litType: "string", value: "g" },
-                                      ],
-                                    },
-                                    thenBlock: {
+                                        thenBlock: {
+                                          type: "Block",
+                                          body: [
+                                            {
+                                              type: "Return",
+                                              value: { type: "Literal", litType: "string", value: "number" },
+                                            },
+                                          ],
+                                        },
+                                      },
+                                    ],
+                                    elseBlock: {
                                       type: "Block",
                                       body: [
                                         {
-                                          type: "Return",
-                                          value: { type: "Literal", litType: "string", value: "number" },
-                                        },
-                                      ],
-                                    },
-                                  },
-                                ],
-                                elseBlock: {
-                                  type: "Block",
-                                  body: [
-                                    {
-                                      type: "If",
-                                      cases: [
-                                        {
-                                          cond: {
-                                            type: "Call",
-                                            name: "sensing_regextest",
-                                            args: [
-                                              { type: "Var", name: "value" },
-                                              { type: "Literal", litType: "string", value: "^(?:true|false)$" },
-                                              { type: "Literal", litType: "string", value: "g" },
-                                            ],
-                                          },
-                                          thenBlock: {
+                                          type: "If",
+                                          cases: [
+                                            {
+                                              cond: {
+                                                type: "Call",
+                                                name: "sensing_regextest",
+                                                args: [
+                                                  { type: "Var", name: "value" },
+                                                  { type: "Literal", litType: "string", value: "^(?:true|false)$" },
+                                                  { type: "Literal", litType: "string", value: "g" },
+                                                ],
+                                              },
+                                              thenBlock: {
+                                                type: "Block",
+                                                body: [
+                                                  {
+                                                    type: "Return",
+                                                    value: { type: "Literal", litType: "string", value: "boolean" },
+                                                  },
+                                                ],
+                                              },
+                                            },
+                                          ],
+                                          elseBlock: {
                                             type: "Block",
                                             body: [
                                               {
                                                 type: "Return",
-                                                value: { type: "Literal", litType: "string", value: "boolean" },
+                                                value: { type: "Literal", litType: "string", value: "string" },
                                               },
                                             ],
                                           },
                                         },
                                       ],
-                                      elseBlock: {
-                                        type: "Block",
-                                        body: [
-                                          {
-                                            type: "Return",
-                                            value: { type: "Literal", litType: "string", value: "string" },
-                                          },
-                                        ],
-                                      },
                                     },
-                                  ],
-                                },
+                                  },
+                                ],
                               },
-                            ],
-                          },
+                            },
+                          ],
                         },
-                      ],
-                    },
-                  },
+                      }]
+                    }
+                  }
                 ],
               },
             },
@@ -3441,7 +3618,7 @@ if (!nestedInput) {
         if (chain.length >= 2) {
           let objReceiver =
             chain[0] === "this"
-              ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+              ? selfRef()
               : { type: "Var", name: chain[0] };
           if (chain.length > 2) {
             if (chain[0] === "this" && emittingClass && emittingStaticMethod) {
@@ -3477,7 +3654,9 @@ if (!nestedInput) {
           const setter =
             chain.length === 2 && chain[0] === "this" && emittingClass && emittingStaticMethod
               ? getClassStaticSet(emittingClass, propName, newVal)
-              : makeSet(propName, receiverRef, newVal);
+              : chain[0] === "this"
+                ? emitThisMemberSet(chain, newVal)
+                : emitImmutableMemberSet(chain, newVal, inMethod, paramMap);
           const ret = {
             opcode: "procedures_return",
             inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", oldTmp] }],
@@ -3630,7 +3809,7 @@ if (!nestedInput) {
         if (chain.length >= 2) {
           let objReceiver =
             chain[0] === "this"
-              ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+              ? selfRef()
               : { type: "Var", name: chain[0] };
           if (chain.length > 2) {
             if (chain[0] === "this" && emittingClass && emittingStaticMethod) {
@@ -3681,7 +3860,14 @@ if (!nestedInput) {
                 opcode: "SPtempVars_getVar",
                 inputs: ["thread", newTmp],
               })
-              : makeSet(propName, receiverRef, { opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] });
+              : chain[0] === "this"
+                ? emitThisMemberSet(chain, { opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] })
+                : emitImmutableMemberSet(
+                  chain,
+                  { opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] },
+                  inMethod,
+                  paramMap,
+                );
           const ret = {
             opcode: "procedures_return",
             inputs: [{ opcode: "SPtempVars_getVar", inputs: ["thread", newTmp] }],
@@ -3783,7 +3969,7 @@ if (!nestedInput) {
       const scope = varScopeForName(expr.name, inMethod, paramMap, undefined);
       return { type: "Var", name: expr.name, scope };
     }
-    if (expr.type === "This") return { opcode: "jwClass_self", inputs: [] };
+    if (expr.type === "This") return selfRef();
     if (expr.type === "Index") {
       // Square-bracket array access: map to `jwArray_get` (1-based index).
       const arrNested = exprToNested(expr.receiver, inMethod, paramMap);
@@ -3833,7 +4019,7 @@ if (!nestedInput) {
                 const tmpName = Array.isArray(retVal.inputs) ? retVal.inputs[1] : null;
                 const cls = tmpName && tempToClass[tmpName] ? tempToClass[tmpName] : null;
                 // Debug: log temp -> class resolution
-                if (tmpName) console.error("[emit] inline tempToClass", tmpName, "=>", cls);
+                //if (tmpName) console.error("[emit] inline tempToClass", tmpName, "=>", cls);
                 // compose accessor/call if first prop is a getter on the class
                 const firstProp = props && props.length > 0 ? props[0] : null;
                 if (cls && firstProp && hasMethodFlag(cls, firstProp, "getter")) {
@@ -3932,7 +4118,7 @@ if (!nestedInput) {
       // Build nested receiver (object) stopping before the final property
       let objReceiver =
         typeof chain[0] === "string" && chain[0] === "this"
-          ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+          ? selfRef()
           : mapReceiverName(chain[0], paramMap);
       if (chain.length > 2) {
         // If the base is a static `this` inside a static class method, treat it
@@ -4034,7 +4220,7 @@ if (!nestedInput) {
       if (typeof first === "string") {
         objReceiver =
           first === "this"
-            ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+            ? selfRef()
             : mapReceiverName(first, paramMap);
       } else {
         // do not call exprToNested(first) when `first` is an object;
@@ -4383,7 +4569,7 @@ if (!nestedInput) {
                 r = getClassStaticGet(emittingClass, recvChain[1]);
                 for (let k = 2; k < recvChain.length; k++) r = makeGet(recvChain[k], r);
               } else {
-                r = { opcode: "jwClass_self", inputs: [], noPlaceholder: true };
+                r = selfRef();
                 for (let k = 1; k < recvChain.length; k++) r = makeGet(recvChain[k], r);
               }
             } else {
@@ -4851,7 +5037,7 @@ if (!nestedInput) {
       // Record mapping temp -> class so later property accessors on this temp
       // can resolve whether a getter/setter exists for that class.
       tempToClass[tempName] = className;
-      if (tempName) console.error("[emit] set tempToClass", tempName, "=>", className);
+      //if (tempName) console.error("[emit] set tempToClass", tempName, "=>", className);
       // attempt to map constructor param names if we have class signature info
       const ctorParamSetters = [];
       //let className = null;
@@ -5288,7 +5474,7 @@ if (!nestedInput) {
       if (typeof first === "string") {
         objReceiver =
           first === "this"
-            ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+            ? selfRef()
             : mapReceiverName(first, paramMap);
       } else if (typeof first === "object") {
         objReceiver = exprToNested(first, inMethod, paramMap);
@@ -5391,7 +5577,7 @@ if (!nestedInput) {
             else {
               let r =
                 recvChain[0] === "this"
-                  ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+                  ? selfRef()
                   : { type: "Var", name: recvChain[0] };
               for (let k = 1; k < recvChain.length; k++) r = makeGet(recvChain[k], r);
               receiverRef = r;
@@ -5705,7 +5891,7 @@ if (!nestedInput) {
         const chain = stmt.memberChain;
         let objReceiver =
           chain[0] === "this"
-            ? { opcode: "jwClass_self", inputs: [], noPlaceholder: true }
+            ? selfRef()
             : { type: "Var", name: chain[0] };
         if (chain.length > 2) {
           for (let i = 1; i < chain.length - 1; i++) {
@@ -5726,7 +5912,7 @@ if (!nestedInput) {
         ) {
           let leftNested = null;
           if (chain[0] === "this") {
-            leftNested = makeGet(propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true });
+            leftNested = makeGet(propName, selfRef());
           } else {
             leftNested = exprToNested({ type: "Member", chain: chain.slice() }, inMethod, paramMap);
           }
@@ -5773,7 +5959,7 @@ if (!nestedInput) {
           for (let i = 2; i < chain.length - 1; i++) {
             receiverRef = makeGet(chain[i], receiverRef);
           }
-          return makeSet(propName, receiverRef, val);
+          return makeObjectSetStatement(receiverRef, propName, val, inMethod, paramMap);
         }
         if (typeof chain[0] === "string" && classRegistry[chain[0]]) {
           if (chain.length === 2) {
@@ -5783,7 +5969,7 @@ if (!nestedInput) {
           for (let i = 2; i < chain.length - 1; i++) {
             receiverRef = makeGet(chain[i], receiverRef);
           }
-          return makeSet(propName, receiverRef, val);
+          return makeObjectSetStatement(receiverRef, propName, val, inMethod, paramMap);
         }
         if (chain.length === 2 && typeof chain[0] === "string" && chain[0] !== "this") {
           const destType = varScopeForName(chain[0], inMethod, paramMap, undefined);
@@ -5792,7 +5978,8 @@ if (!nestedInput) {
             inputs: [destType, chain[0], makeSet(propName, objReceiver, val)],
           };
         }
-        return makeSet(propName, objReceiver, val);
+        if (chain[0] === "this") return emitThisMemberSet(chain, val);
+        return emitImmutableMemberSet(chain, val, inMethod, paramMap);
       }
       const destType = varScopeForName(stmt.name, inMethod, paramMap, stmt.kind);
       return {
@@ -6005,7 +6192,7 @@ if (!nestedInput) {
           if (m.static) emittingClassStaticInit = true;
           const setProp = m.static
             ? getClassStaticSet(className, methodKey, lambdaBlock)
-            : makeSet(methodKey, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }, lambdaBlock);
+            : { opcode: "jwClass_setProp", inputs: [methodKey, selfRef(), lambdaBlock] };
           emittingClassStaticInit = _prevEmittingClassStaticInit;
           if (m.static) staticSubstackBlocks.push(setProp);
           else substackBlocks.push(setProp);
@@ -6055,7 +6242,7 @@ if (!nestedInput) {
               for (let i = 2; i < chain.length - 1; i++) {
                 receiverRef = makeGet(chain[i], receiverRef);
               }
-              setProp = makeSet(propName, receiverRef, val);
+              setProp = makeObjectSetStatement(receiverRef, propName, val, inMethod, paramMap);
             }
             emittingClassStaticInit = _prevEmittingClassStaticInit;
             staticSubstackBlocks.push(setProp);
@@ -6069,12 +6256,15 @@ if (!nestedInput) {
               for (let i = 2; i < chain.length - 1; i++) {
                 receiverRef = makeGet(chain[i], receiverRef);
               }
-              setProp = makeSet(propName, receiverRef, val);
+              setProp = makeObjectSetStatement(receiverRef, propName, val, inMethod, paramMap);
             }
             emittingClassStaticInit = _prevEmittingClassStaticInit;
             staticSubstackBlocks.push(setProp);
           } else {
-            setProp = makeSet(propName, { opcode: "jwClass_self", inputs: [], noPlaceholder: true }, val);
+            setProp =
+              chain[0] === "this"
+                ? emitThisMemberSet(chain, val)
+                : emitImmutableMemberSet(chain, val, inMethod, paramMap);
             substackBlocks.push(setProp);
           }
           continue;
@@ -6303,7 +6493,7 @@ if (usedClasses) {
     out.extensionURLs = out.extensionURLs || {};
     out.extensionURLs.jwClass =
       out.extensionURLs.jwClass || // jwClass backported from port to old compiler non core extension(unsandboxed), with some added features
-      "data:text/javascript;base64,KGZ1bmN0aW9uIChTY3JhdGNoKSB7CiAgICAndXNlIHN0cmljdCc7CiAKICAgIGlmICghU2NyYXRjaC5leHRlbnNpb25zLnVuc2FuZGJveGVkKSB7CiAgICAgICAgdGhyb3cgbmV3IEVycm9yKCdqd0NsYXNzIG11c3QgYmUgbG9hZGVkIGFzIGFuIHVuc2FuZGJveGVkIFR1cmJvV2FycCBleHRlbnNpb24uJyk7CiAgICB9CiAKICAgIGNvbnN0IHZtID0gU2NyYXRjaC52bTsKICAgIGNvbnN0IHJ1bnRpbWUgPSB2bS5ydW50aW1lOwogCiAgICBjb25zdCBCbG9ja1R5cGUgPSBTY3JhdGNoLkJsb2NrVHlwZTsKICAgIGNvbnN0IEFyZ3VtZW50VHlwZSA9IFNjcmF0Y2guQXJndW1lbnRUeXBlOwogICAgY29uc3QgQmxvY2tTaGFwZSA9IFNjcmF0Y2guQmxvY2tTaGFwZSB8fCB7CiAgICAgICAgU1FVQVJFOiAnc3F1YXJlJywKICAgICAgICBUSUNLRVQ6ICd0aWNrZXQnCiAgICB9OwogCiAgICBjb25zdCBwbVN5bWJvbCA9IFNjcmF0Y2gucG1TeW1ib2wgfHwgewogICAgICAgIGVxdWFsczogU3ltYm9sLmZvcigncG0uZXF1YWxzJykKICAgIH07CiAKICAgIGNvbnN0IGVzY2FwZUhUTUwgPSB1bnNhZmUgPT4gewogICAgICAgIHJldHVybiBTdHJpbmcodW5zYWZlKQogICAgICAgICAgICAucmVwbGFjZUFsbCgnJicsICcmYW1wOycpCiAgICAgICAgICAgIC5yZXBsYWNlQWxsKCc8JywgJyZsdDsnKQogICAgICAgICAgICAucmVwbGFjZUFsbCgnPicsICcmZ3Q7JykKICAgICAgICAgICAgLnJlcGxhY2VBbGwoJyInLCAnJnF1b3Q7JykKICAgICAgICAgICAgLnJlcGxhY2VBbGwoIiciLCAnJiMwMzk7Jyk7CiAgICB9OwogCiAgICBjb25zdCBjbGFzc1N5bWJvbCA9IFN5bWJvbCgnY2xhc3MnKTsKIAogICAgbGV0IGRvZ2Vpc2N1dE9iamVjdCA9IHsKICAgICAgICBUeXBlOiBjbGFzcyB7fSwKICAgICAgICBCbG9jazoge30sCiAgICAgICAgQXJndW1lbnQ6IHt9CiAgICB9OwogCiAgICBsZXQgandQb2ludGVyID0gewogICAgICAgIFR5cGU6IGNsYXNzIHt9LAogICAgICAgIEJsb2NrOiB7fSwKICAgICAgICBBcmd1bWVudDoge30KICAgIH07CiAKICAgIGNvbnN0IHJlZnJlc2hEZXBzID0gKCkgPT4gewogICAgICAgIGlmICh2bS5kb2dlaXNjdXRPYmplY3QpIGRvZ2Vpc2N1dE9iamVjdCA9IHZtLmRvZ2Vpc2N1dE9iamVjdDsKICAgICAgICBpZiAodm0uandQb2ludGVyKSBqd1BvaW50ZXIgPSB2bS5qd1BvaW50ZXI7CiAgICB9OwogCiAgICBjbGFzcyBDbGFzc1R5cGUgewogICAgICAgIGNvbnN0cnVjdG9yKGNvbnN0cnVjdCA9IGZ1bmN0aW9uKiAoKSB7fSwgbmFtZSA9ICcnLCBleHRlbnNpb24gPSBudWxsLCBwcm9jID0gbnVsbCwgc3RhdGljQ29uc3RydWN0ID0gZnVuY3Rpb24qICgpIHt9KSB7CiAgICAgICAgICAgIHRoaXMuY29uc3RydWN0ID0gY29uc3RydWN0OwogICAgICAgICAgICB0aGlzLm5hbWUgPSBuYW1lOwogICAgICAgICAgICB0aGlzLmV4dGVuc2lvbiA9IGV4dGVuc2lvbjsKICAgICAgICAgICAgdGhpcy5wcm9jID0gcHJvYyA/PyB7fTsKICAgICAgICAgICAgdGhpcy5zdGF0aWMgPSB7fTsKICAgICAgICAgICAgdGhpcy5zdGF0aWNDb25zdHJ1Y3QgPSBzdGF0aWNDb25zdHJ1Y3Q7CiAgICAgICAgfQogCiAgICAgICAgdG9TdHJpbmcoKSB7CiAgICAgICAgICAgIHJldHVybiB0aGlzLm5hbWUubGVuZ3RoID4gMCA/IGBDbGFzczwke3RoaXMubmFtZX0+YCA6ICdDbGFzcyc7CiAgICAgICAgfQogCiAgICAgICAgandBcnJheUhhbmRsZXIoKSB7CiAgICAgICAgICAgIHJldHVybiBlc2NhcGVIVE1MKHRoaXMudG9TdHJpbmcoKSk7CiAgICAgICAgfQogCiAgICAgICAgc3RhdGljIHRvQ2xhc3ModikgewogICAgICAgICAgICBpZiAodiBpbnN0YW5jZW9mIENsYXNzVHlwZSkgcmV0dXJuIHY7CiAgICAgICAgICAgIHJldHVybiBuZXcgQ2xhc3NUeXBlKCk7CiAgICAgICAgfQogCiAgICAgICAgY3JlYXRlSW5zdGFuY2UgPSBmdW5jdGlvbiogKHRocmVhZCwgdGFyZ2V0KSB7CiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAKICAgICAgICAgICAgaWYgKHRoaXMucHJvYykgdGhyZWFkLnByb2NlZHVyZXMgPSB7IC4uLnRoaXMucHJvYywgLi4udGhyZWFkLnByb2NlZHVyZXMgfTsKCiAgICAgICAgICAgIGlmICghdGhpcy5leHRlbnNpb24pIHsKICAgICAgICAgICAgICAgIGxldCBvYmplY3QgPSBuZXcgZG9nZWlzY3V0T2JqZWN0LlR5cGUoKTsKICAgICAgICAgICAgICAgIG9iamVjdC5tYXAuc2V0KGNsYXNzU3ltYm9sLCB0aGlzKTsKICAgICAgICAgICAgICAgIGxldCBwb2ludGVyID0gandQb2ludGVyLlR5cGUuY3JlYXRlKCk7CiAgICAgICAgICAgICAgICBwb2ludGVyLnZhbHVlID0gb2JqZWN0OwogICAgICAgICAgICAgICAgeWllbGQqIHRoaXMuY29uc3RydWN0KHBvaW50ZXIsIHRocmVhZCwgdGFyZ2V0KTsKICAgICAgICAgICAgICAgIHJldHVybiBwb2ludGVyOwogICAgICAgICAgICB9IGVsc2UgewogICAgICAgICAgICAgICAgbGV0IHBvaW50ZXIgPSB5aWVsZCogdGhpcy5leHRlbnNpb24uY3JlYXRlSW5zdGFuY2UodGhyZWFkLCB0YXJnZXQpOwogICAgICAgICAgICAgICAgbGV0IG9iamVjdCA9IHBvaW50ZXIudmFsdWU7CiAgICAgICAgICAgICAgICBpZiAob2JqZWN0IGluc3RhbmNlb2YgZG9nZWlzY3V0T2JqZWN0LlR5cGUpIG9iamVjdC5tYXAuc2V0KGNsYXNzU3ltYm9sLCB0aGlzKTsKICAgICAgICAgICAgICAgIHlpZWxkKiB0aGlzLmNvbnN0cnVjdChwb2ludGVyLCB0aHJlYWQsIHRhcmdldCk7CiAgICAgICAgICAgICAgICByZXR1cm4gcG9pbnRlcjsKICAgICAgICAgICAgfQogICAgICAgIH07CiAKICAgICAgICBleHRlbmQoZXh0ZW5zaW9uKSB7CiAgICAgICAgICAgIHJldHVybiBuZXcgQ2xhc3NUeXBlKHRoaXMuY29uc3RydWN0LCB0aGlzLm5hbWUsIGV4dGVuc2lvbiwgdGhpcy5wcm9jLCB0aGlzLnN0YXRpY0NvbnN0cnVjdCk7CiAgICAgICAgfQogCiAgICAgICAgW3BtU3ltYm9sLmVxdWFsc10ob3RoZXIpIHsKICAgICAgICAgICAgcmV0dXJuIHRoaXMgPT09IG90aGVyOwogICAgICAgIH0KICAgIH0KIAogICAgY29uc3QgandDbGFzcyA9IHsKICAgICAgICBUeXBlOiBDbGFzc1R5cGUsCiAgICAgICAgQmxvY2s6IHsKICAgICAgICAgICAgYmxvY2tUeXBlOiBCbG9ja1R5cGUuUkVQT1JURVIsCiAgICAgICAgICAgIGJsb2NrU2hhcGU6IEJsb2NrU2hhcGUuVElDS0VULAogICAgICAgICAgICBmb3JjZU91dHB1dFR5cGU6ICdqd0NsYXNzJywKICAgICAgICAgICAgZGlzYWJsZU1vbml0b3I6IHRydWUKICAgICAgICB9LAogICAgICAgIEFyZ3VtZW50OiB7CiAgICAgICAgICAgIHNoYXBlOiBCbG9ja1NoYXBlLlRJQ0tFVCwKICAgICAgICAgICAgY2hlY2s6IFsnandDbGFzcycsICdQb2ludGVyJ10KICAgICAgICB9LAogCiAgICAgICAgY2xhc3NTeW1ib2wsCiAKICAgICAgICBzZXRQcm9wKG5hbWUsIHBvaW50ZXIsIHZhbHVlKSB7CiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAgICAgICAgICAgIGlmICghKHBvaW50ZXIgaW5zdGFuY2VvZiBqd1BvaW50ZXIuVHlwZSkpIHJldHVybjsKICAgICAgICAgICAgaWYgKCEocG9pbnRlci52YWx1ZSBpbnN0YW5jZW9mIGRvZ2Vpc2N1dE9iamVjdC5UeXBlKSkgcmV0dXJuOwogICAgICAgICAgICBwb2ludGVyLnZhbHVlID0gZG9nZWlzY3V0T2JqZWN0LlR5cGUudG9PYmplY3QocG9pbnRlci52YWx1ZSk7IC8vIGNsb25lCiAgICAgICAgICAgIHBvaW50ZXIudmFsdWUubWFwLnNldChuYW1lLCB2YWx1ZSk7CiAgICAgICAgfSwKIAogICAgICAgIGdldFByb3AobmFtZSwgcG9pbnRlcikgewogICAgICAgICAgICByZWZyZXNoRGVwcygpOwogICAgICAgICAgICBpZiAoIShwb2ludGVyIGluc3RhbmNlb2YgandQb2ludGVyLlR5cGUpKSByZXR1cm4gbnVsbDsKICAgICAgICAgICAgaWYgKCEocG9pbnRlci52YWx1ZSBpbnN0YW5jZW9mIGRvZ2Vpc2N1dE9iamVjdC5UeXBlKSkgcmV0dXJuIG51bGw7CiAgICAgICAgICAgIHJldHVybiBwb2ludGVyLnZhbHVlLm1hcC5nZXQobmFtZSk7CiAgICAgICAgfSwKCiAgICAgICAgc2V0U3RhdGljKG5hbWUsIGNsYXNzVHlwZSwgdmFsdWUpIHsKICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsKICAgICAgICAgICAgY2xhc3NUeXBlID0gQ2xhc3NUeXBlLnRvQ2xhc3MoY2xhc3NUeXBlKTsKICAgICAgICAgICAgaWYgKCEoY2xhc3NUeXBlIGluc3RhbmNlb2YgQ2xhc3NUeXBlKSkgcmV0dXJuOwogICAgICAgICAgICBjbGFzc1R5cGUuc3RhdGljW25hbWVdID0gdmFsdWU7CiAgICAgICAgfSwKCiAgICAgICAgZ2V0U3RhdGljKG5hbWUsIGNsYXNzVHlwZSkgewogICAgICAgICAgICByZWZyZXNoRGVwcygpOwogICAgICAgICAgICBjbGFzc1R5cGUgPSBDbGFzc1R5cGUudG9DbGFzcyhjbGFzc1R5cGUpOwogICAgICAgICAgICBpZiAoIShjbGFzc1R5cGUgaW5zdGFuY2VvZiBDbGFzc1R5cGUpKSByZXR1cm4gbnVsbDsKICAgICAgICAgICAgcmV0dXJuIGNsYXNzVHlwZS5zdGF0aWNbbmFtZV07CiAgICAgICAgfSwKIAogICAgICAgIGluc3RhbmNlT2YocG9pbnRlciwgb3RoZXJDbGFzcykgewogICAgICAgICAgICByZWZyZXNoRGVwcygpOwogICAgICAgICAgICBsZXQgX19jbGFzc19fID0gandDbGFzcy5nZXRQcm9wKGNsYXNzU3ltYm9sLCBwb2ludGVyKTsKICAgICAgICAgICAgd2hpbGUgKF9fY2xhc3NfXykgewogICAgICAgICAgICAgICAgaWYgKF9fY2xhc3NfXyA9PT0gb3RoZXJDbGFzcykgcmV0dXJuIHRydWU7CiAgICAgICAgICAgICAgICBfX2NsYXNzX18gPSBfX2NsYXNzX18uZXh0ZW5zaW9uOwogICAgICAgICAgICB9CiAgICAgICAgICAgIHJldHVybiBmYWxzZTsKICAgICAgICB9CiAgICB9OwogCiAgICBjbGFzcyBFeHRlbnNpb24gewogICAgICAgIGNvbnN0cnVjdG9yKCkgewogICAgICAgICAgICByZWZyZXNoRGVwcygpOwogCiAgICAgICAgICAgIHRyeSB7CiAgICAgICAgICAgICAgICBpZiAocnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25VUkwpIHsKICAgICAgICAgICAgICAgICAgICBjb25zdCBsb2FkZWQgPSBydW50aW1lLmV4dGVuc2lvbk1hbmFnZXIubG9hZEV4dGVuc2lvblVSTCgKICAgICAgICAgICAgICAgICAgICAgICAgJ2h0dHBzOi8vZXh0ZW5zaW9ucy5wZW5ndWlubW9kLmNvbS9leHRlbnNpb25zL0RvZ2Vpc0N1dC9kb2dlaXNjdXRPYmplY3QuanMnCiAgICAgICAgICAgICAgICAgICAgKTsKICAgICAgICAgICAgICAgICAgICBpZiAobG9hZGVkICYmIHR5cGVvZiBsb2FkZWQudGhlbiA9PT0gJ2Z1bmN0aW9uJykgewogICAgICAgICAgICAgICAgICAgICAgICBsb2FkZWQudGhlbihyZWZyZXNoRGVwcykuY2F0Y2goKCkgPT4ge30pOwogICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfSBjYXRjaCAoZSkge30KIAogICAgICAgICAgICB0cnkgewogICAgICAgICAgICAgICAgaWYgKHJ1bnRpbWUuZXh0ZW5zaW9uTWFuYWdlci5sb2FkRXh0ZW5zaW9uSWRTeW5jKSB7CiAgICAgICAgICAgICAgICAgICAgcnVudGltZS5leHRlbnNpb25NYW5hZ2VyLmxvYWRFeHRlbnNpb25JZFN5bmMoJ2p3UG9pbnRlcicpO3J1bnRpbWUuZXh0ZW5zaW9uTWFuYWdlci5sb2FkRXh0ZW5zaW9uSWRTeW5jKCdqd0xhbWJkYScpOwogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9IGNhdGNoIChlKSB7fQogCiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAKICAgICAgICAgICAgdm0uandDbGFzcyA9IGp3Q2xhc3M7CiAKICAgICAgICAgICAgcnVudGltZS5yZWdpc3RlclNlcmlhbGl6ZXIoCiAgICAgICAgICAgICAgICAnandDbGFzcycsCiAgICAgICAgICAgICAgICB2ID0+IHYubmFtZSwKICAgICAgICAgICAgICAgIHYgPT4gbmV3IGp3Q2xhc3MuVHlwZShmdW5jdGlvbiogKCkge30sIHYubmFtZSkKICAgICAgICAgICAgKTsKIAogICAgICAgICAgICBpZiAocnVudGltZS5yZWdpc3RlckNvbXBpbGVkRXh0ZW5zaW9uQmxvY2tzKSB7CiAgICAgICAgICAgICAgICBydW50aW1lLnJlZ2lzdGVyQ29tcGlsZWRFeHRlbnNpb25CbG9ja3MoJ2p3Q2xhc3MnLCB0aGlzLmdldENvbXBpbGVJbmZvKCkpOwogICAgICAgICAgICB9CiAgICAgICAgfQogCiAgICAgICAgZ2V0SW5mbygpIHsKICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsKIAogICAgICAgICAgICByZXR1cm4gewogICAgICAgICAgICAgICAgaWQ6ICdqd0NsYXNzJywKICAgICAgICAgICAgICAgIG5hbWU6ICdDbGFzc2VzJywKICAgICAgICAgICAgICAgIGNvbG9yMTogJyM0YmJmNTYnLAogICAgICAgICAgICAgICAgbWVudUljb25VUkk6ICdkYXRhOmltYWdlL3N2Zyt4bWw7YmFzZTY0LFBITjJaeUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSFpwWlhkQ2IzZzlJakFnTUNBeU1DQXlNQ0krQ2lBZ1BHVnNiR2x3YzJVZ2MzUjViR1U5SW5OMGNtOXJaVG9nY21kaUtEWXdMQ0F4TlRNc0lEWTVLVHNnWm1sc2JEb2djbWRpS0RjMUxDQXhPVEVzSURnMktUc2lJR040UFNJeE1DSWdZM2s5SWpFd0lpQnllRDBpT1M0MUlpQnllVDBpT1M0MUlqNDhMMlZzYkdsd2MyVStDaUFnUEdjK0NpQWdJQ0E4Y0dGMGFDQmtQU0pOSURZdU9UYzRJRFV1TlRFMklFTWdOQzQzTXpZZ09DNDFNRFVnTkM0M016WWdNVEV1TkRrMElEWXVPVGM0SURFMExqUTROQ0lnYzNSeWIydGxQU0lqWm1abUlpQm1hV3hzUFNKdWIyNWxJaUJ6ZEhsc1pUMGljM1J5YjJ0bExXeHBibVZxYjJsdU9pQnliM1Z1WkRzZ2MzUnliMnRsTFd4cGJtVmpZWEE2SUhKdmRXNWtPeUJ6ZEhKdmEyVXRkMmxrZEdnNklESTdJajQ4TDNCaGRHZytDaUFnSUNBOGNHRjBhQ0JrUFNKTklERTBMamN3TXlBeE5DNDBPRFFnUXlBeE1pNDBOakVnTVRFdU5EazFJREV5TGpRMk1TQTRMalV3TmlBeE5DNDNNRE1nTlM0MU1UWWlJSE4wY205clpUMGlJMlptWmlJZ1ptbHNiRDBpYm05dVpTSWdjM1I1YkdVOUluTjBjbTlyWlMxc2FXNWxhbTlwYmpvZ2NtOTFibVE3SUhOMGNtOXJaUzFzYVc1bFkyRndPaUJ5YjNWdVpEc2djM1J5YjJ0bExYZHBaSFJvT2lBeU95QjBjbUZ1YzJadmNtMHRZbTk0T2lCbWFXeHNMV0p2ZURzZ2RISmhibk5tYjNKdExXOXlhV2RwYmpvZ05UQWxJRFV3SlRzaUlIUnlZVzV6Wm05eWJUMGliV0YwY21sNEtDMHhMQ0F3TENBd0xDQXRNU3dnTFRBdU1EQXdNREF5TENBd0tTSStQQzl3WVhSb1Bnb2dJRHd2Wno0S1BDOXpkbWMrJywKICAgICAgICAgICAgICAgIGJsb2NrczogWwogICAgICAgICAgICAgICAgICAgIHsKICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnY2xhc3MnLAogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiBbJ2NsYXNzIFtOQU1FXSBbU0VMRl0nLCAnc3RhdGljIGluaXQgW1NFTEYyXSddLAogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIE5BTUU6IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0eXBlOiBBcmd1bWVudFR5cGUuU1RSSU5HLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRlZmF1bHRWYWx1ZTogJycKICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBTRUxGOiB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZmlsbEluOiAnc2VsZicKICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBTRUxGMjogewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGZpbGxJbjogJ3NlbGYnCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgICAgIGJyYW5jaGVzOiBbe30sIHt9XSwKICAgICAgICAgICAgICAgICAgICAgICAgYWxpZ25tZW50czogWwogICAgICAgICAgICAgICAgICAgICAgICAgICAgbnVsbCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIG51bGwsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBTY3JhdGNoLkFyZ3VtZW50QWxpZ25tZW50LkxlZnQKICAgICAgICAgICAgICAgICAgICAgICAgXSwKICAgICAgICAgICAgICAgICAgICAgICAgLi4uandDbGFzcy5CbG9jawogICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgewogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdzZWxmJywKICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ3NlbGYnLAogICAgICAgICAgICAgICAgICAgICAgICBoaWRlRnJvbVBhbGV0dGU6IHRydWUsCiAgICAgICAgICAgICAgICAgICAgICAgIGNhbkRyYWdEdXBsaWNhdGU6IHRydWUsCiAgICAgICAgICAgICAgICAgICAgICAgIC4uLmp3UG9pbnRlci5CbG9jawogICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgewogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdleHRlbmQnLAogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiAnW0NMQVNTXSBleHRlbmRzIFtFWFRFTlNJT05dJywKICAgICAgICAgICAgICAgICAgICAgICAgYXJndW1lbnRzOiB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIEVYVEVOU0lPTjogandDbGFzcy5Bcmd1bWVudAogICAgICAgICAgICAgICAgICAgICAgICB9LAogICAgICAgICAgICAgICAgICAgICAgICAuLi5qd0NsYXNzLkJsb2NrCiAgICAgICAgICAgICAgICAgICAgfSwKICAgICAgICAgICAgICAgICAgICAnLS0tJywKICAgICAgICAgICAgICAgICAgICB7CiAgICAgICAgICAgICAgICAgICAgICAgIG9wY29kZTogJ3NldFByb3AnLAogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiAnc2V0IFtOQU1FXSBvbiBbUE9JTlRFUl0gdG8gW1ZBTFVFXScsCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLkNPTU1BTkQsCiAgICAgICAgICAgICAgICAgICAgICAgIGFyZ3VtZW50czogewogICAgICAgICAgICAgICAgICAgICAgICAgICAgTkFNRTogewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHR5cGU6IEFyZ3VtZW50VHlwZS5TVFJJTkcsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZGVmYXVsdFZhbHVlOiAnZm9vJwogICAgICAgICAgICAgICAgICAgICAgICAgICAgfSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIFBPSU5URVI6IGp3UG9pbnRlci5Bcmd1bWVudCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIFZBTFVFOiB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHlwZTogQXJndW1lbnRUeXBlLlNUUklORywKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBkZWZhdWx0VmFsdWU6ICdiYXInCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICB9LAogICAgICAgICAgICAgICAgICAgIHsKICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnZ2V0UHJvcCcsCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdnZXQgW05BTUVdIG9uIFtQT0lOVEVSXScsCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLlJFUE9SVEVSLAogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIE5BTUU6IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0eXBlOiBBcmd1bWVudFR5cGUuU1RSSU5HLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRlZmF1bHRWYWx1ZTogJ2ZvbycKICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBQT0lOVEVSOiBqd1BvaW50ZXIuQXJndW1lbnQKICAgICAgICAgICAgICAgICAgICAgICAgfSwKICAgICAgICAgICAgICAgICAgICAgICAgYWxsb3dEcm9wQW55d2hlcmU6IHRydWUKICAgICAgICAgICAgICAgICAgICB9LAogICAgICAgICAgICAgICAgICAgIHsKICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnc2V0U3RhdGljJywKICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ3NldCBzdGF0aWMgW05BTUVdIG9uIFtDTEFTU10gdG8gW1ZBTFVFXScsCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLkNPTU1BTkQsCiAgICAgICAgICAgICAgICAgICAgICAgIGFyZ3VtZW50czogewogICAgICAgICAgICAgICAgICAgICAgICAgICAgTkFNRTogeyB0eXBlOiBBcmd1bWVudFR5cGUuU1RSSU5HLCBkZWZhdWx0VmFsdWU6ICdmb28nIH0sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIFZBTFVFOiB7IHR5cGU6IEFyZ3VtZW50VHlwZS5TVFJJTkcsIGRlZmF1bHRWYWx1ZTogJ2JhcicgfQogICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgfSwKICAgICAgICAgICAgICAgICAgICB7CiAgICAgICAgICAgICAgICAgICAgICAgIG9wY29kZTogJ2dldFN0YXRpYycsCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdnZXQgc3RhdGljIFtOQU1FXSBvbiBbQ0xBU1NdJywKICAgICAgICAgICAgICAgICAgICAgICAgYmxvY2tUeXBlOiBCbG9ja1R5cGUuUkVQT1JURVIsCiAgICAgICAgICAgICAgICAgICAgICAgIGFyZ3VtZW50czogewogICAgICAgICAgICAgICAgICAgICAgICAgICAgTkFNRTogeyB0eXBlOiBBcmd1bWVudFR5cGUuU1RSSU5HLCBkZWZhdWx0VmFsdWU6ICdmb28nIH0sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBDTEFTUzogandDbGFzcy5Bcmd1bWVudAogICAgICAgICAgICAgICAgICAgICAgICB9LAogICAgICAgICAgICAgICAgICAgICAgICBhbGxvd0Ryb3BBbnl3aGVyZTogdHJ1ZQogICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgewogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdnZXRDbGFzcycsCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdnZXQgY2xhc3Mgb2YgW1BPSU5URVJdJywKICAgICAgICAgICAgICAgICAgICAgICAgYXJndW1lbnRzOiB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBQT0lOVEVSOiBqd1BvaW50ZXIuQXJndW1lbnQKICAgICAgICAgICAgICAgICAgICAgICAgfSwKICAgICAgICAgICAgICAgICAgICAgICAgLi4uandDbGFzcy5CbG9jawogICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgJy0tLScsCiAgICAgICAgICAgICAgICAgICAgewogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICduZXcnLAogICAgICAgICAgICAgICAgICAgICAgICB0ZXh0OiAnbmV3IFtDTEFTU10nLAogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIENMQVNTOiBqd0NsYXNzLkFyZ3VtZW50CiAgICAgICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgICAgIC4uLmp3UG9pbnRlci5CbG9jawogICAgICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAgICAgewogICAgICAgICAgICAgICAgICAgICAgICBvcGNvZGU6ICdnZXROYW1lJywKICAgICAgICAgICAgICAgICAgICAgICAgdGV4dDogJ25hbWUgb2YgW0NMQVNTXScsCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2NrVHlwZTogQmxvY2tUeXBlLlJFUE9SVEVSLAogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIENMQVNTOiBqd0NsYXNzLkFyZ3VtZW50CiAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICB9LAogICAgICAgICAgICAgICAgICAgICctLS0nLAogICAgICAgICAgICAgICAgICAgIHsKICAgICAgICAgICAgICAgICAgICAgICAgb3Bjb2RlOiAnaW5zdGFuY2VvZicsCiAgICAgICAgICAgICAgICAgICAgICAgIHRleHQ6ICdpcyBbUE9JTlRFUl0gaW5zdGFuY2Ugb2YgW0NMQVNTXT8nLAogICAgICAgICAgICAgICAgICAgICAgICBibG9ja1R5cGU6IEJsb2NrVHlwZS5CT09MRUFOLAogICAgICAgICAgICAgICAgICAgICAgICBhcmd1bWVudHM6IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIFBPSU5URVI6IGp3UG9pbnRlci5Bcmd1bWVudCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIENMQVNTOiBqd0NsYXNzLkFyZ3VtZW50CiAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICBdCiAgICAgICAgICAgIH07CiAgICAgICAgfQogCiAgICAgICAgZ2V0Q29tcGlsZUluZm8oKSB7CiAgICAgICAgICAgIHJldHVybiB7CiAgICAgICAgICAgICAgICBpcjogewogICAgICAgICAgICAgICAgICAgIGNsYXNzOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gewogICAgICAgICAgICAgICAgICAgICAgICBnZW5lcmF0b3Iuc2NyaXB0LnlpZWxkcyA9IHRydWU7CiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgbmFtZTogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdOQU1FJyksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBzdWJzdGFjazogZ2VuZXJhdG9yLmRlc2NlbmRTdWJzdGFjayhibG9jaywgJ1NVQlNUQUNLJyksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBzdWJzdGFjazI6IGdlbmVyYXRvci5kZXNjZW5kU3Vic3RhY2soYmxvY2ssICdTVUJTVEFDSzInKQogICAgICAgICAgICAgICAgICAgICAgICB9OwogICAgICAgICAgICAgICAgICAgIH0sCiAKICAgICAgICAgICAgICAgICAgICBzZWxmOiAoKSA9PiAoewogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnCiAgICAgICAgICAgICAgICAgICAgfSksCiAKICAgICAgICAgICAgICAgICAgICBleHRlbmQ6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoewogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLAogICAgICAgICAgICAgICAgICAgICAgICBjbGFzczogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdDTEFTUycpLAogICAgICAgICAgICAgICAgICAgICAgICBleHRlbnNpb246IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnRVhURU5TSU9OJykKICAgICAgICAgICAgICAgICAgICB9KSwKIAogICAgICAgICAgICAgICAgICAgIHNldFByb3A6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoewogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnc3RhY2snLAogICAgICAgICAgICAgICAgICAgICAgICBuYW1lOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ05BTUUnKSwKICAgICAgICAgICAgICAgICAgICAgICAgcG9pbnRlcjogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdQT0lOVEVSJyksCiAgICAgICAgICAgICAgICAgICAgICAgIHZhbHVlOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1ZBTFVFJykKICAgICAgICAgICAgICAgICAgICB9KSwKCiAgICAgICAgICAgICAgICAgICAgc2V0U3RhdGljOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gKHsKICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ3N0YWNrJywKICAgICAgICAgICAgICAgICAgICAgICAgbmFtZTogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdOQU1FJyksCiAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJyksCiAgICAgICAgICAgICAgICAgICAgICAgIHZhbHVlOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1ZBTFVFJykKICAgICAgICAgICAgICAgICAgICB9KSwKIAogICAgICAgICAgICAgICAgICAgIGdldFByb3A6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoewogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLAogICAgICAgICAgICAgICAgICAgICAgICBuYW1lOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ05BTUUnKSwKICAgICAgICAgICAgICAgICAgICAgICAgcG9pbnRlcjogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdQT0lOVEVSJykKICAgICAgICAgICAgICAgICAgICB9KSwKCiAgICAgICAgICAgICAgICAgICAgZ2V0U3RhdGljOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gKHsKICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywKICAgICAgICAgICAgICAgICAgICAgICAgbmFtZTogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdOQU1FJyksCiAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJykKICAgICAgICAgICAgICAgICAgICB9KSwKIAogICAgICAgICAgICAgICAgICAgIGdldENsYXNzOiAoZ2VuZXJhdG9yLCBibG9jaykgPT4gKHsKICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywKICAgICAgICAgICAgICAgICAgICAgICAgcG9pbnRlcjogZ2VuZXJhdG9yLmRlc2NlbmRJbnB1dE9mQmxvY2soYmxvY2ssICdQT0lOVEVSJykKICAgICAgICAgICAgICAgICAgICB9KSwKIAogICAgICAgICAgICAgICAgICAgIG5ldzogKGdlbmVyYXRvciwgYmxvY2spID0+IHsKICAgICAgICAgICAgICAgICAgICAgICAgZ2VuZXJhdG9yLnNjcmlwdC55aWVsZHMgPSB0cnVlOwogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gewogICAgICAgICAgICAgICAgICAgICAgICAgICAga2luZDogJ2lucHV0JywKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJykKICAgICAgICAgICAgICAgICAgICAgICAgfTsKICAgICAgICAgICAgICAgICAgICB9LAogCiAgICAgICAgICAgICAgICAgICAgZ2V0TmFtZTogKGdlbmVyYXRvciwgYmxvY2spID0+ICh7CiAgICAgICAgICAgICAgICAgICAgICAgIGtpbmQ6ICdpbnB1dCcsCiAgICAgICAgICAgICAgICAgICAgICAgIGNsYXNzOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ0NMQVNTJykKICAgICAgICAgICAgICAgICAgICB9KSwKIAogICAgICAgICAgICAgICAgICAgIGluc3RhbmNlb2Y6IChnZW5lcmF0b3IsIGJsb2NrKSA9PiAoewogICAgICAgICAgICAgICAgICAgICAgICBraW5kOiAnaW5wdXQnLAogICAgICAgICAgICAgICAgICAgICAgICBwb2ludGVyOiBnZW5lcmF0b3IuZGVzY2VuZElucHV0T2ZCbG9jayhibG9jaywgJ1BPSU5URVInKSwKICAgICAgICAgICAgICAgICAgICAgICAgY2xhc3M6IGdlbmVyYXRvci5kZXNjZW5kSW5wdXRPZkJsb2NrKGJsb2NrLCAnQ0xBU1MnKQogICAgICAgICAgICAgICAgICAgIH0pCiAgICAgICAgICAgICAgICB9LAogCiAgICAgICAgICAgICAgICBqczogewogICAgICAgICAgICAgICAgICAgIGNsYXNzOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsKICAgICAgICAgICAgICAgICAgICAgICAgY29uc3QgdGVtcCA9IGNvbXBpbGVyLnNvdXJjZTsKICAgICAgICAgICAgICAgICAgICAgICAgLy8gY3JlYXRlIGNsYXNzLCB0aGVuIHJ1biBzdGF0aWNDb25zdHJ1Y3QgaW1tZWRpYXRlbHkKICAgICAgICAgICAgICAgICAgICAgICAgY29tcGlsZXIuc291cmNlID0gJyhmdW5jdGlvbigpIHtcbic7CiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLnNvdXJjZSArPSAnY29uc3QgX2NscyA9IG5ldyB2bS5qd0NsYXNzLlR5cGUoZnVuY3Rpb24qKF9qd0NsYXNzU2VsZiwgdGhyZWFkLCB0YXJnZXQpIHtcbic7CiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLmRlc2NlbmRTdGFjayhub2RlLnN1YnN0YWNrLCBuZXcgaW1wb3J0cy5GcmFtZShmYWxzZSwgdW5kZWZpbmVkLCB0cnVlKSk7CiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLnNvdXJjZSArPSBgfSwgJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5uYW1lKS5hc1Vua25vd24oKX0sIG51bGwsIHRocmVhZC5wcm9jZWR1cmVzLCBmdW5jdGlvbiooX2p3Q2xhc3NTZWxmLCB0aHJlYWQsIHRhcmdldCkge1xuYDsKICAgICAgICAgICAgICAgICAgICAgICAgY29tcGlsZXIuZGVzY2VuZFN0YWNrKG5vZGUuc3Vic3RhY2syLCBuZXcgaW1wb3J0cy5GcmFtZShmYWxzZSwgdW5kZWZpbmVkLCB0cnVlKSk7CiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLnNvdXJjZSArPSAnfSk7XG4nOwogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgKz0gJ3RyeSB7IGNvbnN0IF9nID0gX2Nscy5zdGF0aWNDb25zdHJ1Y3QgJiYgX2Nscy5zdGF0aWNDb25zdHJ1Y3QoX2NscywgdGhyZWFkLCB0YXJnZXQpOyBpZiAoX2cgJiYgdHlwZW9mIF9nLm5leHQgPT09ICJmdW5jdGlvbiIpIHsgbGV0IF9yID0gX2cubmV4dCgpOyB3aGlsZSAoIV9yLmRvbmUpIF9yID0gX2cubmV4dCgpOyB9IH0gY2F0Y2ggKGUpIHt9XG4nOwogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgKz0gJ3JldHVybiBfY2xzO1xufSkoKTsnOwogICAgICAgICAgICAgICAgICAgICAgICBjb25zdCByZXR1cm5zID0gY29tcGlsZXIuc291cmNlOwogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgPSB0ZW1wOwogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dChyZXR1cm5zLCBpbXBvcnRzLlRZUEVfVU5LTk9XTik7CiAgICAgICAgICAgICAgICAgICAgfSwKIAogICAgICAgICAgICAgICAgICAgIHNlbGY6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gewogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgKICAgICAgICAgICAgICAgICAgICAgICAgICAgICcodHlwZW9mIF9qd0NsYXNzU2VsZiAhPT0gInVuZGVmaW5lZCIgPyBfandDbGFzc1NlbGYgOiBuZXcgdm0uandQb2ludGVyLlR5cGUoMCkpJywKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9VTktOT1dOCiAgICAgICAgICAgICAgICAgICAgICAgICk7CiAgICAgICAgICAgICAgICAgICAgfSwKIAogICAgICAgICAgICAgICAgICAgIGV4dGVuZDogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7CiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KAogICAgICAgICAgICAgICAgICAgICAgICAgICAgYHZtLmp3Q2xhc3MuVHlwZS50b0NsYXNzKCR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUuY2xhc3MpLmFzVW5rbm93bigpfSkuZXh0ZW5kKCR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUuZXh0ZW5zaW9uKS5hc1Vua25vd24oKX0pYCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9VTktOT1dOCiAgICAgICAgICAgICAgICAgICAgICAgICk7CiAgICAgICAgICAgICAgICAgICAgfSwKIAogICAgICAgICAgICAgICAgICAgIHNldFByb3A6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gewogICAgICAgICAgICAgICAgICAgICAgICBjb21waWxlci5zb3VyY2UgKz0gYHZtLmp3Q2xhc3Muc2V0UHJvcCgke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLm5hbWUpLmFzVW5rbm93bigpfSwgJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5wb2ludGVyKS5hc1Vua25vd24oKX0sICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUudmFsdWUpLmFzVW5rbm93bigpfSk7XG5gOwogICAgICAgICAgICAgICAgICAgIH0sCgogICAgICAgICAgICAgICAgICAgIHNldFN0YXRpYzogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7CiAgICAgICAgICAgICAgICAgICAgICAgIGNvbXBpbGVyLnNvdXJjZSArPSBgdm0uandDbGFzcy5zZXRTdGF0aWMoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5uYW1lKS5hc1Vua25vd24oKX0sICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUuY2xhc3MpLmFzVW5rbm93bigpfSwgJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS52YWx1ZSkuYXNVbmtub3duKCl9KTtcbmA7CiAgICAgICAgICAgICAgICAgICAgfSwKIAogICAgICAgICAgICAgICAgICAgIGdldFByb3A6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gewogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGB2bS5qd0NsYXNzLmdldFByb3AoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5uYW1lKS5hc1Vua25vd24oKX0sICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUucG9pbnRlcikuYXNVbmtub3duKCl9KWAsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpbXBvcnRzLlRZUEVfVU5LTk9XTgogICAgICAgICAgICAgICAgICAgICAgICApOwogICAgICAgICAgICAgICAgICAgIH0sCgogICAgICAgICAgICAgICAgICAgIGdldFN0YXRpYzogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7CiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KAogICAgICAgICAgICAgICAgICAgICAgICAgICAgYHZtLmp3Q2xhc3MuZ2V0U3RhdGljKCR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUubmFtZSkuYXNVbmtub3duKCl9LCAke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLmNsYXNzKS5hc1Vua25vd24oKX0pYCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9VTktOT1dOCiAgICAgICAgICAgICAgICAgICAgICAgICk7CiAgICAgICAgICAgICAgICAgICAgfSwKIAogICAgICAgICAgICAgICAgICAgIGdldENsYXNzOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsKICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIG5ldyBpbXBvcnRzLlR5cGVkSW5wdXQoCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgdm0uandDbGFzcy5nZXRQcm9wKHZtLmp3Q2xhc3MuY2xhc3NTeW1ib2wsICR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUucG9pbnRlcikuYXNVbmtub3duKCl9KWAsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpbXBvcnRzLlRZUEVfVU5LTk9XTgogICAgICAgICAgICAgICAgICAgICAgICApOwogICAgICAgICAgICAgICAgICAgIH0sCiAKICAgICAgICAgICAgICAgICAgICBuZXc6IChub2RlLCBjb21waWxlciwgaW1wb3J0cykgPT4gewogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gbmV3IGltcG9ydHMuVHlwZWRJbnB1dCgKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGAoeWllbGQqIHZtLmp3Q2xhc3MuVHlwZS50b0NsYXNzKCR7Y29tcGlsZXIuZGVzY2VuZElucHV0KG5vZGUuY2xhc3MpLmFzVW5rbm93bigpfSkuY3JlYXRlSW5zdGFuY2UodGhyZWFkLCB0YXJnZXQpKWAsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpbXBvcnRzLlRZUEVfVU5LTk9XTgogICAgICAgICAgICAgICAgICAgICAgICApOwogICAgICAgICAgICAgICAgICAgIH0sCiAKICAgICAgICAgICAgICAgICAgICBnZXROYW1lOiAobm9kZSwgY29tcGlsZXIsIGltcG9ydHMpID0+IHsKICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIG5ldyBpbXBvcnRzLlR5cGVkSW5wdXQoCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBgdm0uandDbGFzcy5UeXBlLnRvQ2xhc3MoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5jbGFzcykuYXNVbmtub3duKCl9KS5uYW1lYCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGltcG9ydHMuVFlQRV9TVFJJTkcKICAgICAgICAgICAgICAgICAgICAgICAgKTsKICAgICAgICAgICAgICAgICAgICB9LAogCiAgICAgICAgICAgICAgICAgICAgaW5zdGFuY2VvZjogKG5vZGUsIGNvbXBpbGVyLCBpbXBvcnRzKSA9PiB7CiAgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiBuZXcgaW1wb3J0cy5UeXBlZElucHV0KAogICAgICAgICAgICAgICAgICAgICAgICAgICAgYHZtLmp3Q2xhc3MuaW5zdGFuY2VPZigke2NvbXBpbGVyLmRlc2NlbmRJbnB1dChub2RlLnBvaW50ZXIpLmFzVW5rbm93bigpfSwgdm0uandDbGFzcy5UeXBlLnRvQ2xhc3MoJHtjb21waWxlci5kZXNjZW5kSW5wdXQobm9kZS5jbGFzcykuYXNVbmtub3duKCl9KSlgLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgaW1wb3J0cy5UWVBFX0JPT0xFQU4KICAgICAgICAgICAgICAgICAgICAgICAgKTsKICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH07CiAgICAgICAgfQogCiAgICAgICAgY2xhc3MoeyBOQU1FLCBTRUxGIH0sIHV0aWwpIHsKICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsKICAgICAgICAgICAgLy8gVHJ5IHRvIGNhcHR1cmUgcnVudGltZSBzdWJzdGFja3MgaWYgcHJvdmlkZWQgb24gdXRpbCAoYmVzdC1lZmZvcnQpCiAgICAgICAgICAgIGNvbnN0IGluc3RhbmNlQ29uc3RydWN0ID0gZnVuY3Rpb24qIChfandDbGFzc1NlbGYsIHRocmVhZCwgdGFyZ2V0KSB7CiAgICAgICAgICAgICAgICBpZiAodXRpbCAmJiB0eXBlb2YgdXRpbC5zdWJzdGFjayA9PT0gJ2Z1bmN0aW9uJykgewogICAgICAgICAgICAgICAgICAgIHlpZWxkKiB1dGlsLnN1YnN0YWNrKHRocmVhZCwgdGFyZ2V0KTsKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfTsKICAgICAgICAgICAgY29uc3Qgc3RhdGljQ29uc3RydWN0ID0gZnVuY3Rpb24qIChfandDbGFzc1NlbGYsIHRocmVhZCwgdGFyZ2V0KSB7CiAgICAgICAgICAgICAgICBpZiAodXRpbCAmJiB0eXBlb2YgdXRpbC5zdWJzdGFjazIgPT09ICdmdW5jdGlvbicpIHsKICAgICAgICAgICAgICAgICAgICB5aWVsZCogdXRpbC5zdWJzdGFjazIodGhyZWFkLCB0YXJnZXQpOwogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9OwogICAgICAgICAgICBjb25zdCBjbHMgPSBuZXcgandDbGFzcy5UeXBlKGluc3RhbmNlQ29uc3RydWN0LCBOQU1FLCBudWxsLCB1dGlsLnRocmVhZD8ucHJvY2VkdXJlcywgc3RhdGljQ29uc3RydWN0KTsKICAgICAgICAgICAgLy8gUnVuIHN0YXRpYyBpbml0aWFsaXplciBub3cgKHdoZW4gdGhlIGNsYXNzIGJsb2NrIGlzIGV4ZWN1dGVkKSwgYmVzdC1lZmZvcnQuCiAgICAgICAgICAgIHRyeSB7CiAgICAgICAgICAgICAgICBpZiAodXRpbCAmJiB0eXBlb2YgdXRpbC5zdWJzdGFjazIgPT09ICdmdW5jdGlvbicpIHsKICAgICAgICAgICAgICAgICAgICAvLyBJZiBydW50aW1lIHByb3ZpZGVkIGEgc3Vic3RhY2sgcnVubmVyLCB1c2UgaXQgc28geWllbGRzIGludGVncmF0ZSB3aXRoIHRoZSB0aHJlYWQKICAgICAgICAgICAgICAgICAgICB0cnkgewogICAgICAgICAgICAgICAgICAgICAgICB1dGlsLnN1YnN0YWNrMih1dGlsLnRocmVhZCwgdXRpbC50YXJnZXQpOwogICAgICAgICAgICAgICAgICAgIH0gY2F0Y2ggKGUpIHsKICAgICAgICAgICAgICAgICAgICAgICAgLy8gZmFsbCBiYWNrIHRvIGRpcmVjdCBzdGF0aWNDb25zdHJ1Y3QKICAgICAgICAgICAgICAgICAgICAgICAgY29uc3QgZ2VuID0gY2xzLnN0YXRpY0NvbnN0cnVjdCAmJiBjbHMuc3RhdGljQ29uc3RydWN0KGNscywgdXRpbD8udGhyZWFkLCB1dGlsPy50YXJnZXQpOwogICAgICAgICAgICAgICAgICAgICAgICBpZiAoZ2VuICYmIHR5cGVvZiBnZW4ubmV4dCA9PT0gJ2Z1bmN0aW9uJykgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IHIgPSBnZW4ubmV4dCgpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgd2hpbGUgKCFyLmRvbmUpIHIgPSBnZW4ubmV4dCgpOwogICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgfSBlbHNlIHsKICAgICAgICAgICAgICAgICAgICBjb25zdCBnZW4gPSBjbHMuc3RhdGljQ29uc3RydWN0ICYmIGNscy5zdGF0aWNDb25zdHJ1Y3QoY2xzLCB1dGlsPy50aHJlYWQsIHV0aWw/LnRhcmdldCk7CiAgICAgICAgICAgICAgICAgICAgaWYgKGdlbiAmJiB0eXBlb2YgZ2VuLm5leHQgPT09ICdmdW5jdGlvbicpIHsKICAgICAgICAgICAgICAgICAgICAgICAgbGV0IHIgPSBnZW4ubmV4dCgpOwogICAgICAgICAgICAgICAgICAgICAgICB3aGlsZSAoIXIuZG9uZSkgciA9IGdlbi5uZXh0KCk7CiAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9IGNhdGNoIChlKSB7fQogICAgICAgICAgICByZXR1cm4gY2xzOwogICAgICAgIH0KIAogICAgICAgIHNlbGYoKSB7CiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAgICAgICAgICAgIHJldHVybiBuZXcgandQb2ludGVyLlR5cGUoMCk7CiAgICAgICAgfQogCiAgICAgICAgZXh0ZW5kKHsgQ0xBU1MsIEVYVEVOU0lPTiB9KSB7CiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAgICAgICAgICAgIENMQVNTID0gandDbGFzcy5UeXBlLnRvQ2xhc3MoQ0xBU1MpOwogICAgICAgICAgICBFWFRFTlNJT04gPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhFWFRFTlNJT04pOwogICAgICAgICAgICByZXR1cm4gQ0xBU1MuZXh0ZW5kKEVYVEVOU0lPTik7CiAgICAgICAgfQogCiAgICAgICAgc2V0UHJvcCh7IE5BTUUsIFBPSU5URVIsIFZBTFVFIH0pIHsKICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsKICAgICAgICAgICAgandDbGFzcy5zZXRQcm9wKE5BTUUsIFBPSU5URVIsIFZBTFVFKTsKICAgICAgICB9CgogICAgICAgIHNldFN0YXRpYyh7IE5BTUUsIENMQVNTLCBWQUxVRSB9KSB7CiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAgICAgICAgICAgIGp3Q2xhc3Muc2V0U3RhdGljKE5BTUUsIENMQVNTLCBWQUxVRSk7CiAgICAgICAgfQogCiAgICAgICAgZ2V0UHJvcCh7IE5BTUUsIFBPSU5URVIgfSkgewogICAgICAgICAgICByZWZyZXNoRGVwcygpOwogICAgICAgICAgICByZXR1cm4gandDbGFzcy5nZXRQcm9wKE5BTUUsIFBPSU5URVIpOwogICAgICAgIH0KCiAgICAgICAgZ2V0U3RhdGljKHsgTkFNRSwgQ0xBU1MgfSkgewogICAgICAgICAgICByZWZyZXNoRGVwcygpOwogICAgICAgICAgICByZXR1cm4gandDbGFzcy5nZXRTdGF0aWMoTkFNRSwgQ0xBU1MpOwogICAgICAgIH0KIAogICAgICAgIGdldENsYXNzKHsgUE9JTlRFUiB9KSB7CiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAgICAgICAgICAgIHJldHVybiBqd0NsYXNzLmdldFByb3AoY2xhc3NTeW1ib2wsIFBPSU5URVIpOwogICAgICAgIH0KIAogICAgICAgIG5ldyh7IENMQVNTIH0sIHV0aWwpIHsKICAgICAgICAgICAgcmVmcmVzaERlcHMoKTsKICAgICAgICAgICAgQ0xBU1MgPSBqd0NsYXNzLlR5cGUudG9DbGFzcyhDTEFTUyk7CiAgICAgICAgICAgIHJldHVybiBDTEFTUy5jcmVhdGVJbnN0YW5jZSh1dGlsLnRocmVhZCwgdXRpbC50YXJnZXQpOwogICAgICAgIH0KIAogICAgICAgIGdldE5hbWUoeyBDTEFTUyB9KSB7CiAgICAgICAgICAgIHJlZnJlc2hEZXBzKCk7CiAgICAgICAgICAgIENMQVNTID0gandDbGFzcy5UeXBlLnRvQ2xhc3MoQ0xBU1MpOwogICAgICAgICAgICByZXR1cm4gQ0xBU1MubmFtZTsKICAgICAgICB9CiAKICAgICAgICBpbnN0YW5jZW9mKHsgUE9JTlRFUiwgQ0xBU1MgfSkgewogICAgICAgICAgICByZWZyZXNoRGVwcygpOwogICAgICAgICAgICByZXR1cm4gandDbGFzcy5pbnN0YW5jZU9mKFBPSU5URVIsIGp3Q2xhc3MuVHlwZS50b0NsYXNzKENMQVNTKSk7CiAgICAgICAgfQogICAgfQogCiAgICBTY3JhdGNoLmV4dGVuc2lvbnMucmVnaXN0ZXIobmV3IEV4dGVuc2lvbigpKTsKfSkoU2NyYXRjaCk7";
+      `data:text/javascript;base64,${btoa(require("fs").readFileSync("jwClass.js"))}`;
   }
 }
 

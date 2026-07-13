@@ -125,4 +125,22 @@ const setWrapperBlock = setWrapperEntry[1];
 const setChildId = setWrapperBlock.inputs.VALUE[1];
 assert.ok(setChildId && spriteBlocks[setChildId] && spriteBlocks[setChildId].opcode === 'dogeiscutObject_set', 'Expected SPtempVars_setVar VALUE input to contain dogeiscutObject_set');
 
+// Class instances: inferred class type must reject reassignment to a non-instance.
+const { result: instanceInferError } = runFixture('class_instance_infer_reassign_error.pang');
+assert.notStrictEqual(instanceInferError.status, 0, 'Expected compile-time type error when an inferred class instance is reassigned to a non-instance');
+assert.match(instanceInferError.stderr || instanceInferError.stdout, /Type error/i);
+
+// Class instances: explicit annotation + another instance of the same class is fine.
+const { result: instanceExplicitOk } = runFixture('class_instance_explicit_annotation_ok.pang');
+assert.strictEqual(instanceExplicitOk.status, 0, instanceExplicitOk.stderr || instanceExplicitOk.stdout);
+
+// Class instances: explicit annotation + static factory usage must compile.
+const { result: instanceStaticOk } = runFixture('class_instance_static_ok.pang');
+assert.strictEqual(instanceStaticOk.status, 0, instanceStaticOk.stderr || instanceStaticOk.stdout);
+
+// Class instances: explicit annotation must reject reassignment to a non-instance.
+const { result: instanceExplicitError } = runFixture('class_instance_explicit_reassign_error.pang');
+assert.notStrictEqual(instanceExplicitError.status, 0, 'Expected compile-time type error when an explicitly annotated class instance is reassigned to a non-instance');
+assert.match(instanceExplicitError.stderr || instanceExplicitError.stdout, /Type error/i);
+
 console.log('type system tests passed');

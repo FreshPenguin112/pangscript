@@ -1,0 +1,17 @@
+class Foo {
+    static make(x) {
+        return new Foo(x, x);
+    }
+    constructor(a, b) {
+        this.a = a;
+        this.b = b;
+    }
+    bar() {
+        return this.a + this.b;
+    }
+}
+
+let a: Foo = Foo.make(3);
+a.bar();
+a = new Foo(1, 2);
+a.bar();
