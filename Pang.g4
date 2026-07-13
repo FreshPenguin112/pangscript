@@ -220,9 +220,9 @@ optionValue
 
 functionCall
     : memberExpr
-      ('.' IDENT)*
+      ('.' propertyName)*
       '(' (expr (',' expr)*)? ')'
-      ( '(' (expr (',' expr)*)? ')' | '.' IDENT )*
+      ( '(' (expr (',' expr)*)? ')' | '.' propertyName )*
     ;
 
 arrowFunction
@@ -231,7 +231,12 @@ arrowFunction
     ;
 
 memberExpr
-    : (IDENT | THIS) ('.' IDENT)*
+    : (IDENT | THIS) ('.' propertyName)*
+    ;
+
+propertyName
+    : IDENT
+    | 'constructor'
     ;
 
 classDecl

@@ -2,7 +2,6 @@ on("flag", () => {
     class Foo {
         constructor(x, y) {
             print(x + y, {seconds: 2});
-            print(this, {seconds: 2})
         }
         bar() {
             print("bar");
@@ -11,11 +10,22 @@ on("flag", () => {
                 print(i, {seconds: 1});
             }
         }
+
+        static test() {
+            print("test")
+        }
     }
 
     let a: Foo = new Foo(5, 10);
-    a.bar();
+    //a.bar();
     //a = {bar: () => {return 1}};
     //a.bar();
     print(typeof a); // Foo
+    Foo.constructor = (x, y) => { // you can override methods now
+      print(x * y, {seconds: 2});
+    }
+    Foo.bar = () => {print(5, {seconds: 2})}
+    a = new Foo(5, 5);
+    Foo.test();
+    a.bar();
 });

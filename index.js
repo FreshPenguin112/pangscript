@@ -288,21 +288,8 @@ function mapReceiverName(name, paramMap) {
 // inline wrappers, arg setters, constructor temps, etc.
 let __pw_temp_counter = 0;
 let __pw_arg_counter = 0;
-// Argument UID map: assign a small random uid per logical argument/key so
-// all occurrences of the same argument share the same uid (no global run uid).
-const __pw_arg_uid_map = Object.create(null);
 function genRandomUid() {
   return Math.random().toString(36).slice(2, 7);
-}
-function getUidForKey(key) {
-  if (!key) return genRandomUid();
-  if (!__pw_arg_uid_map[key]) __pw_arg_uid_map[key] = genRandomUid();
-  return __pw_arg_uid_map[key];
-}
-function getTaggedArgName(scopeKey, origName) {
-  const uid = getUidForKey(scopeKey);
-  const clean = String(origName).replace(/^_+/, "");
-  return `__${uid}_${clean}`;
 }
 
 function __pw_newTemp(prefix = "temp") {
@@ -311,14 +298,10 @@ function __pw_newTemp(prefix = "temp") {
   return `__${genRandomUid()}_${clean}${__pw_temp_counter}`;
 }
 
-// If a scopeKey is provided, reuse a UID for that key so the generated
-// arg name is stable across uses. Otherwise, prefer deterministic indexed
-// names like __arg0 so lambda call wrappers share the same naming as the
-// lambda definition.
-function __pw_newArgTemp(base = "value", scopeKey = null) {
+// Always use deterministic indexed names like __arg0 so lambda call
+// wrappers share the same naming as the lambda definition.
+function __pw_newArgTemp() {
   __pw_arg_counter += 1;
-  const clean = String(base).replace(/^_+/, "");
-  if (scopeKey) return getTaggedArgName(scopeKey, clean);
   return `__arg${__pw_arg_counter - 1}`;
 }
 
@@ -530,11 +513,9 @@ class AstBuilder extends PangVisitor {
     }
     // collect base identifiers from memberExpr (e.g., ['num','add'])
     const baseNames = [];
-    if (memberExpr && memberExpr.IDENT) {
-      const idNodes = memberExpr.IDENT();
-      if (Array.isArray(idNodes)) {
-        for (let i = 0; i < idNodes.length; i++) baseNames.push(idNodes[i].getText());
-      } else if (idNodes) baseNames.push(idNodes.getText());
+    if (memberExpr) {
+      const chain = this.visitMemberExpr(memberExpr);
+      if (Array.isArray(chain)) baseNames.push(...chain);
     }
 
     // Walk children to extract argument-groups for each `(...)` pair and
@@ -600,11 +581,7 @@ class AstBuilder extends PangVisitor {
           ) {
             // If the immediate preceding child is a MemberExprContext, prefer its last IDENT
             try {
-              const ids = prevChild.IDENT
-                ? Array.isArray(prevChild.IDENT())
-                  ? prevChild.IDENT().map((x) => x.getText())
-                  : [prevChild.IDENT().getText()]
-                : [];
+              const ids = this.visitMemberExpr(prevChild);
               if (ids && ids.length > 0) methodName = ids[ids.length - 1];
             } catch (e) { }
           }
@@ -819,6 +796,21 @@ class AstBuilder extends PangVisitor {
   visitMemberExpr(ctx) {
     const ids = [];
     if (!ctx) return ids;
+    if (ctx.children) {
+      for (let i = 0; i < ctx.children.length; i++) {
+        const ch = ctx.children[i];
+        if (!ch) continue;
+        const text = ch.getText ? ch.getText() : null;
+        if (text === "." ) continue;
+        const cn = ch.constructor && ch.constructor.name ? ch.constructor.name : "";
+        if (cn.endsWith("PropertyNameContext")) {
+          ids.push(text);
+        } else if (ch.symbol) {
+          ids.push(text);
+        }
+      }
+      return ids;
+    }
     const idNodes = ctx.IDENT ? ctx.IDENT() : [];
     if (Array.isArray(idNodes)) {
       for (let i = 0; i < idNodes.length; i++) ids.push(idNodes[i].getText());
@@ -2558,11 +2550,9 @@ if (!nestedInput) {
           // generate tagged param names for this method so call-sites
           // and the method body use the same synthetic thread-var names.
           const origParams = Array.isArray(m.params) ? m.params.slice() : m.params ? [m.params] : [];
-          // Use a per-method scope key so all occurrences of the same method
-          // parameter share the same uid-prefixed name.
-          const tagged = origParams.map((p, i) =>
-            p ? __pw_newArgTemp(p, `class:${name}:${m.name}:param:${i}:${p}`) : p,
-          );
+          // Use deterministic indexed arg names so call-sites and the method
+          // body share the same naming.
+          const tagged = origParams.map((p, i) => (p ? `__arg${i}` : p));
           // Allow multiple variants (method/getter/setter) to coexist under
           // the same logical name. Store either an array (legacy) or an
           // object with keys `method`, `getter`, `setter` pointing to
@@ -2587,7 +2577,7 @@ if (!nestedInput) {
             classRegistry[name].methods[m.name] = tagged;
           }
           const methodId = m.getter ? "getter" : m.setter ? "setter" : "method";
-          const methodKey = getTaggedArgName(`class:${name}:method:${m.name}:${methodId}`, m.name);
+          const methodKey = m.name;
           // store method metadata flags so later emission can handle static/get/set/generator
           classRegistry[name].methodInfo[m.name] = classRegistry[name].methodInfo[m.name] || {
             static: false,
@@ -5547,19 +5537,11 @@ if (!nestedInput) {
       const methodParams = className ? getMethodParams(className, methodName) : null;
       // detect static methods on the class and prepare a synthetic receiver
       const isStaticCall = className && hasMethodFlag(className, methodName, "static");
-      let staticTempName = null;
-      let staticSetTemp = null;
       let staticReceiverRef = null;
       if (isStaticCall) {
-        staticTempName = __pw_newTemp("__s");
-        const classRefNestedLocal = getClassGlobalRef(className);
-        staticSetTemp = {
-          opcode: "SPtempVars_setVar",
-          inputs: ["thread", staticTempName, { opcode: "jwClass_new", inputs: [classRefNestedLocal] }],
-        };
-        staticReceiverRef = { opcode: "SPtempVars_getVar", inputs: ["thread", staticTempName] };
-        tempToClass[staticTempName] = className;
+        staticReceiverRef = getClassGlobalRef(className);
       }
+      const staticMethodGetter = isStaticCall ? getClassStaticGet(className, actualMethodName) : null;
 
       // If we have a true chain (more than one step), emit stack-level temps
       if (steps.length > 1) {
@@ -5798,12 +5780,9 @@ if (!nestedInput) {
           const argExpr = stmt.args && stmt.args[i] ? exprToNested(stmt.args[i], inMethod, paramMap) : "";
           setters.push({ opcode: "SPtempVars_setVar", inputs: ["thread", pname, argExpr] });
         }
-        // If this is a static method, ensure we create the synthetic class
-        // instance first and call the method on it.
-        if (isStaticCall) setters.unshift(staticSetTemp);
         const call = {
           opcode: "jwLambda_execute",
-          inputs: [isStaticCall ? makeGet(actualMethodName, staticReceiverRef) : methodGetter, ""],
+          inputs: [isStaticCall ? staticMethodGetter : methodGetter, ""],
         };
         return [].concat(setters, [call]);
       }
@@ -5833,15 +5812,14 @@ if (!nestedInput) {
         const setter = { opcode: "SPtempVars_setVar", inputs: ["thread", argTempName, argNested] };
         if (isStaticCall)
           return [].concat([
-            staticSetTemp,
             setter,
-            { opcode: "jwLambda_execute", inputs: [makeGet(actualMethodName, staticReceiverRef), ""] },
+            { opcode: "jwLambda_execute", inputs: [staticMethodGetter, ""] },
           ]);
         const call = { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
         return [].concat([setter], [call]);
       }
       if (isStaticCall)
-        return { opcode: "jwLambda_execute", inputs: [makeGet(actualMethodName, staticReceiverRef), ""] };
+        return { opcode: "jwLambda_execute", inputs: [staticMethodGetter, ""] };
       return { opcode: "jwLambda_execute", inputs: [methodGetter, ""] };
     }
     if (stmt.type === "Declare") {
@@ -6336,6 +6314,10 @@ if (!nestedInput) {
   // (set inside exprToNested during the loop above). Inject it post hoc.
   if (runtimeTypeofHelperUsed && !userDefinedRuntimeTypeof) {
     const helperOn = buildRuntimeTypeofHelperDecl();
+    arraysUsed = true;
+    objectsUsed = true;
+    lambdasUsed = true;
+    usedClasses = true;
     const rawChildren =
       helperOn.body && helperOn.body.body
         ? helperOn.body.body.map((c) => stmtToNested(c, false)).filter(Boolean)
