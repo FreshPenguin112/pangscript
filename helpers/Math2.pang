@@ -107,7 +107,7 @@ on("flag", () => {
         } else {
             let temp = intPart;
             while (temp > 0) {
-                intStr = digits[temp % radix] + intStr;
+                intStr = (digits[temp % radix]) .. intStr;
                 temp = operator_mathop("floor", temp / radix);
             }
         }
@@ -121,7 +121,7 @@ on("flag", () => {
             fracPart = fracPart * radix;
 
             let digit = operator_mathop("floor", fracPart);
-            fracStr = fracStr + digits[digit];
+            fracStr = fracStr .. digits[digit];
 
             fracPart = fracPart - digit;
             count = count + 1;
@@ -130,11 +130,11 @@ on("flag", () => {
         let result = intStr;
 
         if (fracStr.length > 0) {
-            result = result + "." + fracStr;
+            result = result .. "." .. fracStr;
         }
 
         if (negative) {
-            result = "-" + result;
+            result = "-" .. result;
         }
 
         return result;

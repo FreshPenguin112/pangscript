@@ -37,6 +37,128 @@ const InputTypes = {
   data_listcontents: 13,
 };
 
+// ===== NEW: Enhanced Type Normalization and Checking =====
+
+/**
+ * Comprehensive type checking with multiple format support
+ * Handles "String"/"string"/"str"/"text", arrays, numbers, etc.
+ */
+function normalizeAndCheckType(type, targetType) {
+  if (!type) return false;
+  const cleaned = String(type).trim().toLowerCase();
+
+  if (targetType === "string") {
+    return ["string", "str", "text", "char"].includes(cleaned);
+  }
+  if (targetType === "array") {
+    return ["array", "list", "tuple", "vec"].includes(cleaned) || cleaned.endsWith("[]");
+  }
+  if (targetType === "number") {
+    return ["number", "num", "int", "float", "double", "decimal"].includes(cleaned);
+  }
+  if (targetType === "boolean") {
+    return ["boolean", "bool", "true", "false"].includes(cleaned);
+  }
+  return false;
+}
+
+/**
+ * Robust receiver type detection with 7 fallback strategies
+ * Returns: { type, confidence, primaryMethod, normalizedType }
+ */
+function getReceiverTypeForIndexing(receiver, paramMap, varToClass, paramTypeMap) {
+  if (!receiver) return { type: "unknown", confidence: 0 };
+  // inside getReceiverTypeForIndexing, before the return
+  //console.log("receiver:", receiver, "inferredType:", receiver.inferredType);
+
+  const results = {
+    type: "unknown",
+    confidence: 0,
+    primaryMethod: null,
+    normalizedType: null
+  };
+
+  // METHOD 1: Literal values (100% confidence)
+  if (receiver.type === "Literal") {
+    if (receiver.litType === "string") {
+      return { type: "string", confidence: 100, primaryMethod: "literal_type", normalizedType: "string" };
+    }
+    if (receiver.litType === "array") {
+      return { type: "array", confidence: 100, primaryMethod: "literal_type", normalizedType: "array" };
+    }
+  }
+
+  // METHOD 2: Type annotations (95% confidence)
+  if (receiver.typeAnnotation) {
+    if (normalizeAndCheckType(receiver.typeAnnotation, "string")) {
+      return { type: "string", confidence: 95, primaryMethod: "type_annotation", normalizedType: "string" };
+    }
+    if (normalizeAndCheckType(receiver.typeAnnotation, "array")) {
+      return { type: "array", confidence: 95, primaryMethod: "type_annotation", normalizedType: "array" };
+    }
+  }
+
+  // METHOD 3: Inferred types (85% confidence)
+  if (receiver.inferredType) {
+    if (normalizeAndCheckType(receiver.inferredType, "string")) {
+      return { type: "string", confidence: 85, primaryMethod: "inferred_type", normalizedType: "string" };
+    }
+    if (normalizeAndCheckType(receiver.inferredType, "array")) {
+      return { type: "array", confidence: 85, primaryMethod: "inferred_type", normalizedType: "array" };
+    }
+  }
+
+  // METHOD 4: Parameter type map (80% confidence)
+  if (receiver.type === "Var" && receiver.name && paramTypeMap) {
+    const paramType = paramTypeMap[receiver.name];
+    if (paramType) {
+      if (normalizeAndCheckType(paramType, "string")) {
+        return { type: "string", confidence: 80, primaryMethod: "param_type_map", normalizedType: "string" };
+      }
+      if (normalizeAndCheckType(paramType, "array")) {
+        return { type: "array", confidence: 80, primaryMethod: "param_type_map", normalizedType: "array" };
+      }
+    }
+  }
+
+  // METHOD 5: Variable-to-class mapping (75% confidence)
+  if (receiver.type === "Var" && receiver.name && varToClass && varToClass[receiver.name]) {
+    return { type: "object", confidence: 75, primaryMethod: "var_to_class", normalizedType: "object" };
+  }
+
+  // METHOD 6: String-returning call heuristics (60% confidence)
+  if (receiver.type === "Call" && receiver.name) {
+    const callName = String(receiver.name).toLowerCase();
+    if (callName.includes("tostring") || callName.includes("stringify") ||
+      callName.includes("join") || callName.includes("concat")) {
+      return { type: "string", confidence: 60, primaryMethod: "string_call_heuristic", normalizedType: "string" };
+      }
+  }
+
+  // METHOD 7: String method heuristics (70% confidence)
+  if (receiver.type === "Call" && receiver.name) {
+    const stringMethods = ["substring", "substr", "slice", "charAt", "trim",
+    "toUpperCase", "toLowerCase", "split"];
+    const callName = String(receiver.name).toLowerCase();
+    if (stringMethods.some(m => callName.includes(m))) {
+      return { type: "string", confidence: 70, primaryMethod: "string_method_heuristic", normalizedType: "string" };
+    }
+  }
+
+  // METHOD 8: Global variable type map (85% confidence)
+  if (receiver.type === "Var" && receiver.name && globalVarTypeMap && globalVarTypeMap[receiver.name]) {
+    const type = globalVarTypeMap[receiver.name];
+    if (normalizeAndCheckType(type, "string")) {
+      return { type: "string", confidence: 85, primaryMethod: "global_type_map", normalizedType: "string" };
+    }
+    if (normalizeAndCheckType(type, "array")) {
+      return { type: "array", confidence: 85, primaryMethod: "global_type_map", normalizedType: "array" };
+    }
+  }
+
+  return { type: "unknown", confidence: 0, primaryMethod: null, normalizedType: null };
+}
+
 function getTypeofLabel(type) {
   if (type == null) return null;
   const raw = String(type).trim();
@@ -114,6 +236,7 @@ require("./blocks_dogeiscut_additions");
 // so module-scoped helpers like isClassReceiver can consult them.
 let varToClass = {};
 let tempToClass = {};
+let globalVarTypeMap = {};
 
 // Helpers to choose DogeisCut opcodes when available in blocks metadata.
 // Decide whether a receiver refers to a class instance (in which case we must
@@ -1338,9 +1461,10 @@ class AstBuilder extends PangVisitor {
     }
 
     // Precedence levels (high -> low). Matches JavaScript operator precedence order.
+    // Precedence levels (high -> low). Matches JavaScript operator precedence order.
     const PRECEDENCE_LEVELS = [
       ["**"],
-      ["*", "/"],
+      ["*", "/", "%"],
       // include string concat '..' alongside + and - so concatenation chains are combined
       ["+", "-", ".."],
       ["<<", ">>", ">>>"],
@@ -1501,6 +1625,10 @@ class AstBuilder extends PangVisitor {
             j++;
           }
           if (inner) bracketExprs.push(inner);
+
+          // FIX: Advance the outer loop past the parsed bracket expression
+          // so it doesn't try to parse the inner expression's tokens as primary tokens.
+          i = j;
         }
       }
     }
@@ -1822,19 +1950,38 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         return node.inferredType;
       }
       case "Index": {
-        //console.log("DEBUG visitExpression: processing Index, receiver type:", node.receiver?.type, "name:", node.receiver?.name);
         const receiverType = node.receiver ? visitExpression(node.receiver) : "Any";
-        //console.log("DEBUG visitExpression: receiver type after visit:", receiverType);
+
+
+        // FIX: Visit the index expression so that complex indices (e.g., a % b)
+        // are properly analyzed and their inferred types/variables are registered.
+        if (node.index) {
+          visitExpression(node.index);
+        }
+
         let inferred = "Any";
+
+        // Check if it's an array type (handle array[] syntax)
         if (receiverType && receiverType.endsWith("[]")) {
           inferred = normalizeTypeName(receiverType.slice(0, -2));
         }
-        if (receiverType === "String") {
+        // Check if it's a string type with better normalization
+        else if (normalizeAndCheckType(receiverType, "string")) {
           inferred = "String";
         }
+
         node.inferredType = inferred;
-        if (node.receiver) node.receiver.inferredType = receiverType;
-        //console.log("DEBUG visitExpression: Index complete. Set node.receiver.inferredType =", receiverType);
+
+        if (node.receiver) {
+          // Store the receiver's type
+          node.receiver.inferredType = receiverType;
+
+          // Store normalized version for use in exprToNested
+          node.receiver.normalizedReceiverType = normalizeAndCheckType(receiverType, "string")
+          ? "string"
+          : (normalizeAndCheckType(receiverType, "array") ? "array" : "unknown");
+        }
+
         return inferred;
       }
       case "Ternary": {
@@ -1977,6 +2124,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         }
         stmt.inferredType = effectiveType;
         setType(stmt.name, effectiveType);
+        globalVarTypeMap[stmt.name] = effectiveType;   // <-- ADD THIS
         break;
       }
       case "Assign": {
@@ -1989,8 +2137,10 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
           const mergedType = targetType || valueType;
           if (targetType && mergedType && mergedType !== "Any") {
             setType(stmt.name, mergedType);
+            globalVarTypeMap[stmt.name] = mergedType;   // <-- ADD THIS
           } else if (!targetType) {
             setType(stmt.name, valueType);
+            globalVarTypeMap[stmt.name] = valueType;    // <-- ADD THIS
           }
         }
         break;
@@ -3743,36 +3893,38 @@ if (!nestedInput) {
     }
     if (expr.type === "This") return selfRef();
     if (expr.type === "Index") {
-      // Determine if this is string indexing or array indexing
-      let receiverType = null;
-      
-      if (expr.receiver) {
-        // Method 1: Check cached inferredType from visitExpression
-        if (expr.receiver.inferredType) {
-          receiverType = expr.receiver.inferredType;
-        }
-        // Method 2: Check if it's a string literal
-        else if (expr.receiver.type === "Literal" && expr.receiver.litType === "string") {
-          receiverType = "String";
-        }
-        // Method 3: For Var nodes, check paramTypeMap (populated from lambda/function paramTypes)
-        else if (expr.receiver.type === "Var" && expr.receiver.name && paramTypeMap[expr.receiver.name]) {
-          receiverType = paramTypeMap[expr.receiver.name];
-        }
-      }
-      
-      const isStringIndex = receiverType === "String";
-      if (isStringIndex) stringUsed = true;
-      const strNested = exprToNested(expr.receiver, inMethod, paramMap);
-      const rawIdx = exprToNested(expr.index, inMethod, paramMap);
-      if (isStringIndex) {
-        // Scratch operator_letter_of is 1-based, so add 1 to index
+      const receiver = expr.receiver;
+      const index = expr.index;
+
+      // Convert expressions to nested format
+      const strNested = exprToNested(receiver, inMethod, paramMap);
+      const rawIdx = exprToNested(index, inMethod, paramMap);
+
+      // Perform enhanced type detection using helper function
+      const typeInfo = getReceiverTypeForIndexing(receiver, paramMap, varToClass, paramTypeMap);
+
+      // ===== DECISION TREE =====
+
+      if (typeInfo.type === "string") {
+        // CONFIDENT: Use string indexing (operator_letter_of)
+        stringUsed = true;
         const idxArg = adjustArrayIndex(rawIdx, inMethod, paramMap);
         return { opcode: "operator_letter_of", inputs: [idxArg, strNested] };
       }
-      // Square-bracket array access: map to `jwArray_get` (1-based index).
-      const idxArg = adjustArrayIndex(rawIdx, inMethod, paramMap);
-      return { opcode: "jwArray_get", inputs: [{ ...strNested, noPlaceholder: true }, idxArg] };
+
+      if (typeInfo.type === "array") {
+        // CONFIDENT: Use array indexing (jwArray_get)
+        arraysUsed = true;
+        const idxArg = adjustArrayIndex(rawIdx, inMethod, paramMap);
+        return { opcode: "jwArray_get", inputs: [{ ...strNested, noPlaceholder: true }, idxArg] };
+      }
+
+      if (typeInfo.confidence >= 60) {
+        // MODERATE CONFIDENCE: Default to array indexing (more common)
+        arraysUsed = true;
+        const idxArg = adjustArrayIndex(rawIdx, inMethod, paramMap);
+        return { opcode: "jwArray_get", inputs: [{ ...strNested, noPlaceholder: true }, idxArg] };
+      }
     }
     if (expr.type === "Member" || expr.type === "MemberExpr") {
       const chain = expr.chain || [];
