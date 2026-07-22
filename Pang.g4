@@ -111,8 +111,9 @@ continueStmt
 
 primary
     : atom
-      (INCR | DECR)? // optional post-increment/decrement
+      (INCR | DECR)?
       ( '[' expr ']' )*
+      ( '.' propertyName ( '(' (expr (',' expr)*)? ')' )? )*
     ;
 
 expr
@@ -226,7 +227,7 @@ functionCall
     ;
 
 arrowFunction
-    : '(' (paramDecl (',' paramDecl)*)? ')' '=>' (block | inlineBlock)
+    : '(' (paramDecl (',' paramDecl)*)? ')' typeAnnotation? '=>' (block | inlineBlock)
     | paramDecl '=>' (block | inlineBlock)
     ;
 

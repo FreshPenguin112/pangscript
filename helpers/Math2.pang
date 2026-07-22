@@ -1,0 +1,142 @@
+on("flag", () => {
+    let Math = {
+        Number E: pmOperatorsExpansion_euler(),
+        Number PI: pmOperatorsExpansion_pi(),
+        abs: (n): Number => {
+            return operator_mathop("abs", n);
+        },
+        floor: (n): Number => {
+            return operator_mathop("floor", n);
+        },
+        ceil: (n): Number => {
+            return operator_mathop("ceiling", n);
+        },
+        round: (n): Number => {
+            return operator_round(n);
+        },
+        sqrt: (n): Number => {
+            return operator_mathop("sqrt", n);
+        },
+        sign: (n): Number => {
+            return operator_mathop("sign", n);
+        },
+        trunc: (n): Number => {
+            return pmOperatorsExpansion_truncateNumber(n);
+        },
+        sin: (n): Number => {
+            return operator_mathop("sin", n);
+        },
+        cos: (n): Number => {
+            return operator_mathop("cos", n);
+        },
+        tan: (n): Number => {
+            return operator_mathop("tan", n);
+        },
+        asin: (n): Number => {
+            return operator_mathop("asin", n);
+        },
+        acos: (n): Number => {
+            return operator_mathop("acos", n);
+        },
+        atan: (n): Number => {
+            return operator_mathop("atan", n);
+        },
+        atan2: (y, x): Number => {
+            return pmOperatorsExpansion_atan2(y, x);
+        },
+        exp: (n): Number => {
+            return operator_mathop("e ^", n);
+        },
+        log: (n): Number => {
+            return operator_mathop("ln", n);
+        },
+        log10: (n): Number => {
+            return operator_mathop("log", n);
+        },
+        log2: (n): Number => {
+            return operator_mathop("log2", n);
+        },
+        pow: (x, y): Number => {
+            return operator_mathop("e ^", y * operator_mathop("ln", x));
+        },
+        min: (a, b): Number => {
+            if (a < b) {
+                return a;
+            } else {
+                return b;
+            }
+        },
+        max: (a, b): Number => {
+            if (a > b) {
+                return a;
+            } else {
+                return b;
+            }
+        },
+        random: (): Number => {
+            const a = operator_random(0, 2**26 - 1);
+            const b = operator_random(0, 2**27 - 1);
+
+            return (a * 2**27 + b) / 2**53;
+        },
+        cbrt: (n): Number => {
+            return operator_mathop("e ^", operator_mathop("ln", n) / 3);
+        },
+        hypot: (x, y): Number => {
+            return operator_mathop("sqrt", x * x + y * y);
+        }
+    };
+    let _INTERNAL_numberToString = (n, radix): String => {
+        if (radix == 10 || radix == "") {
+            return operator_stringify(n);
+        }
+
+        let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+        let negative = n < 0;
+        let num = operator_mathop("abs", n);
+
+        // split parts
+        let intPart = operator_mathop("floor", num);
+        let fracPart = num - intPart;
+
+        // --- integer conversion ---
+        let intStr = "";
+        if (intPart == 0) {
+            intStr = "0";
+        } else {
+            let temp = intPart;
+            while (temp > 0) {
+                intStr = digits[temp % radix] + intStr;
+                temp = operator_mathop("floor", temp / radix);
+            }
+        }
+
+        // --- fractional conversion ---
+        let fracStr = "";
+        let precision = 16;
+
+        let count = 0;
+        while (fracPart > 0 && count < precision) {
+            fracPart = fracPart * radix;
+
+            let digit = operator_mathop("floor", fracPart);
+            fracStr = fracStr + digits[digit];
+
+            fracPart = fracPart - digit;
+            count = count + 1;
+        }
+
+        let result = intStr;
+
+        if (fracStr.length > 0) {
+            result = result + "." + fracStr;
+        }
+
+        if (negative) {
+            result = "-" + result;
+        }
+
+        return result;
+    };
+});

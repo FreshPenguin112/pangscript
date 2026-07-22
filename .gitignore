@@ -21,3 +21,4 @@ vscode-pang
 vm.js
 dogeiscutObjects.js
 !tests/**
+!helpers/**

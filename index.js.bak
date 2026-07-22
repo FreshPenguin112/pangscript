@@ -1662,7 +1662,7 @@ function parseWithAntlr(source) {
 --------------------------*/
 // Delegate block/project generation to lib/generator.js so index.js contains no
 // manual block generation logic.
-function performStaticTypeAnalysis(rootAst, lenientMode = false) {
+function performStaticTypeAnalysis(rootAst) {
   const scopes = [new Map()];
 
   function pushScope() {
@@ -1763,7 +1763,6 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
       case "Var": {
         const found = lookupType(node.name);
         node.inferredType = found || "Any";
-        //console.log("DEBUG visitExpression Var:", node.name, "-> type:", node.inferredType);
         return node.inferredType;
       }
       case "Typeof": {
@@ -1822,9 +1821,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         return node.inferredType;
       }
       case "Index": {
-        //console.log("DEBUG visitExpression: processing Index, receiver type:", node.receiver?.type, "name:", node.receiver?.name);
         const receiverType = node.receiver ? visitExpression(node.receiver) : "Any";
-        //console.log("DEBUG visitExpression: receiver type after visit:", receiverType);
         let inferred = "Any";
         if (receiverType && receiverType.endsWith("[]")) {
           inferred = normalizeTypeName(receiverType.slice(0, -2));
@@ -1833,8 +1830,6 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
           inferred = "String";
         }
         node.inferredType = inferred;
-        if (node.receiver) node.receiver.inferredType = receiverType;
-        //console.log("DEBUG visitExpression: Index complete. Set node.receiver.inferredType =", receiverType);
         return inferred;
       }
       case "Ternary": {
@@ -1903,17 +1898,13 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         node.inferredType = lambdaReturnType || "Function";
         if (node.body && Array.isArray(node.body.body)) {
           const lambdaScope = new Map();
-          
-            //console.log("LAMBDA_PARAMS", JSON.stringify(node.params), JSON.stringify(node.paramTypes));
-            if (Array.isArray(node.params)) {
+          if (Array.isArray(node.params)) {
             node.params.forEach((name, index) => {
               const declaredType = node.paramTypes && node.paramTypes[index] ? normalizeTypeName(node.paramTypes[index]) : "Any";
               lambdaScope.set(name, declaredType);
             });
           }
-          scopes.push(lambdaScope);
           visitStatements(node.body.body, lambdaScope, lambdaReturnType);
-          scopes.pop();
         }
         return node.inferredType;
       }
@@ -1963,17 +1954,15 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         const explicitType = stmt.typeAnnotation ? normalizeTypeName(stmt.typeAnnotation) : null;
         const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
         let effectiveType = explicitType || valueType || "Any";
-        if (!lenientMode && stmt.typeAnnotation && stmt.value && !isTypeCompatible(effectiveType, valueType)) {
+        if (stmt.typeAnnotation && stmt.value && !isTypeCompatible(effectiveType, valueType)) {
           throw new Error(`Type error: cannot assign ${valueType} to ${effectiveType}`);
         }
         if (stmt.typeAnnotation && !stmt.value) {
           effectiveType = explicitType;
         } else if (!stmt.typeAnnotation && stmt.value && !isConcreteType(valueType)) {
-          if (!lenientMode) {
-            throw new Error(
-              `Type inference error: cannot infer a concrete type for ${stmt.name} without an explicit type annotation`,
-            );
-          }
+          throw new Error(
+            `Type inference error: cannot infer a concrete type for ${stmt.name} without an explicit type annotation`,
+          );
         }
         stmt.inferredType = effectiveType;
         setType(stmt.name, effectiveType);
@@ -1982,7 +1971,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
       case "Assign": {
         const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
         const targetType = lookupType(stmt.name) || stmt.targetType || null;
-        if (!lenientMode && targetType && !isTypeCompatible(targetType, valueType)) {
+        if (targetType && !isTypeCompatible(targetType, valueType)) {
           throw new Error(`Type error: cannot assign ${valueType} to ${targetType}`);
         }
         if (stmt.name) {
@@ -1997,7 +1986,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
       }
       case "Return": {
         const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
-        if (!lenientMode && methodReturnType && !isTypeCompatible(methodReturnType, valueType)) {
+        if (methodReturnType && !isTypeCompatible(methodReturnType, valueType)) {
           throw new Error(`Type error: return value ${valueType} does not match ${methodReturnType}`);
         }
         break;
@@ -2074,11 +2063,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
           });
         }
         const returnType = stmt.returnType ? normalizeTypeName(stmt.returnType) : null;
-        if (stmt.body && stmt.body.body) {
-          scopes.push(methodScope);
-          visitStatements(stmt.body.body, methodScope, returnType);
-          scopes.pop();
-        }
+        if (stmt.body && stmt.body.body) visitStatements(stmt.body.body, methodScope, returnType);
         break;
       }
       case "Class": {
@@ -2219,8 +2204,8 @@ if (!nestedInput) {
           for (const node of stringHelperAst) {
             try {
               if (node && node.type === "On" && node.body && node.body.body)
-                performStaticTypeAnalysis(node.body.body, true);
-              else performStaticTypeAnalysis([node], true);
+                performStaticTypeAnalysis(node.body.body);
+              else performStaticTypeAnalysis([node]);
             } catch (_) {}
           }
         }
@@ -2228,8 +2213,8 @@ if (!nestedInput) {
           for (const node of mathHelperAst) {
             try {
               if (node && node.type === "On" && node.body && node.body.body)
-                performStaticTypeAnalysis(node.body.body, true);
-              else performStaticTypeAnalysis([node], true);
+                performStaticTypeAnalysis(node.body.body);
+              else performStaticTypeAnalysis([node]);
             } catch (_) {}
           }
         }
@@ -3241,9 +3226,6 @@ if (!nestedInput) {
   // jwClass_getProp(SPtempVars_getVar(...)) patterns that required
   // post-processing.
 
-  // Track parameter types during lambda/function processing
-  let paramTypeMap = {};
-
   // Convert AST to nested JSON form (canonical representation generator expects)
   function exprToNested(expr, inMethod = false, paramMap = null) {
     if (!expr) return "";
@@ -3294,24 +3276,8 @@ if (!nestedInput) {
           });
         }
         const bodyStmts = defaultGuards.concat(expr.body.body);
-        
-        // Save previous paramTypeMap and populate it with this lambda's parameter types
-        const savedParamTypeMap = paramTypeMap;
-        paramTypeMap = {};
-        if (Array.isArray(expr.params) && Array.isArray(expr.paramTypes)) {
-          expr.params.forEach((name, index) => {
-            const declaredType = expr.paramTypes[index];
-            if (declaredType && declaredType !== null) {
-              paramTypeMap[name] = declaredType;
-            }
-          });
-        }
-        
         const raw = bodyStmts.map((s) => stmtToNested(s, true, localParamMap)).filter(Boolean);
         lambdaBody = flattenNestedResults(raw);
-        
-        // Restore previous paramTypeMap
-        paramTypeMap = savedParamTypeMap;
         assertReturnTerminal(lambdaBody, "lambda body");
       }
       // If the lambda contains `jw_yield` calls (preprocessed from `yield`),
@@ -3744,23 +3710,9 @@ if (!nestedInput) {
     if (expr.type === "This") return selfRef();
     if (expr.type === "Index") {
       // Determine if this is string indexing or array indexing
-      let receiverType = null;
-      
-      if (expr.receiver) {
-        // Method 1: Check cached inferredType from visitExpression
-        if (expr.receiver.inferredType) {
-          receiverType = expr.receiver.inferredType;
-        }
-        // Method 2: Check if it's a string literal
-        else if (expr.receiver.type === "Literal" && expr.receiver.litType === "string") {
-          receiverType = "String";
-        }
-        // Method 3: For Var nodes, check paramTypeMap (populated from lambda/function paramTypes)
-        else if (expr.receiver.type === "Var" && expr.receiver.name && paramTypeMap[expr.receiver.name]) {
-          receiverType = paramTypeMap[expr.receiver.name];
-        }
-      }
-      
+      const receiverType = expr.receiver &&
+        (expr.receiver.inferredType ||
+          (expr.receiver.type === "Literal" && expr.receiver.litType === "string" ? "String" : null));
       const isStringIndex = receiverType === "String";
       if (isStringIndex) stringUsed = true;
       const strNested = exprToNested(expr.receiver, inMethod, paramMap);

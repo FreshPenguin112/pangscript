@@ -96,24 +96,27 @@ assert.match(emitted, /dogeiscutObject_builder/,
   'Expected object literal builder block to be emitted');
 const project = JSON.parse(emitted);
 const spriteBlocks = project.targets && project.targets[1] && project.targets[1].blocks ? project.targets[1].blocks : {};
-const builderEntry = Object.entries(spriteBlocks).find(([, block]) => block && block.opcode === 'dogeiscutObject_builder');
-assert.ok(builderEntry, 'Expected a dogeiscut object builder block in project.json');
-const [builderId, builder] = builderEntry;
-assert.strictEqual(builder.inputs.CURRENT_OBJECT[0], 1, 'Expected CURRENT_OBJECT to be emitted as a direct block-reference input');
-assert.strictEqual(typeof builder.inputs.CURRENT_OBJECT[1], 'string', 'Expected CURRENT_OBJECT input to reference a block id');
-assert.strictEqual(builder.inputs.SUBSTACK[0], 2, 'Expected builder substack to be emitted as a block reference');
+const builderEntries = Object.entries(spriteBlocks).filter(([, block]) => block && block.opcode === 'dogeiscutObject_builder');
+assert.ok(builderEntries.length >= 1, 'Expected at least one dogeiscut object builder block in project.json');
 const appendEntries = Object.entries(spriteBlocks).filter(([, block]) => block && block.opcode === 'dogeiscutObject_builderAppend');
 assert.ok(appendEntries.length > 0, 'Expected builder append blocks to be emitted');
-assert.ok(appendEntries.every(([, block]) => block.inputs.VALUE && block.inputs.VALUE[0] === 1 && block.inputs.VALUE[1] && block.inputs.VALUE[1][0] === 10), 'Expected builder append values to use text input type');
-assert.ok(appendEntries.length >= 2, 'Expected at least two builder append blocks');
-const appendById = Object.fromEntries(appendEntries);
-const firstAppendId = appendEntries.find(([, block]) => block.parent === builderId)[0];
-assert.ok(firstAppendId, 'Expected one builder append to be parented to the builder');
-let prevId = firstAppendId;
-for (let i = 1; i < appendEntries.length; i++) {
-  const nextId = appendById[prevId].next;
+// Find the builder whose appends have text values (the user fixture's builder)
+const textAppendEntries = appendEntries.filter(([, block]) => block.inputs.VALUE && block.inputs.VALUE[0] === 1 && block.inputs.VALUE[1] && block.inputs.VALUE[1][0] === 10);
+assert.ok(textAppendEntries.length >= 2, 'Expected at least two builder append blocks with text values');
+const textAppendById = Object.fromEntries(textAppendEntries);
+const textBuilderEntry = builderEntries.find(([bid]) => textAppendEntries.some(([, ab]) => ab.parent === bid));
+assert.ok(textBuilderEntry, 'Expected a builder parented to text-valued appends');
+const [textBuilderId, textBuilder] = textBuilderEntry;
+assert.strictEqual(textBuilder.inputs.CURRENT_OBJECT[0], 1, 'Expected CURRENT_OBJECT to be emitted as a direct block-reference input');
+assert.strictEqual(typeof textBuilder.inputs.CURRENT_OBJECT[1], 'string', 'Expected CURRENT_OBJECT input to reference a block id');
+assert.strictEqual(textBuilder.inputs.SUBSTACK[0], 2, 'Expected builder substack to be emitted as a block reference');
+const firstTextAppendId = textAppendEntries.find(([, block]) => block.parent === textBuilderId)[0];
+assert.ok(firstTextAppendId, 'Expected a text-valued builder append to be parented to its builder');
+let prevId = firstTextAppendId;
+for (let i = 1; i < textAppendEntries.length; i++) {
+  const nextId = textAppendById[prevId].next;
   assert.ok(nextId, `Expected append block ${prevId} to link to the next append block`);
-  assert.strictEqual(appendById[nextId].parent, prevId, 'Expected subsequent builder append to be parented to the previous append block');
+  assert.strictEqual(textAppendById[nextId].parent, prevId, 'Expected subsequent builder append to be parented to the previous append block');
   prevId = nextId;
 }
 

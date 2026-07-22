@@ -1,0 +1,45 @@
+on("flag", () => {
+    let _INTERNAL__runtime_typeof__AABBCCDDEE12123434__ = (v, isVarName, type, isPropGet, propName, propGetType) => {
+        let value = "";
+        if (isPropGet) {
+            if (propGetType == "object") {
+                if (!dogeiscutObject_has(v, propName)) {
+                    return "undefined";
+                }
+                value = dogeiscutObject_get(v, propName);
+            } else {
+                if (!dogeiscutObject_has(dogeiscutObject_parse(v), propName)) {
+                    return "undefined";
+                }
+                value = dogeiscutObject_get(dogeiscutObject_parse(v), propName);
+            }
+        } else if (isVarName) {
+            if (type == "global") {
+                if (!SPtempVars_varExists("global", v)) {
+                    return "undefined";
+                }
+                value = SPtempVars_getVar("global", v);
+            } else {
+                if (!SPtempVars_varExists("thread", v)) {
+                    return "undefined";
+                }
+                value = SPtempVars_getVar("thread", v);
+            }
+        } else {
+            value = v;
+        }
+        if (jwClass_getClass(value) != "null") {
+            return jwClass_getName(jwClass_getClass(value));
+        } else if (dogeiscutObject_is(operator_stringify(value))) {
+            return "object";
+        } else if (jwArray_validate(operator_stringify(value))) {
+            return "array";
+        } else if (sensing_regextest(value, "^[+-]?(?:\\d+\\.?\\d*|\\.\\d+)$", "g")) {
+            return "number";
+        } else if (sensing_regextest(value, "^(?:true|false)$", "g")) {
+            return "boolean";
+        } else {
+            return "string";
+        }
+    };
+});

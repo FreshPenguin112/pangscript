@@ -1763,7 +1763,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
       case "Var": {
         const found = lookupType(node.name);
         node.inferredType = found || "Any";
-        //console.log("DEBUG visitExpression Var:", node.name, "-> type:", node.inferredType);
+        console.log("DEBUG visitExpression Var:", node.name, "-> type:", node.inferredType);
         return node.inferredType;
       }
       case "Typeof": {
@@ -1822,9 +1822,9 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         return node.inferredType;
       }
       case "Index": {
-        //console.log("DEBUG visitExpression: processing Index, receiver type:", node.receiver?.type, "name:", node.receiver?.name);
+        console.log("DEBUG visitExpression: processing Index, receiver type:", node.receiver?.type, "name:", node.receiver?.name);
         const receiverType = node.receiver ? visitExpression(node.receiver) : "Any";
-        //console.log("DEBUG visitExpression: receiver type after visit:", receiverType);
+        console.log("DEBUG visitExpression: receiver type after visit:", receiverType);
         let inferred = "Any";
         if (receiverType && receiverType.endsWith("[]")) {
           inferred = normalizeTypeName(receiverType.slice(0, -2));
@@ -1834,7 +1834,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         }
         node.inferredType = inferred;
         if (node.receiver) node.receiver.inferredType = receiverType;
-        //console.log("DEBUG visitExpression: Index complete. Set node.receiver.inferredType =", receiverType);
+        console.log("DEBUG visitExpression: Index complete. Set node.receiver.inferredType =", receiverType);
         return inferred;
       }
       case "Ternary": {
@@ -1904,8 +1904,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         if (node.body && Array.isArray(node.body.body)) {
           const lambdaScope = new Map();
           
-            //console.log("LAMBDA_PARAMS", JSON.stringify(node.params), JSON.stringify(node.paramTypes));
-            if (Array.isArray(node.params)) {
+            console.log("LAMBDA_PARAMS", JSON.stringify(node.params), JSON.stringify(node.paramTypes));if (Array.isArray(node.params)) {
             node.params.forEach((name, index) => {
               const declaredType = node.paramTypes && node.paramTypes[index] ? normalizeTypeName(node.paramTypes[index]) : "Any";
               lambdaScope.set(name, declaredType);
@@ -3241,9 +3240,6 @@ if (!nestedInput) {
   // jwClass_getProp(SPtempVars_getVar(...)) patterns that required
   // post-processing.
 
-  // Track parameter types during lambda/function processing
-  let paramTypeMap = {};
-
   // Convert AST to nested JSON form (canonical representation generator expects)
   function exprToNested(expr, inMethod = false, paramMap = null) {
     if (!expr) return "";
@@ -3294,24 +3290,8 @@ if (!nestedInput) {
           });
         }
         const bodyStmts = defaultGuards.concat(expr.body.body);
-        
-        // Save previous paramTypeMap and populate it with this lambda's parameter types
-        const savedParamTypeMap = paramTypeMap;
-        paramTypeMap = {};
-        if (Array.isArray(expr.params) && Array.isArray(expr.paramTypes)) {
-          expr.params.forEach((name, index) => {
-            const declaredType = expr.paramTypes[index];
-            if (declaredType && declaredType !== null) {
-              paramTypeMap[name] = declaredType;
-            }
-          });
-        }
-        
         const raw = bodyStmts.map((s) => stmtToNested(s, true, localParamMap)).filter(Boolean);
         lambdaBody = flattenNestedResults(raw);
-        
-        // Restore previous paramTypeMap
-        paramTypeMap = savedParamTypeMap;
         assertReturnTerminal(lambdaBody, "lambda body");
       }
       // If the lambda contains `jw_yield` calls (preprocessed from `yield`),
@@ -3746,22 +3726,31 @@ if (!nestedInput) {
       // Determine if this is string indexing or array indexing
       let receiverType = null;
       
+      console.log("===DEBUG=== Index expression detected");
+      console.log("Receiver:", expr.receiver ? { type: expr.receiver.type, name: expr.receiver.name, inferredType: expr.receiver.inferredType } : null);
+      
       if (expr.receiver) {
         // Method 1: Check cached inferredType from visitExpression
         if (expr.receiver.inferredType) {
           receiverType = expr.receiver.inferredType;
+          console.log("✓ Method 1 (inferredType): Found", receiverType);
         }
         // Method 2: Check if it's a string literal
         else if (expr.receiver.type === "Literal" && expr.receiver.litType === "string") {
           receiverType = "String";
+          console.log("✓ Method 2 (literal): String literal");
         }
-        // Method 3: For Var nodes, check paramTypeMap (populated from lambda/function paramTypes)
-        else if (expr.receiver.type === "Var" && expr.receiver.name && paramTypeMap[expr.receiver.name]) {
-          receiverType = paramTypeMap[expr.receiver.name];
+        // Method 3: For Var nodes, check if this might be a typed parameter/variable
+        // Note: We cannot access scopes here since exprToNested is outside performStaticTypeAnalysis
+        else if (expr.receiver.type === "Var") {
+          console.log("✗ Method 3 failed: Var node '" + expr.receiver.name + "' has no inferredType set");
+          console.log("  This means visitExpression didn't run on this Var, or the type wasn't found");
         }
       }
       
       const isStringIndex = receiverType === "String";
+      console.log("Final decision: isStringIndex=", isStringIndex, "will use:", isStringIndex ? "operator_letter_of" : "jwArray_get");
+      
       if (isStringIndex) stringUsed = true;
       const strNested = exprToNested(expr.receiver, inMethod, paramMap);
       const rawIdx = exprToNested(expr.index, inMethod, paramMap);
