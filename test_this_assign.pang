@@ -1,0 +1,7 @@
+on("flag", *{
+  class Foo {
+    setBar() {
+      this.foo = 5;
+    }
+  }
+});

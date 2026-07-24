@@ -165,7 +165,13 @@ atom
     | memberExpr
     | arrayLiteral
     | objectLiteral
+    | dynamicLiteral
     | '(' expr ')'
+    ;
+
+dynamicLiteral
+    : 'dynamic' arrayLiteral
+    | 'dynamic' objectLiteral
     ;
 
 arrayLiteral

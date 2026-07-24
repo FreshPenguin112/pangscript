@@ -1,0 +1,18 @@
+on("flag", () => {
+    let test = {
+        foo: a => {return a .. "bar"}
+    }
+    print(test.foo("foo"), {seconds: 2});
+    //test.foo = "foo"
+    print(typeof test.foo)
+    print(operator_random(0, 1) == 0)
+    print(typeof q)
+    let b = [1, "foo", [1, 2, 3]]
+    print(typeof b, {seconds: 2})
+    print((b[2] as Array).length)
+    let d = dynamic {
+        foo: (a) => {return a .. "bar"},
+        bar: ["foo"]
+    };
+    print(d.bar.length)
+})

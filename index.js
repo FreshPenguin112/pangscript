@@ -51,7 +51,7 @@ function normalizeAndCheckType(type, targetType) {
     return ["string", "str", "text", "char"].includes(cleaned);
   }
   if (targetType === "array") {
-    return ["array", "list", "tuple", "vec"].includes(cleaned) || cleaned.endsWith("[]");
+    return ["array", "list", "tuple", "vec", "dynamicarray", "dynamic_array"].includes(cleaned) || cleaned.endsWith("[]");
   }
   if (targetType === "number") {
     return ["number", "num", "int", "float", "double", "decimal"].includes(cleaned);
@@ -171,6 +171,8 @@ function getTypeofLabel(type) {
   if (["object", "obj", "class"].includes(lowered)) return "object";
   if (["function", "func", "lambda"].includes(lowered)) return "function";
   if (["void", "undefined", "null"].includes(lowered)) return "undefined";
+  if (["dynamicarray", "dynamic_array"].includes(lowered)) return "dynamic_array";
+  if (["dynamicobject", "dynamic_object"].includes(lowered)) return "dynamic_object";
   if (raw.endsWith("[]")) return "array";
   if (raw.startsWith("Object{")) return "object";
   return null;
@@ -429,7 +431,25 @@ function __pw_newArgTemp() {
 }
 
 // Build a simple AST visitor by extending the generated visitor
+// Format an error message with source position from an AST node or ANTLR context.
+// If the node has a `loc` property (line/col), prepend it to the message.
+function formatError(msg, node) {
+  //console.log(node)
+  if (!node) return msg;
+  const loc = node.loc || (node.start ? { line: node.start.line, column: node.start.column } : null);
+  if (loc) return `${msg} [${loc.line}:${loc.column + 1}]`; // most text editors use one indexed columns, so add one
+  return msg;
+}
+
 class AstBuilder extends PangVisitor {
+  // Capture line/column from an ANTLR parse context for attaching to AST nodes.
+  loc(ctx) {
+    if (ctx && ctx.start && ctx.start.line !== undefined) {
+      return { line: ctx.start.line, column: ctx.start.column };
+    }
+    return null;
+  }
+
   normalizeTypeName(type) {
     if (!type) return "Any";
     const raw = String(type).trim();
@@ -484,6 +504,8 @@ class AstBuilder extends PangVisitor {
       }
       return `Object{${parts.join(",")}}`;
     }
+    if (node.type === "DynamicArray") return "DynamicArray";
+    if (node.type === "DynamicObject") return "DynamicObject";
     if (node.type === "Typeof") return "String";
     if (node.type === "Cast") return this.normalizeTypeName(node.typeName || node.inferredType || "Any");
     if (node.type === "Member") return "Any";
@@ -569,7 +591,7 @@ class AstBuilder extends PangVisitor {
     } else if (ibCtx) body = this.visit(ibCtx);
     else if (bCtx) body = this.visit(bCtx);
     else body = { type: "Block", body: [] };
-    return { type: "On", event, body };
+    return { type: "On", event, body, loc: this.loc(ctx) };
   }
 
   // inlineBlock now contains an `inlineBlockBody` instead of a normal `block`.
@@ -611,7 +633,7 @@ class AstBuilder extends PangVisitor {
         }
       }
     }
-    return { type: "Block", body: stmts };
+    return { type: "Block", body: stmts, loc: this.loc(ctx) };
   }
 
   visitBlock(ctx) {
@@ -620,7 +642,7 @@ class AstBuilder extends PangVisitor {
       const s = this.visit(ctx.statement(i));
       if (s != null) stmts.push(s);
     }
-    return { type: "Block", body: stmts };
+    return { type: "Block", body: stmts, loc: this.loc(ctx) };
   }
 
   visitPrintCall(ctx) {
@@ -629,7 +651,7 @@ class AstBuilder extends PangVisitor {
     const expr = exprCtx ? this.visit(exprCtx) : null;
     const optsCtx = ctx.options_ ? ctx.options_() : ctx.options ? ctx.options() : null;
     const options = optsCtx ? this.visitOptions_(optsCtx) : null;
-    return { type: "Print", expr, options };
+    return { type: "Print", expr, options, loc: this.loc(ctx) };
   }
 
   visitFunctionCall(ctx) {
@@ -774,20 +796,21 @@ class AstBuilder extends PangVisitor {
         }
       }
       if (chain.length <= 1) return null;
-      return { type: "Member", chain };
+      return { type: "Member", chain, loc: this.loc(ctx) };
     }
+    const loc = this.loc(ctx);
     let ast = null;
     const first = calls[0];
     if (first.baseNames) {
       if (first.baseNames.length <= 1)
-        ast = { type: "Call", name: first.baseNames[0] || "", args: first.args };
-      else ast = { type: "MemberCall", chain: first.baseNames, args: first.args };
+        ast = { type: "Call", name: first.baseNames[0] || "", args: first.args, loc };
+      else ast = { type: "MemberCall", chain: first.baseNames, args: first.args, loc };
     } else {
-      ast = { type: "Call", name: first.methodName || "", args: first.args };
+      ast = { type: "Call", name: first.methodName || "", args: first.args, loc };
     }
     for (let k = 1; k < calls.length; k++) {
       const c = calls[k];
-      ast = { type: "MemberCall", chain: [ast, c.methodName], args: c.args };
+      ast = { type: "MemberCall", chain: [ast, c.methodName], args: c.args, loc };
     }
 
     // Attach any trailing property accesses (e.g., `.num`) collected earlier
@@ -796,7 +819,7 @@ class AstBuilder extends PangVisitor {
     if (trailingProps && trailingProps.length > 0) {
       for (let pi = 0; pi < trailingProps.length; pi++) {
         const pname = trailingProps[pi];
-        ast = { type: "Member", chain: [ast, pname] };
+        ast = { type: "Member", chain: [ast, pname], loc };
       }
     }
     return ast;
@@ -967,7 +990,7 @@ class AstBuilder extends PangVisitor {
       const e = exprs[i];
       if (e) elements.push(this.visit(e));
     }
-    return { type: "Array", elements };
+    return { type: "Array", elements, loc: this.loc(ctx) };
   }
 
   visitObjectLiteral(ctx) {
@@ -1019,7 +1042,19 @@ class AstBuilder extends PangVisitor {
     // Diagnostic: log props and inferred types (temporary)
     // mark that objects are used so emitter includes the Objects extension
     objectsUsed = true;
-    return { type: "Object", props };
+    return { type: "Object", props, loc: this.loc(ctx) };
+  }
+
+  visitDynamicLiteral(ctx) {
+    if (ctx.arrayLiteral && ctx.arrayLiteral()) {
+      const inner = this.visit(ctx.arrayLiteral());
+      return { type: "DynamicArray", elements: inner.elements, loc: this.loc(ctx) };
+    }
+    if (ctx.objectLiteral && ctx.objectLiteral()) {
+      const inner = this.visit(ctx.objectLiteral());
+      return { type: "DynamicObject", props: inner.props, loc: this.loc(ctx) };
+    }
+    return null;
   }
 
   visitClassDecl(ctx) {
@@ -1052,7 +1087,7 @@ class AstBuilder extends PangVisitor {
         else if (si.continueStmt && si.continueStmt()) members.push(this.visit(si.continueStmt()));
       }
     }
-    return { type: "Class", name, extends: ext, members };
+    return { type: "Class", name, extends: ext, members, loc: this.loc(ctx) };
   }
 
   visitClassMember(ctx) {
@@ -1134,6 +1169,7 @@ class AstBuilder extends PangVisitor {
       getter: isGetter,
       setter: isSetter,
       generator: isGenerator,
+      loc: this.loc(ctx),
     };
   }
 
@@ -1151,29 +1187,30 @@ class AstBuilder extends PangVisitor {
     } catch (e) { }
     const inferredType = value ? this.inferType(value) : null;
     if (!hasExplicitKind && ctx.expr && ctx.expr()) {
-      return { type: "Assign", name, value, targetType: typeAnnotation || null };
+      return { type: "Assign", name, value, targetType: typeAnnotation || null, loc: this.loc(ctx) };
     }
     if (!value) return; // this way variables made like this: `let foo;` get their type as undefined, if they were made they would be set to an empty string, which runtime typeof resolves to type string and not undefined, it only does undefined for non existant variables, so we just dont make a declaration
-    return { type: "Declare", kind: kindToken, name, value, typeAnnotation, inferredType };
+    return { type: "Declare", kind: kindToken, name, value, typeAnnotation, inferredType, loc: this.loc(ctx) };
   }
 
   visitReturn(ctx) {
     // 'return' expr?
     const exprCtx = ctx.expr ? ctx.expr() : null;
     const value = exprCtx ? this.visit(exprCtx) : null;
-    return { type: "Return", value };
+    return { type: "Return", value, loc: this.loc(ctx) };
   }
 
   visitAssignStmt(ctx) {
     if (!ctx.expr || !ctx.expr()) return null;
     const value = this.visit(ctx.expr());
+    const loc = this.loc(ctx);
     // If parser provides memberExpr (member chain), prefer that form
     try {
       if (ctx.memberExpr && typeof ctx.memberExpr === "function" && ctx.memberExpr()) {
         const me = ctx.memberExpr();
         const raw = me.getText ? me.getText() : "";
         const chain = raw ? raw.split(".") : [];
-        return { type: "Assign", memberChain: chain, value };
+        return { type: "Assign", memberChain: chain, value, loc };
       }
     } catch (e) { }
 
@@ -1192,7 +1229,7 @@ class AstBuilder extends PangVisitor {
         if (left) {
           const chain = left.split(".");
           if (Array.isArray(chain) && chain.length >= 2) {
-            return { type: "Assign", memberChain: chain, value };
+            return { type: "Assign", memberChain: chain, value, loc };
           }
         }
       }
@@ -1200,7 +1237,7 @@ class AstBuilder extends PangVisitor {
 
     // Final fallback: IDENT or THIS token (single-name assignment)
     const name = ctx.IDENT ? ctx.IDENT().getText() : ctx.THIS ? ctx.THIS().getText() : "";
-    return { type: "Assign", name, value };
+    return { type: "Assign", name, value, loc };
   }
 
   visitIfStmt(ctx) {
@@ -1236,7 +1273,7 @@ class AstBuilder extends PangVisitor {
       elseBlock =
         s && s.type === "Block" ? s : { type: "Block", body: s ? (Array.isArray(s) ? s : [s]) : [] };
     }
-    return { type: "If", cases, elseBlock };
+    return { type: "If", cases, elseBlock, loc: this.loc(ctx) };
   }
 
   visitForStmt(ctx) {
@@ -1289,15 +1326,15 @@ class AstBuilder extends PangVisitor {
       }
       body = { type: "Block", body: stmts };
     } else body = { type: "Block", body: [] };
-    return { type: "For", init, cond, update, body };
+    return { type: "For", init, cond, update, body, loc: this.loc(ctx) };
   }
 
   visitBreakStmt(ctx) {
-    return { type: "Break" };
+    return { type: "Break", loc: this.loc(ctx) };
   }
 
   visitContinueStmt(ctx) {
-    return { type: "Continue" };
+    return { type: "Continue", loc: this.loc(ctx) };
   }
 
   visitWhileStmt(ctx) {
@@ -1315,25 +1352,26 @@ class AstBuilder extends PangVisitor {
       }
       body = { type: "Block", body: stmts };
     } else body = { type: "Block", body: [] };
-    return { type: "While", cond, body };
+    return { type: "While", cond, body, loc: this.loc(ctx) };
   }
 
   visitExpr(ctx) {
+    const loc = this.loc(ctx);
     if (ctx.children && ctx.children.some((c) => c && c.getText && c.getText() === "as")) {
       const targetExpr = this.visit(ctx.expr(0));
       const targetType = ctx.typeName ? this.visit(ctx.typeName()) : null;
-      return { type: "Cast", expr: targetExpr, typeName: targetType };
+      return { type: "Cast", expr: targetExpr, typeName: targetType, loc };
     }
 
     // Prefer explicit unary handling for leading unary operators
     if (ctx.children && ctx.children[0] && ctx.children[0].getText) {
       const firstTok = ctx.children[0].getText();
       if (firstTok === "typeof") {
-        return { type: "Typeof", expr: this.visit(ctx.expr(0)) };
+        return { type: "Typeof", expr: this.visit(ctx.expr(0)), loc };
       }
       // Handle *typeof (force runtime typeof, bypassing compile-time resolution)
       if (firstTok === "*" && ctx.children[1] && ctx.children[1].getText && ctx.children[1].getText() === "typeof") {
-        return { type: "Typeof", expr: this.visit(ctx.expr(0)), forceRuntime: true };
+        return { type: "Typeof", expr: this.visit(ctx.expr(0)), forceRuntime: true, loc };
       }
       if (firstTok === "new") {
         // new <functionCall>
@@ -1343,7 +1381,7 @@ class AstBuilder extends PangVisitor {
           if (callee && callee.type === "Call" && typeof callee.name === "string") className = callee.name;
           else if (callee && callee.type === "MemberCall" && Array.isArray(callee.chain) && callee.chain.length > 0)
             className = callee.chain[callee.chain.length - 1];
-          return { type: "New", callee, className };
+          return { type: "New", callee, className, loc };
         }
       }
       if (
@@ -1354,7 +1392,7 @@ class AstBuilder extends PangVisitor {
         firstTok === "++" ||
         firstTok === "--"
       ) {
-        return { type: "Unary", op: firstTok, operand: this.visit(ctx.expr(0)) };
+        return { type: "Unary", op: firstTok, operand: this.visit(ctx.expr(0)), loc };
       }
     }
 
@@ -1367,7 +1405,7 @@ class AstBuilder extends PangVisitor {
         const cond = this.visit(ctx.expr(0));
         const thenExpr = this.visit(ctx.expr(1));
         const elseExpr = this.visit(ctx.expr(2));
-        return { type: "Ternary", cond, thenExpr, elseExpr };
+        return { type: "Ternary", cond, thenExpr, elseExpr, loc };
       }
     }
 
@@ -1396,6 +1434,7 @@ class AstBuilder extends PangVisitor {
         operators.push(n.children[1].getText());
         helper(n.expr(1));
       } else {
+        const nloc = self.loc(n);
         // no-op: keep helper focused on atomic node handling
         // atomic node: handle primary/function/print/ident/number/string specially
         // If the node is a raw terminal containing a numeric string (e.g., '-2'),
@@ -1404,7 +1443,7 @@ class AstBuilder extends PangVisitor {
         if (n && n.getText && typeof n.getText === "function") {
           const txt = n.getText();
           if (/^-?\d+(?:\.\d+)?$/.test(txt)) {
-            operands.push({ type: "Literal", litType: "number", value: Number(txt) });
+            operands.push({ type: "Literal", litType: "number", value: Number(txt), loc: nloc });
             return;
           }
         }
@@ -1422,30 +1461,30 @@ class AstBuilder extends PangVisitor {
           return;
         }
         if (n.NUMBER && typeof n.NUMBER === "function" && n.NUMBER()) {
-          operands.push({ type: "Literal", litType: "number", value: Number(n.NUMBER().getText()) });
+          operands.push({ type: "Literal", litType: "number", value: Number(n.NUMBER().getText()), loc: nloc });
           return;
         }
         if (n.STRING && typeof n.STRING === "function" && n.STRING()) {
           const s = n.STRING().getText();
           try {
-            operands.push({ type: "Literal", litType: "string", value: JSON.parse(s) });
+            operands.push({ type: "Literal", litType: "string", value: JSON.parse(s), loc: nloc });
             return;
           } catch (e) {
-            operands.push({ type: "Literal", litType: "string", value: s.replace(/^"|"$/g, "") });
+            operands.push({ type: "Literal", litType: "string", value: s.replace(/^"|"$/g, ""), loc: nloc });
             return;
           }
         }
         if (n.getText && (n.getText() === "true" || n.getText() === "false")) {
-          operands.push({ type: "Literal", litType: "boolean", value: n.getText() === "true" });
+          operands.push({ type: "Literal", litType: "boolean", value: n.getText() === "true", loc: nloc });
           return;
         }
         //console.log(n)
         if (n.THIS && typeof n.THIS === "function" && n.THIS()) {
-          operands.push({ type: "This" });
+          operands.push({ type: "This", loc: nloc });
           return;
         }
         if (n.IDENT && typeof n.IDENT === "function" && n.IDENT()) {
-          operands.push({ type: "Var", name: n.IDENT().getText() });
+          operands.push({ type: "Var", name: n.IDENT().getText(), loc: nloc });
           return;
         }
         // fallback to visiting the node
@@ -1457,15 +1496,15 @@ class AstBuilder extends PangVisitor {
     helper(ctx);
 
     if (operators.length === 0) {
-      return operands[0] || null;
+      const result = operands[0] || null;
+      if (result && typeof result === "object" && !result.loc) result.loc = loc;
+      return result;
     }
 
-    // Precedence levels (high -> low). Matches JavaScript operator precedence order.
     // Precedence levels (high -> low). Matches JavaScript operator precedence order.
     const PRECEDENCE_LEVELS = [
       ["**"],
       ["*", "/", "%"],
-      // include string concat '..' alongside + and - so concatenation chains are combined
       ["+", "-", ".."],
       ["<<", ">>", ">>>"],
       ["<", "<=", ">", ">="],
@@ -1482,13 +1521,13 @@ class AstBuilder extends PangVisitor {
 
     for (let level = 0; level < PRECEDENCE_LEVELS.length; level++) {
       const levelOps = PRECEDENCE_LEVELS[level];
-      const rightAssoc = level === 0; // `**` is right-associative
+      const rightAssoc = level === 0;
       if (rightAssoc) {
         for (let i = ops.length - 1; i >= 0; i--) {
           if (levelOps.includes(ops[i])) {
             const left = values[i];
             const right = values[i + 1];
-            const combined = { type: "Binary", op: ops[i], left, right };
+            const combined = { type: "Binary", op: ops[i], left, right, loc };
             values.splice(i, 2, combined);
             ops.splice(i, 1);
           }
@@ -1498,7 +1537,7 @@ class AstBuilder extends PangVisitor {
           if (levelOps.includes(ops[i])) {
             const left = values[i];
             const right = values[i + 1];
-            const combined = { type: "Binary", op: ops[i], left, right };
+            const combined = { type: "Binary", op: ops[i], left, right, loc };
             values.splice(i, 2, combined);
             ops.splice(i, 1);
             i--;
@@ -1507,52 +1546,57 @@ class AstBuilder extends PangVisitor {
       }
     }
 
-    return values[0] || null;
+    const result = values[0] || null;
+    if (result && typeof result === "object" && !result.loc) result.loc = loc;
+    return result;
   }
   // Handle the new `atom` grammar rule introduced when `primary` was split.
   // This mirrors the previous primary-level literal/ident/member handling
   // so generated visitors for `atom` will produce the same AST shapes.
   visitAtom(ctx) {
     if (!ctx) return null;
+    const loc = this.loc(ctx);
     if (ctx.NUMBER && typeof ctx.NUMBER === "function" && ctx.NUMBER()) {
       const txt = ctx.NUMBER().getText();
       const val = /^0[xX]/.test(txt) ? parseInt(txt, 16) : Number(txt);
-      return { type: "Literal", litType: "number", value: val };
+      return { type: "Literal", litType: "number", value: val, loc };
     }
     if (ctx.STRING && typeof ctx.STRING === "function" && ctx.STRING()) {
       const s = ctx.STRING().getText();
       try {
-        return { type: "Literal", litType: "string", value: JSON.parse(s) };
+        return { type: "Literal", litType: "string", value: JSON.parse(s), loc };
       } catch (e) {
-        return { type: "Literal", litType: "string", value: s.replace(/^\"|\"$/g, "") };
+        return { type: "Literal", litType: "string", value: s.replace(/^\"|\"$/g, ""), loc };
       }
     }
     if (ctx.getText && (ctx.getText() === "true" || ctx.getText() === "false"))
-      return { type: "Literal", litType: "boolean", value: ctx.getText() === "true" };
-    if (ctx.getText && ctx.getText() === "this") return { type: "This" };
+      return { type: "Literal", litType: "boolean", value: ctx.getText() === "true", loc };
+    if (ctx.getText && ctx.getText() === "this") return { type: "This", loc };
     if (ctx.printCall && ctx.printCall()) return this.visit(ctx.printCall());
     if (ctx.inlineBlock && ctx.inlineBlock()) {
       const body = this.visit(ctx.inlineBlock());
-      return { type: "Lambda", params: [], body };
+      return { type: "Lambda", params: [], body, loc };
     }
     if (ctx.arrowFunction && ctx.arrowFunction()) return this.visit(ctx.arrowFunction());
     if (ctx.arrayLiteral && ctx.arrayLiteral()) return this.visit(ctx.arrayLiteral());
     if (ctx.objectLiteral && ctx.objectLiteral()) return this.visit(ctx.objectLiteral());
+    if (ctx.dynamicLiteral && ctx.dynamicLiteral()) return this.visit(ctx.dynamicLiteral());
     if (ctx.functionCall && ctx.functionCall()) return this.visit(ctx.functionCall());
     if (ctx.memberExpr && ctx.memberExpr()) {
       const chain = this.visit(ctx.memberExpr());
-      if (Array.isArray(chain) && chain.length === 1) return { type: "Var", name: chain[0] };
-      return { type: "Member", chain };
+      if (Array.isArray(chain) && chain.length === 1) return { type: "Var", name: chain[0], loc };
+      return { type: "Member", chain, loc };
     }
     // parenthesized expression: atom may include '(' expr ')'
     if (ctx.expr && ctx.expr()) {
       const e = Array.isArray(ctx.expr()) ? ctx.expr(0) : ctx.expr();
       if (e) return this.visit(e);
     }
-    if (ctx.IDENT && ctx.IDENT()) return { type: "Var", name: ctx.IDENT().getText() };
+    if (ctx.IDENT && ctx.IDENT()) return { type: "Var", name: ctx.IDENT().getText(), loc };
     return null;
   }
   visitPrimary(ctx) {
+    const loc = this.loc(ctx);
     // Normalize primary by delegating to `atom` when present (new grammar),
     // otherwise fall back to legacy token checks.
     let base = null;
@@ -1562,46 +1606,48 @@ class AstBuilder extends PangVisitor {
       if (ctx.NUMBER && typeof ctx.NUMBER === "function" && ctx.NUMBER()) {
         const txt = ctx.NUMBER().getText();
         const val = /^0[xX]/.test(txt) ? parseInt(txt, 16) : Number(txt);
-        base = { type: "Literal", litType: "number", value: val };
+        base = { type: "Literal", litType: "number", value: val, loc };
       } else if (ctx.STRING && typeof ctx.STRING === "function" && ctx.STRING()) {
         const s = ctx.STRING().getText();
         try {
-          base = { type: "Literal", litType: "string", value: JSON.parse(s) };
+          base = { type: "Literal", litType: "string", value: JSON.parse(s), loc };
         } catch (e) {
-          base = { type: "Literal", litType: "string", value: s.replace(/^\"|\"$/g, "") };
+          base = { type: "Literal", litType: "string", value: s.replace(/^\"|\"$/g, ""), loc };
         }
       } else if (ctx.getText && (ctx.getText() === "true" || ctx.getText() === "false")) {
-        base = { type: "Literal", litType: "boolean", value: ctx.getText() === "true" };
+        base = { type: "Literal", litType: "boolean", value: ctx.getText() === "true", loc };
       } else if (ctx.getText && ctx.getText() === "this") {
-        base = { type: "This" };
+        base = { type: "This", loc };
       } else if (ctx.printCall && ctx.printCall()) {
         base = this.visit(ctx.printCall());
       } else if (ctx.inlineBlock && ctx.inlineBlock()) {
         const body = this.visit(ctx.inlineBlock());
-        base = { type: "Lambda", params: [], body };
+        base = { type: "Lambda", params: [], body, loc };
       } else if (ctx.arrowFunction && ctx.arrowFunction()) {
         base = this.visit(ctx.arrowFunction());
       } else if (ctx.arrayLiteral && ctx.arrayLiteral()) {
         base = this.visit(ctx.arrayLiteral());
       } else if (ctx.objectLiteral && ctx.objectLiteral()) {
         base = this.visit(ctx.objectLiteral());
+      } else if (ctx.dynamicLiteral && ctx.dynamicLiteral()) {
+        base = this.visit(ctx.dynamicLiteral());
       } else if (ctx.functionCall && ctx.functionCall()) {
         base = this.visit(ctx.functionCall());
       } else if (ctx.memberExpr && ctx.memberExpr()) {
         const chain = this.visit(ctx.memberExpr());
-        if (Array.isArray(chain) && chain.length === 1) base = { type: "Var", name: chain[0] };
-        else base = { type: "Member", chain };
+        if (Array.isArray(chain) && chain.length === 1) base = { type: "Var", name: chain[0], loc };
+        else base = { type: "Member", chain, loc };
       } else if (ctx.expr && ctx.expr()) {
         const e = Array.isArray(ctx.expr()) ? ctx.expr(0) : ctx.expr();
         if (e) base = this.visit(e);
       } else if (ctx.IDENT && ctx.IDENT()) {
-        base = { type: "Var", name: ctx.IDENT().getText() };
+        base = { type: "Var", name: ctx.IDENT().getText(), loc };
       } else base = null;
     }
 
     // Postfix ++/--: when present wrap the base into a Postfix AST node
-    if (ctx.INCR && ctx.INCR()) return { type: "Postfix", op: "++", operand: base };
-    if (ctx.DECR && ctx.DECR()) return { type: "Postfix", op: "--", operand: base };
+    if (ctx.INCR && ctx.INCR()) return { type: "Postfix", op: "++", operand: base, loc };
+    if (ctx.DECR && ctx.DECR()) return { type: "Postfix", op: "--", operand: base, loc };
 
     const bracketExprs = [];
     if (ctx.children) {
@@ -1625,9 +1671,6 @@ class AstBuilder extends PangVisitor {
             j++;
           }
           if (inner) bracketExprs.push(inner);
-
-          // FIX: Advance the outer loop past the parsed bracket expression
-          // so it doesn't try to parse the inner expression's tokens as primary tokens.
           i = j;
         }
       }
@@ -1635,7 +1678,7 @@ class AstBuilder extends PangVisitor {
     if (bracketExprs.length > 0) {
       let current = base;
       for (const exprCtx of bracketExprs) {
-        current = { type: "Index", receiver: current, index: this.visit(exprCtx) };
+        current = { type: "Index", receiver: current, index: this.visit(exprCtx), loc };
       }
       base = current;
     }
@@ -1650,7 +1693,6 @@ class AstBuilder extends PangVisitor {
           const nextCh = ctx.children[i + 1];
           const propText = nextCh && nextCh.getText ? nextCh.getText() : null;
           if (!propText || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(propText)) continue;
-          // Check if followed by '('
           let hasParens = false;
           let argExprs = [];
           for (let k = i + 2; k < ctx.children.length; k++) {
@@ -1658,7 +1700,6 @@ class AstBuilder extends PangVisitor {
             const txt = t && t.getText ? t.getText() : null;
             if (txt === "(") {
               hasParens = true;
-              // Collect argument expressions
               for (let ak = k + 1; ak < ctx.children.length; ak++) {
                 const inner = ctx.children[ak];
                 if (inner && inner.getText && inner.getText() === ")") break;
@@ -1676,16 +1717,17 @@ class AstBuilder extends PangVisitor {
             if (txt === "." || txt === "[") break;
           }
           if (hasParens) {
-            current = { type: "MemberCall", chain: [current, propText], args: argExprs };
+            current = { type: "MemberCall", chain: [current, propText], args: argExprs, loc };
           } else {
             const chain = current && current.type ? [current, propText] : [propText];
-            current = { type: "Member", chain };
+            current = { type: "Member", chain, loc };
           }
         }
       }
       if (current !== base) return current;
     }
 
+    if (base && typeof base === "object" && !base.loc) base.loc = loc;
     return base;
   }
   // Build options object from options_ context
@@ -1825,6 +1867,10 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
     if (declared === "Array" && inferred === "Array") return true;
     if (declared === "Object" && inferred === "Object") return true;
     if (declared === "Function" && inferred === "Function") return true;
+    if (declared === "DynamicArray" && (inferred === "Array" || inferred.endsWith("[]"))) return true;
+    if (inferred === "DynamicArray" && (declared === "Array" || declared.endsWith("[]"))) return true;
+    if (declared === "DynamicObject" && (inferred === "Object" || inferred.startsWith("Object{"))) return true;
+    if (inferred === "DynamicObject" && (declared === "Object" || declared.startsWith("Object{"))) return true;
     return false;
   }
 
@@ -1842,6 +1888,8 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
       if (propertyName === "length" || propertyName === "charCodeAt" || propertyName === "indexOf" || propertyName === "lastIndexOf") return "Number";
       if (propertyName === "includes" || propertyName === "startsWith" || propertyName === "endsWith") return "Boolean";
     }
+    const lowerNorm = normalized.toLowerCase();
+    if (propertyName === "length" && ["array", "list", "tuple", "dynamicarray"].includes(lowerNorm)) return "Number";
     const shapeMatch = normalized.match(/^Object\{(.+)\}$/);
     if (!shapeMatch) return null;
     const parts = shapeMatch[1].split(",");
@@ -1944,9 +1992,15 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
           innerType !== "Any" &&
           !isTypeCompatible(target, innerType)
         ) {
-          throw new Error(`Type error: cannot cast ${innerType} to ${target}`);
+          throw new Error(formatError(`Type error: cannot cast ${innerType} to ${target}`, node));
         }
         node.inferredType = target || innerType || "Any";
+        if (containsCast(node.expr)) {
+          console.warn(formatError(
+            `Warning: nested 'as' casts can be unclear. Consider using intermediate variables, e.g.: const a1 = expr as Type; const b1 = a1.prop as Type; ...`,
+            node
+          ));
+        }
         return node.inferredType;
       }
       case "Index": {
@@ -2045,6 +2099,23 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         node.inferredType = shaped;
         return node.inferredType;
       }
+      case "DynamicArray": {
+        if (node.elements) {
+          for (const item of node.elements) visitExpression(item);
+        }
+        node.inferredType = "DynamicArray";
+        return "DynamicArray";
+      }
+      case "DynamicObject": {
+        if (node.props) {
+          for (const p of node.props) {
+            if (p && p.value) visitExpression(p.value);
+            if (p && p.computedExpr) visitExpression(p.computedExpr);
+          }
+        }
+        node.inferredType = "DynamicObject";
+        return "DynamicObject";
+      }
       case "Lambda": {
         const lambdaReturnType = node.returnType ? normalizeTypeName(node.returnType) : null;
         node.inferredType = lambdaReturnType || "Function";
@@ -2083,11 +2154,42 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
           ? inferPropertyTypeFromShape(receiverType, propertyName)
           : null;
         node.inferredType = inferredPropertyType || "Any";
+        if (
+          !inferredPropertyType &&
+          (receiverType === "DynamicObject" || receiverType === "DynamicArray")
+        ) {
+          node.isDynamicProperty = true;
+        }
         return node.inferredType;
       }
       default:
         return "Any";
     }
+  }
+
+  function containsCast(node) {
+    if (!node || typeof node !== "object") return false;
+    if (node.type === "Cast") return true;
+    if (node.expr && containsCast(node.expr)) return true;
+    if (node.left && containsCast(node.left)) return true;
+    if (node.right && containsCast(node.right)) return true;
+    if (node.operand && containsCast(node.operand)) return true;
+    if (node.cond && containsCast(node.cond)) return true;
+    if (node.thenExpr && containsCast(node.thenExpr)) return true;
+    if (node.elseExpr && containsCast(node.elseExpr)) return true;
+    if (node.receiver && containsCast(node.receiver)) return true;
+    if (node.index && containsCast(node.index)) return true;
+    if (Array.isArray(node.chain)) {
+      for (const item of node.chain) {
+        if (typeof item === "object" && containsCast(item)) return true;
+      }
+    }
+    if (Array.isArray(node.args)) {
+      for (const arg of node.args) {
+        if (containsCast(arg)) return true;
+      }
+    }
+    return false;
   }
 
   function visitStatements(stmts, scopeOverride = null, methodReturnType = null) {
@@ -2107,19 +2209,29 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
 
     switch (stmt.type) {
       case "Declare": {
+        if (!lenientMode && stmt.name) {
+          if (stmt.name.startsWith("__")) {
+            console.error(formatError(`Variables starting with "__" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
+          if (stmt.name.startsWith("_INTERNAL")) {
+            console.error(formatError(`Variables starting with "_INTERNAL" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
+        }
         const explicitType = stmt.typeAnnotation ? normalizeTypeName(stmt.typeAnnotation) : null;
         const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
         let effectiveType = explicitType || valueType || "Any";
         if (!lenientMode && stmt.typeAnnotation && stmt.value && !isTypeCompatible(effectiveType, valueType)) {
-          throw new Error(`Type error: cannot assign ${valueType} to ${effectiveType}`);
+          throw new Error(formatError(`Type error: cannot assign ${valueType} to ${effectiveType}`, stmt));
         }
         if (stmt.typeAnnotation && !stmt.value) {
           effectiveType = explicitType;
         } else if (!stmt.typeAnnotation && stmt.value && !isConcreteType(valueType)) {
           if (!lenientMode) {
-            throw new Error(
+            throw new Error(formatError(
               `Type inference error: cannot infer a concrete type for ${stmt.name} without an explicit type annotation`,
-            );
+              stmt));
           }
         }
         stmt.inferredType = effectiveType;
@@ -2128,10 +2240,36 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
         break;
       }
       case "Assign": {
+        if (!lenientMode && stmt.name) {
+          if (stmt.name.startsWith("__")) {
+            console.error(formatError(`Variables starting with "__" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
+          if (stmt.name.startsWith("_INTERNAL")) {
+            console.error(formatError(`Variables starting with "_INTERNAL" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
+        }
         const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
+
+        // Type checking for member chain assignments (e.g., `obj.prop = val`)
+        if (stmt.memberChain && Array.isArray(stmt.memberChain) && stmt.memberChain.length >= 2) {
+          const receiverName = stmt.memberChain[0];
+          const propName = stmt.memberChain[stmt.memberChain.length - 1];
+          if (typeof receiverName === "string") {
+            const receiverType = lookupType(receiverName);
+            if (receiverType) {
+              const propType = inferPropertyTypeFromShape(receiverType, propName);
+              if (propType && !isTypeCompatible(propType, valueType)) {
+                throw new Error(formatError(`Type error: cannot assign ${valueType} to ${propName} (expected ${propType})`, stmt));
+              }
+            }
+          }
+        }
+
         const targetType = lookupType(stmt.name) || stmt.targetType || null;
         if (!lenientMode && targetType && !isTypeCompatible(targetType, valueType)) {
-          throw new Error(`Type error: cannot assign ${valueType} to ${targetType}`);
+          throw new Error(formatError(`Type error: cannot assign ${valueType} to ${targetType}`, stmt));
         }
         if (stmt.name) {
           const mergedType = targetType || valueType;
@@ -2148,7 +2286,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
       case "Return": {
         const valueType = stmt.value ? visitExpression(stmt.value) : "Any";
         if (!lenientMode && methodReturnType && !isTypeCompatible(methodReturnType, valueType)) {
-          throw new Error(`Type error: return value ${valueType} does not match ${methodReturnType}`);
+          throw new Error(formatError(`Type error: return value ${valueType} does not match ${methodReturnType}`, stmt));
         }
         break;
       }
@@ -2173,7 +2311,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
                 if (declaredType && declaredType !== "Any") {
                   const valueType = child.value ? visitExpression(child.value) : "Any";
                   if (!isTypeCompatible(declaredType, valueType)) {
-                    throw new Error(`Type error: cannot assign ${valueType} to ${declaredType}`);
+                    throw new Error(formatError(`Type error: cannot assign ${valueType} to ${declaredType}`, child));
                   }
                 }
               }
@@ -2189,7 +2327,7 @@ function performStaticTypeAnalysis(rootAst, lenientMode = false) {
                 if (declaredType && declaredType !== "Any") {
                   const valueType = child.value ? visitExpression(child.value) : "Any";
                   if (!isTypeCompatible(declaredType, valueType)) {
-                    throw new Error(`Type error: cannot assign ${valueType} to ${declaredType}`);
+                    throw new Error(formatError(`Type error: cannot assign ${valueType} to ${declaredType}`, child));
                   }
                 }
               }
@@ -2421,13 +2559,29 @@ if (!nestedInput) {
       }
       switch (stmt.type) {
         case "Declare":
+          if (stmt.name && stmt.name.startsWith("__")) {
+            console.error(formatError(`Variables starting with "__" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
+          if (stmt.name && stmt.name.startsWith("_INTERNAL")) {
+            console.error(formatError(`Variables starting with "_INTERNAL" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
           if (stmt.kind === "const") {
             consts.add(stmt.name);
           }
           break;
         case "Assign":
+          if (stmt.name && stmt.name.startsWith("__")) {
+            console.error(formatError(`Variables starting with "__" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
+          if (stmt.name && stmt.name.startsWith("_INTERNAL")) {
+            console.error(formatError(`Variables starting with "_INTERNAL" are reserved for the compiler, do not use them. ("${stmt.name}")`, stmt));
+            process.exit(1);
+          }
           if (consts.has(stmt.name)) {
-            throw new Error(`Cannot reassign to const '${stmt.name}'`);
+            throw new Error(formatError(`Cannot reassign to const '${stmt.name}'`, stmt));
           }
           break;
         case "If":
@@ -2439,11 +2593,9 @@ if (!nestedInput) {
           break;
         case "For":
           if (stmt.init) {
-            // init may be Declare or Assign. Disallow declaring `const` in for-loop header.
             if (stmt.init.type === "Declare" && stmt.init.kind === "const") {
-              throw new Error(`Cannot declare const '${stmt.init.name}' in for-loop header`);
+              throw new Error(formatError(`Cannot declare const '${stmt.init.name}' in for-loop header`, stmt.init));
             }
-            // If init declares a const elsewhere (not in for header), we still track it.
             if (stmt.init.type === "Declare" && stmt.init.kind === "const") {
               consts.add(stmt.init.name);
             }
@@ -2452,7 +2604,7 @@ if (!nestedInput) {
           if (stmt.cond) walkExpression(stmt.cond);
           if (stmt.update) {
             if (stmt.update.type === "Assign" && consts.has(stmt.update.name)) {
-              throw new Error(`Cannot reassign to const '${stmt.update.name}'`);
+              throw new Error(formatError(`Cannot reassign to const '${stmt.update.name}'`, stmt.update));
             }
             // update can be an expression or assign; walk accordingly
             if (stmt.update.type === "Assign") walkStatement(stmt.update);
@@ -2529,7 +2681,7 @@ if (!nestedInput) {
         if (!s) continue;
         if (s.type === "Break" || s.type === "Continue") {
           if (i < stmts.length - 1)
-            throw new Error(`Cannot have code after '${s.type.toLowerCase()}' in the same block`);
+            throw new Error(formatError(`Cannot have code after '${s.type.toLowerCase()}' in the same block`, s));
         }
         // Recurse into nested blocks where break rules also apply
         if (s.type === "If") {
@@ -2927,7 +3079,7 @@ if (!nestedInput) {
           info.generator = info.generator || !!m.generator;
           // Error if method is marked as both getter and setter
           if (m.getter && m.setter) {
-            throw new Error(`Class '${name}': method '${m.name}' cannot be both a getter and a setter`);
+            throw new Error(formatError(`Class '${name}': method '${m.name}' cannot be both a getter and a setter`, m));
           }
           function findReturnedClass(node) {
             if (!node) return null;
@@ -3462,8 +3614,26 @@ if (!nestedInput) {
         
         // Restore previous paramTypeMap
         paramTypeMap = savedParamTypeMap;
-        assertReturnTerminal(lambdaBody, "lambda body");
+        assertReturnTerminal(lambdaBody, "lambda body", expr);
       }
+      // Prepend a guard block that returns true if the lambda is called with
+      // the argument "test". This allows runtime typeof to detect lambdas
+      // without executing their actual code.
+      lambdaBody.unshift({
+        opcode: "control_expandableIf",
+        cases: [{
+          cond: {
+            opcode: "operator_equals",
+            inputs: [
+              { opcode: "jwLambda_arg" },
+              "test",
+            ],
+          },
+          then: [{ opcode: "procedures_return", inputs: [true] }],
+        }],
+        elseSeq: null,
+        mutation: { branches: "1", "ends-in-else": "false" },
+      });
       // If the lambda contains `jw_yield` calls (preprocessed from `yield`),
       // convert into a builder-returning lambda (`jwLambda_newLambdaR`) that
       // produces an array of yielded values when invoked. This allows lambdas
@@ -3799,7 +3969,7 @@ if (!nestedInput) {
       }
       return "";
     }
-    if (expr.type === "Object") {
+    if (expr.type === "Object" || expr.type === "DynamicObject") {
       objectsUsed = true;
       const items = Array.isArray(expr.props) ? expr.props : [];
       if (blocksMeta && blocksMeta["dogeiscutObject_builder"]) {
@@ -3868,10 +4038,8 @@ if (!nestedInput) {
       }
       return obj;
     }
-    if (expr.type === "Array") {
+    if (expr.type === "Array" || expr.type === "DynamicArray") {
       arraysUsed = true;
-      // Convert array AST into a jwArray_builder pseudocode block where the
-      // second input is a single substack array of jwArray_builderAppend blocks.
       const els = Array.isArray(expr.elements) ? expr.elements : [];
       const substack = els.map((e) => {
         return { opcode: "jwArray_builderAppend", inputs: [exprToNested(e, inMethod, paramMap)] };
@@ -3892,6 +4060,9 @@ if (!nestedInput) {
       return { type: "Var", name: expr.name, scope };
     }
     if (expr.type === "This") return selfRef();
+    if (expr.type === "Cast") {
+      return exprToNested(expr.expr, inMethod, paramMap);
+    }
     if (expr.type === "Index") {
       const receiver = expr.receiver;
       const index = expr.index;
@@ -4043,7 +4214,7 @@ if (!nestedInput) {
                     resolvedClass &&
                     (hasMethodFlag(resolvedClass, pname, "static") ||
                       (classRegistry[resolvedClass] &&
-                        classRegistry[resolvedClass].staticProps &&
+                        classRegistry[resolvedClass].staticPropsf &&
                         classRegistry[resolvedClass].staticProps[pname]));
                   propGetAlt = useStaticAlt
                     ? getClassStaticGet(resolvedClass, pname)
@@ -4060,12 +4231,34 @@ if (!nestedInput) {
         let receiverRef = recvNested;
         for (let i = 0; i < props.length; i++) {
           const prop = props[i];
-          // String.length: emit operator_length instead of property get
           if (prop === "length" && i === 0) {
-            const recvType = recvNested && recvNested.type === "Var" && recvNested.name
-              ? null : null;
-            stringUsed = true;
-            receiverRef = { opcode: "operator_length", inputs: [receiverRef] };
+            if (recvExpr && recvExpr.isDynamicProperty) {
+              console.error(formatError(
+                `Cannot determine type for '.length' access on a dynamic property. Use an 'as' cast to specify the type, e.g.: (expr as Array).length`,
+                recvExpr
+              ));
+              process.exit(1)
+            }
+            const inferredType = recvExpr ? recvExpr.inferredType : null;
+            const normalizedInferred = inferredType ? String(inferredType).trim().toLowerCase() : "";
+            if (normalizedInferred === "dynamicobject" || normalizedInferred === "dynamic_object") {
+              console.error(formatError(
+                `Cannot determine type for '.length' access on a dynamic object. Use an 'as' cast to specify the type, e.g.: (expr as Array).length`,
+                recvExpr
+              ));
+              process.exit(1)
+            }
+            const isArray = inferredType && normalizeAndCheckType(inferredType, "array");
+            const isString = inferredType && normalizeAndCheckType(inferredType, "string");
+            if (isArray) {
+              arraysUsed = true;
+              receiverRef = { opcode: "jwArray_length", inputs: [{ ...receiverRef, noPlaceholder: true }] };
+            } else if (isString) {
+              stringUsed = true;
+              receiverRef = { opcode: "operator_length", inputs: [receiverRef] };
+            } else {
+              receiverRef = makeGet("length", receiverRef);
+            }
             continue;
           }
           receiverRef = makeGet(prop, receiverRef);
@@ -4159,16 +4352,28 @@ if (!nestedInput) {
             return { opcode: "control_inline_stack_output", inputs: [[retNode2]] };
           }
         }
-        // String.length: emit operator_length instead of property get
         if (propName === "length") {
-          let strNested = objReceiver;
-          if (!strNested && chain.length >= 2 && typeof chain[0] === "object") {
-            strNested = exprToNested(chain[0], inMethod, paramMap);
+          const varType = typeof chain[0] === "string" && chain[0] !== "this"
+            ? globalVarTypeMap[chain[0]] : null;
+          const normalizedVarType = varType ? String(varType).trim().toLowerCase() : "";
+          if (normalizedVarType === "dynamicobject" || normalizedVarType === "dynamic_object") {
+            throw new Error(formatError(
+              `Cannot determine type for '.length' access on a dynamic object. Use an 'as' cast to specify the type, e.g.: (expr as Array).length`,
+              null
+            ));
           }
-          if (strNested) {
+          const isArray = varType && normalizeAndCheckType(varType, "array");
+          if (isArray) {
+            arraysUsed = true;
+            return { opcode: "jwArray_length", inputs: [{ ...objReceiver, noPlaceholder: true }] };
+          }
+          const isString = varType && normalizeAndCheckType(varType, "string");
+          if (isString) {
             stringUsed = true;
-            return { opcode: "operator_length", inputs: [strNested] };
+            return { opcode: "operator_length", inputs: [objReceiver] };
           }
+          // Object or other non-array, non-string type → generic property getter
+          return makeGet("length", objReceiver);
         }
         return makeGet(propName, objReceiver);
       }
@@ -5183,12 +5388,12 @@ if (!nestedInput) {
     return out;
   }
 
-  function assertReturnTerminal(arr, context) {
+  function assertReturnTerminal(arr, context, node) {
     if (!Array.isArray(arr)) return;
     for (let i = 0; i < arr.length; i++) {
       const e = arr[i];
       if (e && e.opcode === "procedures_return" && i !== arr.length - 1) {
-        throw new Error("'return' must be the last statement in " + context);
+        throw new Error(formatError("'return' must be the last statement in " + context, node));
       }
     }
   }
@@ -5224,7 +5429,7 @@ if (!nestedInput) {
       for (let i = 0; i < stmt.cases.length; i++) {
         const c = stmt.cases[i];
         const cres = c.cond ? exprToNested(c.cond, inMethod, paramMap) : null;
-        if (!cres) throw new Error("stmtToNested If: condition must be an expression");
+        if (!cres) throw new Error(formatError("stmtToNested If: condition must be an expression", c));
         const condVal = cres;
         const thenBlocks = caseSeqs[i] || [];
         cases.push({
@@ -5916,7 +6121,7 @@ if (!nestedInput) {
     }
     if (stmt.type === "Return") {
       // Only allowed inside class methods or lambdas (inMethod flag)
-      if (!inMethod) throw new Error("'return' used outside of a method or lambda is not allowed");
+      if (!inMethod) throw new Error(formatError("'return' used outside of a method or lambda is not allowed", stmt));
       let val = stmt.value ? exprToNested(stmt.value, inMethod, paramMap) : "";
       // If the return is a simple variable reference, emit an explicit
       // SPtempVars_getVar here using the centralized scope decision so the
@@ -5936,7 +6141,7 @@ if (!nestedInput) {
         const shape = meta ? meta[1] : null;
         if (shape === "stack" || shape === "branch") {
           console.error("Return value opcode:", val.opcode, "meta:", meta, "shape:", shape);
-          throw new Error("'return' value cannot be a stack/branch block");
+          throw new Error(formatError("'return' value cannot be a stack/branch block", stmt));
         }
       }
       return { opcode: "procedures_return", inputs: [val] };
@@ -6058,11 +6263,10 @@ if (!nestedInput) {
           ? stmt.body.body.map((s) => stmtToNested(s, inMethod, paramMap)).filter(Boolean)
           : [];
       const children = flattenNestedResults(raw);
-      assertReturnTerminal(children, "while body");
+      assertReturnTerminal(children, "while body", stmt);
       return { opcode: "control_while", inputs: [cond, children] };
     }
     if (stmt.type === "For") {
-      // init -> start, cond -> end, update -> inc
       let varName = "";
       let start = 0;
       let end = 0;
@@ -6117,7 +6321,7 @@ if (!nestedInput) {
           : [];
       if (varName) loopVarStack.pop();
       const body = flattenNestedResults(raw);
-      assertReturnTerminal(body, "for body");
+      assertReturnTerminal(body, "for body", stmt);
       return { opcode: "SPtempVars_forVar", inputs: ["thread", varName, start, end, body, inc] };
     }
     if (stmt.type === "Break") {
@@ -6189,7 +6393,7 @@ if (!nestedInput) {
             currentMethodParams = Array.isArray(m.params) ? m.params.slice() : [];
             const raw = m.body.body.map((s) => stmtToNested(s, true, methodParamMap)).filter(Boolean);
             methodBody = flattenNestedResults(raw);
-            assertReturnTerminal(methodBody, `method '${m.name}' body`);
+            assertReturnTerminal(methodBody, `method '${m.name}' body`, m);
             currentEmittingMethodKey = _prevMethodKey;
             emittingStaticMethod = _prevEmittingStaticMethod;
             currentMethodParams = _prevMethodParams;

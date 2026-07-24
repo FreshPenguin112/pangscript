@@ -1,0 +1,6 @@
+on("flag", () => {
+    let d = dynamic {
+        foo: ["a", "b"]
+    };
+    print(d.foo.length);
+});

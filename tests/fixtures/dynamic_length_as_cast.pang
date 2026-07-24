@@ -1,0 +1,23 @@
+on("flag", () => {
+    let arr = [1, 2, 3];
+    print(arr.length);
+
+    let s = "hello";
+    print(s.length);
+
+    let dynArr = dynamic [1, 2, 3];
+    print(dynArr.length);
+
+    let dynObj = dynamic {
+        foo: (a) => { return a .. " bar" },
+        bar: {length: ["nested", "array"]}
+    };
+    print(((dynObj.bar as Object).length as Array).length, {seconds: 2});
+    print((dynObj.foo as String).length);
+
+    let obj = {String foo: "val"};
+    print((obj.foo as String).length);
+
+    let typedArr: String[] = ["a", "b", "c"];
+    print((typedArr as Array).length);
+});

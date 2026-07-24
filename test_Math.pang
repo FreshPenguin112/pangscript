@@ -1,0 +1,5 @@
+on("flag", () => {
+  print(Math.random().toString(16), {seconds: 2});
+  let foo = 255;
+  print((255).toString(16), {seconds: 2});
+});

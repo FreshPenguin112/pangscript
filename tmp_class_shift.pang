@@ -1,0 +1,7 @@
+on("flag", *{
+  class Foo {
+    constructor() {
+      print(-2 >>> 1);
+    }
+  }
+});

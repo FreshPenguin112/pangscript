@@ -1,0 +1,22 @@
+on("flag", *{
+    class Num {
+        constructor(num) {
+            this.num = num;
+        }
+        add(value) {
+            this.num = this.num + value;
+            return this;
+        }
+        test() {
+            return (a) => { return a .. "foo"; };
+        }
+        deep() {
+            return () => { return () => { return (a) => { return a .. "deep"; }; }; };
+        }
+    }
+    let test = 21;
+    let num = new Num(test);
+    print(num.add(5).add(6).num, {seconds: 2});
+    print(num.test()("bar "), {seconds: 2});
+    print(num.deep()()()("x"), {seconds: 2});
+});

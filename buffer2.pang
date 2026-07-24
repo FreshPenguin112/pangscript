@@ -1,0 +1,360 @@
+on("flag", *{
+    // Full Buffer-like class implemented on top of arrays.
+    // Uses only pangscript features: arrays, classes, loops, bitwise ops.
+    class Buffer {
+        constructor(size, arr, offset) {
+            this._arr = [];
+            this._offset = 0;
+            this._length = 0;
+            if (!!arr) {
+                this._arr = arr;
+                if (offset == 0) {
+                    this._offset = 0;
+                } else if (!offset) {
+                    this._offset = 0;
+                } else {
+                    this._offset = offset;
+                }
+                this._length = size;
+                return;
+            }
+            let i = 0;
+            while (i < size) {
+                push(this._arr, 0);
+                i = i + 1;
+            }
+            this._length = size;
+        }
+
+        static alloc(size, fill) {
+            const buf = new Buffer(size);
+            if (fill == 0) {
+                buf.fill(0);
+            } else if (fill) {
+                buf.fill(fill);
+            }
+            return buf;
+        }
+
+        static allocUnsafe(size) {
+            return new Buffer(size);
+        }
+
+        static from(src) {
+            let arr = [];
+            if (src && src._arr) {
+                let i = 0;
+                while (i < src.length) {
+                    push(arr, src.get(i));
+                    i = i + 1;
+                }
+                return new Buffer(src.length, arr, 0);
+            }
+            let i = 0;
+            while (i < length(src)) {
+                push(arr, get(src, i));
+                i = i + 1;
+            }
+            return new Buffer(length(arr), arr, 0);
+        }
+
+        static test() {
+            return "foo";
+        }
+
+        static get test2() {
+            return 5;
+        }
+
+        get length() {
+            return this._length;
+        }
+
+        size() {
+            return this._length;
+        }
+
+        get(i) {
+            let idx = this._offset + i;
+            let val = get(this._arr, idx);
+            // Return the stored value, but treat an absent value as 0.
+            // Preserve actual 0 values (which are falsey) by checking != 0.
+            if (!val && val != 0) {
+                return 0;
+            }
+            return val;
+        }
+
+        set(i, v) {
+            let idx = this._offset + i;
+            let byte = v & 255;
+            set(this._arr, idx, byte);
+            return this;
+        }
+
+        writeUInt8(v, offset) {
+            this.set(offset, v);
+            return 1;
+        }
+
+        readUInt8(offset) {
+            return this.get(offset);
+        }
+
+        writeUInt16LE(v, offset) {
+            this.set(offset, v & 255);
+            this.set(offset + 1, (v >> 8) & 255);
+            return 2;
+        }
+
+        writeUInt16BE(v, offset) {
+            this.set(offset, (v >> 8) & 255);
+            this.set(offset + 1, v & 255);
+            return 2;
+        }
+
+        readUInt16LE(offset) {
+            return this.get(offset) | (this.get(offset + 1) << 8);
+        }
+
+        readUInt16BE(offset) {
+            return (this.get(offset) << 8) | this.get(offset + 1);
+        }
+
+        writeUInt32LE(v, offset) {
+            let i = 0;
+            while (i < 4) {
+                this.set(offset + i, (v >> (8 * i)) & 255);
+                i = i + 1;
+            }
+            return 4;
+        }
+
+        writeUInt32BE(v, offset) {
+            let i = 0;
+            while (i < 4) {
+                this.set(offset + i, (v >> (8 * (3 - i))) & 255);
+                i = i + 1;
+            }
+            return 4;
+        }
+
+        readUInt32LE(offset) {
+            let out = 0;
+            let i = 0;
+            while (i < 4) {
+                out = out | (this.get(offset + i) << (8 * i));
+                i = i + 1;
+            }
+            return out;
+        }
+
+        readUInt32BE(offset) {
+            let out = 0;
+            let i = 0;
+            while (i < 4) {
+                out = out | (this.get(offset + i) << (8 * (3 - i)));
+                i = i + 1;
+            }
+            return out;
+        }
+
+        writeInt8(v, offset) {
+            return this.writeUInt8(v, offset);
+        }
+
+        readInt8(offset) {
+            let val = this.readUInt8(offset);
+            let sign = val & 128;
+            if (sign) {
+                return val - 256;
+            }
+            return val;
+        }
+
+        writeInt16LE(v, offset) {
+            return this.writeUInt16LE(v & 65535, offset);
+        }
+
+        writeInt16BE(v, offset) {
+            return this.writeUInt16BE(v & 65535, offset);
+        }
+
+        readInt16LE(offset) {
+            let val = this.readUInt16LE(offset);
+            if (val & 32768) {
+                return val - 65536;
+            }
+            return val;
+        }
+
+        readInt16BE(offset) {
+            let val = this.readUInt16BE(offset);
+            if (val & 32768) {
+                return val - 65536;
+            }
+            return val;
+        }
+
+        writeInt32LE(v, offset) {
+            return this.writeUInt32LE(v & 4294967295, offset);
+        }
+
+        writeInt32BE(v, offset) {
+            return this.writeUInt32BE(v & 4294967295, offset);
+        }
+
+        readInt32LE(offset) {
+            let val = this.readUInt32LE(offset);
+            if (val & 2147483648) {
+                return val - 4294967296;
+            }
+            return val;
+        }
+
+        readInt32BE(offset) {
+            let val = this.readUInt32BE(offset);
+            if (val & 2147483648) {
+                return val - 4294967296;
+            }
+            return val;
+        }
+
+        subarray(start, end) {
+            let len = this._length;
+            let from = start;
+            if (from == 0) {
+                from = 0;
+            } else if (!from) {
+                from = 0;
+            }
+            if (from < 0) {
+                from = len + from;
+                if (from < 0) {
+                    from = 0;
+                }
+            }
+            let to = end;
+            if (to == 0) {
+                to = 0;
+            } else if (!to) {
+                to = len;
+            }
+            if (to < 0) {
+                to = len + to;
+                if (to < 0) {
+                    to = 0;
+                }
+            }
+            if (from > len) {
+                from = len;
+            }
+            if (to > len) {
+                to = len;
+            }
+            if (to < from) {
+                to = from;
+            }
+            return new Buffer(to - from, this._arr, this._offset + from);
+        }
+
+        slice(start, end) {
+            let view = this.subarray(start, end);
+            let out = new Buffer(view.length);
+            let i = 0;
+            while (i < view.length) {
+                out.set(i, view.get(i));
+                i = i + 1;
+            }
+            return out;
+        }
+
+        fill(value, offset, end) {
+            let start = offset;
+            if (start == 0) {
+                start = 0;
+            } else if (!start) {
+                start = 0;
+            }
+            let stop = end;
+            if (stop == 0) {
+                stop = 0;
+            } else if (!stop) {
+                stop = this._length;
+            }
+            let i = start;
+            while (i < stop) {
+                this.set(i, value);
+                i = i + 1;
+            }
+            return this;
+        }
+
+        concat(other) {
+            let out = new Buffer(this._length + other.length);
+            let i = 0;
+            while (i < this._length) {
+                out.set(i, this.get(i));
+                i = i + 1;
+            }
+            let j = 0;
+            while (j < other.length) {
+                out.set(i + j, other.get(j));
+                j = j + 1;
+            }
+            return out;
+        }
+
+        copy(target, targetStart, sourceStart, sourceEnd) {
+            let dest = targetStart;
+            if (dest == 0) {
+                dest = 0;
+            } else if (!dest) {
+                dest = 0;
+            }
+            let from = sourceStart;
+            if (from == 0) {
+                from = 0;
+            } else if (!from) {
+                from = 0;
+            }
+            let to = sourceEnd;
+            if (to == 0) {
+                to = 0;
+            } else if (!to) {
+                to = this._length;
+            }
+            let written = 0;
+            let i = from;
+            while (i < to) {
+                target.set(dest + written, this.get(i));
+                written = written + 1;
+                i = i + 1;
+            }
+            return written;
+        }
+    }
+
+    // Demo usage
+    let b = Buffer.alloc(8);
+    b.writeUInt8(65, 0);
+    b.writeUInt16LE(16962, 1);
+    print(b.readUInt8(0), {seconds:1}); // 65
+    print(b.readUInt16LE(1), {seconds:1}); // 16962
+    print(b.readUInt32LE(0), {seconds:1}); // 4342337
+
+    let b2 = Buffer.from([65, 66, 67, 68]);
+    print(b2.get(0), {seconds:1}); // 65
+    print(b2.get(1), {seconds:1}); // 66
+
+    let shared = b2.subarray(1, 3);
+    shared.set(0, 90);
+    print(b2.get(1), {seconds:1}); // 90 output: 66
+    print(shared.get(0), {seconds:1}); // 90 output:67
+
+    let copyTarget = new Buffer(4);
+    b2.copy(copyTarget, 0, 0, 4);
+    print(copyTarget.get(0), {seconds:1}); // 65 output: 0
+    print(Buffer.test()); // foo
+    print(Buffer.test2); // 5
+});

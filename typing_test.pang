@@ -1,0 +1,22 @@
+let count: Number = 1;
+let greeting: String = "hi";
+let ok: Boolean = true;
+let numbers: Number[] = [1, 2, 3];
+let doubled: Number = count + 2;
+let countType = typeof count;
+let greetingType = typeof greeting;
+
+class Box {
+  constructor(value: Number) {
+    this.value = value;
+  }
+
+  getValue(): Number {
+    return this.value;
+  }
+}
+
+let box = new Box(3);
+print(countType);
+print(greetingType);
+print(box.getValue());

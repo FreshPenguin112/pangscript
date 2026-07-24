@@ -1,0 +1,16 @@
+on("flag", () => {
+  let calc = {
+    square: (a) => {return a * a},
+    add: (a, b) => {return a + b}
+  };
+  let arr1: Number[] = [1, 2, 3, 4, 5, -1];
+  let sum = (arr: Number[]) => {
+    let temp = 0;
+    for (let i = 0; i < arr.length(); i++) {
+      temp = temp + arr[i];
+    }
+    return temp
+  }
+  print(calc.square(5) + calc.add(3, 2), {seconds: 2})
+  print(sum(arr1) .. ask("foobar"));
+})

@@ -1,0 +1,4 @@
+on("flag", *{
+    let test = [(a) => {return () => {return a + 1}}];
+    print(get(test, 0)(5)());
+})

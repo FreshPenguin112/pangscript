@@ -1,0 +1,13 @@
+on("flag", () => {
+    let obj = {
+        test: (a, b) => {
+            print(a + b);
+        }
+    };
+    obj.test(5, 10);
+
+    let lambda = (x, y) => {
+        print(x * y);
+    };
+    lambda(3, 4);
+});

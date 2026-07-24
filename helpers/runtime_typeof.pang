@@ -31,13 +31,15 @@ on("flag", () => {
         if (jwClass_getClass(value) != "null") {
             return jwClass_getName(jwClass_getClass(value));
         } else if (dogeiscutObject_is(operator_stringify(value))) {
-            return "object";
+            return "dynamic_object";
         } else if (jwArray_validate(operator_stringify(value))) {
-            return "array";
+            return "dynamic_array";
         } else if (sensing_regextest(value, "^[+-]?(?:\\d+\\.?\\d*|\\.\\d+)$", "g")) {
             return "number";
         } else if (sensing_regextest(value, "^(?:true|false)$", "g")) {
             return "boolean";
+        } else if (jwLambda_executeR(value, "test")) {
+            return "function"
         } else {
             return "string";
         }

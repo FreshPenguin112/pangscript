@@ -1,0 +1,10 @@
+on("flag", () => {
+    let Math = {
+        Number E: pmOperatorsExpansion_euler(),
+        Number PI: pmOperatorsExpansion_pi(),
+        abs: (n) => {
+            return operator_mathop("abs", n);
+        }
+    };
+    print(Math.abs(5));
+});

@@ -1,0 +1,10 @@
+on("flag", *{
+    class Test {
+        method() {
+            let local = 42;
+            print(local);
+        }
+    }
+    let t = new Test();
+    t.method();
+});

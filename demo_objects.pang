@@ -1,0 +1,13 @@
+// Demo: Objects usage for PenguinMod testing
+on("flag", *{
+    // simple object
+    let player = { name: "Alice", score: 0 };
+    print(player.name);
+
+    // object with lambda property
+    let ui = { onClick: () => { print("clicked"); } };
+    ui.onClick();
+
+    // ambiguous object (should trigger compile-time error unless annotated)
+    // let ambiguous = { a: 1, b: print("hi") };
+});

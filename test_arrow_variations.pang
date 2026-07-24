@@ -1,0 +1,21 @@
+// Test various arrow function variations in on()
+
+// Single arg arrow function (should this work?)
+on("test1", (x) => {
+  print("single arg");
+});
+
+// No args arrow function
+on("test2", () => {
+  print("no args");
+});
+
+// Traditional inline block
+on("test3", *{
+  print("inline block");
+});
+
+// Traditional block
+on("test4", {
+  print("block");
+});

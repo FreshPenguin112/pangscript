@@ -1,0 +1,36 @@
+on("flag", *{
+    class Counter {
+        static get value() {
+            return this._staticValue;
+        }
+
+        static set value(v) {
+            this._staticValue = v;
+        }
+
+        constructor(initial) {
+            this._x = initial;
+        }
+
+        get x() {
+            return this._x;
+        }
+
+        set x(v) {
+            this._x = v;
+        }
+    }
+
+    let c = new Counter(1);
+    print(c.x, { seconds: 1 }); // expected: 1
+    c.x = 42;
+    print(c.x, { seconds: 1 }); // expected: 42
+
+    Counter.value = 7;
+    print(Counter.value, { seconds: 1 }); // expected: 7
+    Counter.value = 99;
+    print(Counter.value, { seconds: 1 }); // expected: 99
+
+    c.x = 123;
+    print(c.x, { seconds: 1 }); // expected: 123
+});

@@ -141,6 +141,15 @@ assert.strictEqual(instanceExplicitOk.status, 0, instanceExplicitOk.stderr || in
 const { result: instanceStaticOk } = runFixture('class_instance_static_ok.pang');
 assert.strictEqual(instanceStaticOk.status, 0, instanceStaticOk.stderr || instanceStaticOk.stdout);
 
+// Dynamic .length with `as` cast must compile.
+const { result: dynamicLengthAsCast } = runFixture('dynamic_length_as_cast.pang');
+assert.strictEqual(dynamicLengthAsCast.status, 0, dynamicLengthAsCast.stderr || dynamicLengthAsCast.stdout);
+
+// Dynamic .length without `as` cast must error.
+const { result: dynamicLengthNoCast } = runFixture('dynamic_length_no_cast_error.pang');
+assert.notStrictEqual(dynamicLengthNoCast.status, 0, 'Expected compile-time error when .length is accessed on a dynamic property without an as cast');
+assert.match(dynamicLengthNoCast.stderr || dynamicLengthNoCast.stdout, /as.*cast/i);
+
 // Class instances: explicit annotation must reject reassignment to a non-instance.
 const { result: instanceExplicitError } = runFixture('class_instance_explicit_reassign_error.pang');
 assert.notStrictEqual(instanceExplicitError.status, 0, 'Expected compile-time type error when an explicitly annotated class instance is reassigned to a non-instance');

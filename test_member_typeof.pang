@@ -1,0 +1,10 @@
+on("flag", () => {
+    let test = {
+        foo: a => {return a .. "bar"}
+    }
+    print(test.foo("foo"), {seconds: 2});
+    let bar = test.foo
+    print(typeof test.foo)
+    print(typeof bar)
+    print(typeof q)
+})

@@ -1,0 +1,24 @@
+on("flag", () => {
+    let runtime_typeof = (v, isVarName, type) => {
+      if (isVarName) {
+        if(!(type == "global" ? SPtempVars_varExists("global", v) : SPtempVars_varExists("thread", v))) {
+          return "undefined"
+        } else {
+          let value = type == "global" ? SPtempVars_getVar("global", v) : SPtempVars_getVar("thread", v)
+        }
+      } else {
+        let value = v
+      }
+      if (dogeiscutObject_is(operator_stringify(value))) {
+        return "object"
+      } else if (jwArray_validate(operator_stringify(value))) {
+        return "array"
+      } else if (sensing_regextest(value, "^[+-]?(?:\d+\.?\d*|\.\d+)$", "g")) {
+        return "number"
+      } else if (sensing_regextest(value, "^(?:true|false)$", "g")) {
+        return "boolean"
+      } else {
+        return "string"
+      }
+    }
+  })

@@ -1,0 +1,5 @@
+class Counter {
+  static foo() {
+    return 42;
+  }
+}

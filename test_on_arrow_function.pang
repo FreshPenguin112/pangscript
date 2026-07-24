@@ -1,0 +1,3 @@
+on("click", () => {
+  print("Arrow function!");
+});

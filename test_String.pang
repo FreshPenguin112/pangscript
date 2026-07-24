@@ -1,0 +1,3 @@
+on("flag", () => {
+  print("Hello, World!".toLowerCase(), {seconds: 2})
+})

@@ -1,0 +1,9 @@
+on("flag", *{
+    let test1 = (a) => {return () => {return a + 1}};
+    let test2 = [(a) => {return () => {return a + 1}}];
+    if (true) {
+        print(test1(5)());
+    } else {
+        print(get(test2, 0)(5)());
+    }
+});

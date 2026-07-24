@@ -1,0 +1,9 @@
+on("flag", *{
+    class C {
+        test() {
+            return 5;
+        }
+    }
+    let c = new C();
+    print(c.test(), {seconds: 1});
+});

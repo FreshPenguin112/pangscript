@@ -1,0 +1,4 @@
+on("flag", *{
+  let num = 1;
+  print(num.num, {seconds: 2});
+});
